@@ -1,0 +1,504 @@
+// Copyright (c) 2025, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.jdk11.string;
+
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
+import com.android.tools.r8.Jdk9TestUtils;
+import com.android.tools.r8.NeverInline;
+import com.android.tools.r8.ReprocessMethod;
+import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
+import com.android.tools.r8.TestRuntime.CfVm;
+import com.android.tools.r8.utils.codeinspector.ClassSubject;
+import com.android.tools.r8.utils.codeinspector.CodeInspector;
+import com.android.tools.r8.utils.codeinspector.CodeMatchers;
+import com.android.tools.r8.utils.codeinspector.MethodSubject;
+import com.android.tools.r8.utils.internal.StringUtils;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameter;
+import org.junit.runners.Parameterized.Parameters;
+
+@RunWith(Parameterized.class)
+public class StringConcatTest extends TestBase {
+
+  private static final String EXPECTED_OUTPUT =
+      StringUtils.lines(
+          "true",
+          "1",
+          "c",
+          "3",
+          "5",
+          "7",
+          "9.0",
+          "11.0",
+          "e",
+          "concat",
+          "first true and true",
+          "1 true 2 false",
+          "try true and false",
+          "3 true 4 true",
+          "ONE true TWO true",
+          "start  middle  end",
+          "s1 s2 s3",
+          "a 1 b 2 c 3 d 4 e CONST_STR f CONST_STR",
+          "ONE 1 TWO 0",
+          "ONE 0 TWO 1",
+          "ZXY",
+          "false123456.07.08hi",
+          "SIDE EFFECT",
+          "10",
+          "hi3",
+          "hi333",
+          "truetruetruefalsetrue0truenull",
+          "true-3truedtruee",
+          "a bc",
+          "a b c");
+
+  @Parameter(0)
+  public TestParameters parameters;
+
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters()
+        .withDexRuntimes()
+        .withCfRuntime(CfVm.JDK17)
+        .withAllApiLevelsAlsoForCf()
+        .build();
+  }
+
+  @Test
+  public void testReference() throws Exception {
+    parameters.assumeJvmTestParameters();
+    testForJvm(parameters)
+        .addTestClasspath()
+        .run(parameters.getRuntime(), Main.class)
+        .assertSuccessWithOutput(EXPECTED_OUTPUT);
+  }
+
+  @Test
+  public void testD8CfNoDesugar() throws Exception {
+    parameters.assumeJvmTestParameters();
+
+    testForD8(parameters.getBackend())
+        .addInnerClassesAndStrippedOuter(getClass())
+        .setNoMinApi()
+        .disableDesugaring()
+        .compile()
+        .assertNoMessages()
+        .run(parameters.getRuntime(), Main.class)
+        .assertSuccessWithOutput(EXPECTED_OUTPUT);
+  }
+
+  @Test
+  public void testD8() throws Exception {
+    testForD8(parameters.getBackend())
+        .setMinApi(parameters)
+        .addOptionsModification(opt -> opt.enableStringConcatInstruction = true)
+        .addInnerClassesAndStrippedOuter(getClass())
+        .run(parameters.getRuntime(), Main.class)
+        .assertSuccessWithOutput(EXPECTED_OUTPUT);
+  }
+
+  @Test
+  public void testR8() throws Exception {
+    parameters.assumeR8TestParameters();
+    testForR8(parameters.getBackend())
+        .addOptionsModification(opt -> opt.enableStringConcatInstruction = true)
+        .setMinApi(parameters)
+        .applyIf(parameters.isCfRuntime(), Jdk9TestUtils.addJdk9LibraryFiles(temp))
+        .addInnerClassesAndStrippedOuter(getClass())
+        .addKeepMainRule(Main.class)
+        .enableInliningAnnotations()
+        .enableReprocessMethodAnnotations()
+        .addDontObfuscate()
+        .run(parameters.getRuntime(), Main.class)
+        .assertSuccessWithOutput(EXPECTED_OUTPUT)
+        .inspect(inspector -> inspectOutput(inspector, true));
+  }
+
+  private long countStringBuilderOrInvokeDynamic(MethodSubject method) {
+    return method
+        .streamInstructions()
+        .filter(
+            ins ->
+                CodeMatchers.isInvokeWithTarget(typeName(StringBuilder.class), "<init>").test(ins)
+                    || ins.isInvokeDynamic())
+        .count();
+  }
+
+  private void inspectOutput(CodeInspector inspector, boolean isR8) {
+    ClassSubject mainClass = inspector.clazz(Main.class);
+    MethodSubject method = mainClass.uniqueMethodWithOriginalName("shouldConvertToValueOf");
+    assertTrue(method.isPresent());
+    assertEquals(0, countStringBuilderOrInvokeDynamic(method));
+
+    // D8 does not simplify the String.valueOf(phiString).
+    int expectedValueOfCount = isR8 ? 8 : 9;
+    assertEquals(
+        expectedValueOfCount,
+        method
+            .streamInstructions()
+            .filter(ins -> ins.isInvokeStatic() && ins.getMethod().getName().isEqualTo("valueOf"))
+            .count());
+
+    method = mainClass.uniqueMethodWithOriginalName("shouldConvertToConcat");
+    assertTrue(method.isPresent());
+    assertEquals(0, countStringBuilderOrInvokeDynamic(method));
+    assertEquals(
+        1,
+        method
+            .streamInstructions()
+            .filter(ins -> ins.isInvokeVirtual() && ins.getMethod().getName().isEqualTo("concat"))
+            .count());
+
+    method = mainClass.uniqueMethodWithOriginalName("shouldConvertToConcat");
+    assertTrue(method.isPresent());
+    assertEquals(0, countStringBuilderOrInvokeDynamic(method));
+    assertEquals(
+        1,
+        method
+            .streamInstructions()
+            .filter(ins -> ins.isInvokeVirtual() && ins.getMethod().getName().isEqualTo("concat"))
+            .count());
+
+    method = mainClass.uniqueMethodWithOriginalName("doesRemoveExplicitToString_singleUser");
+    assertTrue(method.isPresent());
+    assertEquals(
+        0,
+        method
+            .streamInstructions()
+            .filter(ins -> ins.isInvokeVirtual() && ins.getMethod().getName().isEqualTo("toString"))
+            .count());
+    assertEquals(
+        0,
+        method
+            .streamInstructions()
+            .filter(ins -> ins.isInvokeStatic() && ins.getMethod().getName().isEqualTo("valueOf"))
+            .count());
+
+    method = mainClass.uniqueMethodWithOriginalName("numericAndBooleanStrings");
+    assertTrue(method.isPresent());
+    assertEquals(0, method.streamInstructions().filter(ins -> ins.isConstString()).count());
+
+    method = mainClass.uniqueMethodWithOriginalName("mergeStringsWithSideEffects_sameOrder");
+    assertTrue(method.isPresent());
+    assertEquals(3, countStringBuilderOrInvokeDynamic(method));
+
+    method = mainClass.uniqueMethodWithOriginalName("noOutValues_noSideEffects");
+    assertThat("Empty method should be removed.", method, isPresent());
+  }
+
+  static class Main {
+
+    private static final String CONST_STR = "CONST_STR";
+    private static int sideEffectCounter = 0;
+
+    static class ToStringThatCounts {
+      @Override
+      public String toString() {
+        return "" + sideEffectCounter++;
+      }
+    }
+
+    static class ToStringThatPrints {
+      @Override
+      public String toString() {
+        System.out.println("SIDE EFFECT");
+        return "";
+      }
+    }
+
+    static class ToStringNoSideEffect {
+      @Override
+      public String toString() {
+        return "HELLO";
+      }
+    }
+
+    static class ToStringSneakySideEffects {
+      static String retValue;
+
+      @Override
+      public String toString() {
+        return retValue;
+      }
+    }
+
+    static class Y {
+      static String s = "Y";
+
+      @Override
+      public String toString() {
+        return s;
+      }
+    }
+
+    static class Z {
+      @Override
+      public String toString() {
+        Y.s = null;
+        return "Z";
+      }
+    }
+
+    public static void main(String[] strArr) {
+      shouldConvertToValueOf();
+      shouldConvertToConcat();
+      firstSharedConcat();
+      secondSharedConcatWithTryCatch();
+      mergeStringsSharedConcat();
+      mergeAdjacentConstantsAcrossConcats();
+      mergeStringsSneakySideEffect();
+      mergeConstants();
+      mergeStringsWithSideEffects_reverseOrder();
+      mergeStringsWithSideEffects_sameOrder();
+      mergeStringsWithSideEffects_interaction();
+      System.out.println(allTheParams(false, (byte) 1, '2', (short) 3, 4, 5, 6, 7, 8, "hi"));
+      noOutValues_withSideEffects();
+      noOutValues_noSideEffects();
+      doesNotRemoveExplicitToString();
+      doesRemoveExplicitToString_singleUser();
+      doesRemoveExplicitToString_multiUser();
+      numericAndBooleanStrings();
+      regression_AssertionError_UnexpectedValuesLiveAtEntry();
+      regression_IllegalStateException_Split();
+    }
+
+    @NeverInline
+    public static void shouldConvertToValueOf() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      System.out.println("" + alwaysTrue);
+      System.out.println("" + (alwaysTrue ? (byte) 1 : (byte) 2));
+      System.out.println("" + (alwaysTrue ? 'c' : 'd'));
+      System.out.println("" + (alwaysTrue ? (short) 3 : (short) 4));
+      System.out.println("" + (alwaysTrue ? 5 : 6));
+      System.out.println("" + (alwaysTrue ? (long) 7 : (long) 8));
+      System.out.println("" + (alwaysTrue ? 9f : 10f));
+      System.out.println("" + (alwaysTrue ? 11.0 : 12.0));
+      System.out.println("" + (alwaysTrue ? "e" : "f"));
+    }
+
+    @NeverInline
+    public static void shouldConvertToConcat() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      System.out.println("con" + (alwaysTrue ? "cat" : "dog"));
+    }
+
+    @NeverInline
+    public static void firstSharedConcat() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      System.out.println("first " + alwaysTrue + " and " + alwaysTrue);
+      System.out.println("1 " + alwaysTrue + " 2 " + !alwaysTrue);
+    }
+
+    @NeverInline
+    public static void secondSharedConcatWithTryCatch() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      try {
+        System.out.println("try " + alwaysTrue + " and " + !alwaysTrue);
+        System.out.println("3 " + alwaysTrue + " 4 " + alwaysTrue);
+      } catch (Exception e) {
+      }
+    }
+
+    @NeverInline
+    public static void mergeStringsSharedConcat() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      String partOne = "ONE " + alwaysTrue;
+      String partTwo = " TWO " + alwaysTrue;
+      System.out.println(partOne + partTwo);
+    }
+
+    @NeverInline
+    public static void mergeStringsSneakySideEffect() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      ToStringSneakySideEffects.retValue = "s2";
+      ToStringSneakySideEffects s2 = new ToStringSneakySideEffects();
+      String concat1 = (alwaysTrue ? "s1 " : "") + s2;
+      ToStringSneakySideEffects.retValue = "gotcha!";
+      System.out.println(concat1 + " s3");
+    }
+
+    @NeverInline
+    public static void mergeAdjacentConstantsAcrossConcats() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      // concat1 ends with a constant " middle "
+      String concat1 = (alwaysTrue ? "start " : "alt ") + " middle ";
+      // concat2 starts with a constant " end"
+      // Resulting merge: "start " + " middle " + " end" -> "start  middle  end"
+      String result = concat1 + " end";
+      System.out.println(result);
+    }
+
+    @NeverInline
+    public static void mergeStringsWithSideEffects_sameOrder() {
+      sideEffectCounter = 0;
+      // These can be merged into a single concat since doing so does not change the order of the
+      // side effects.
+      String partOne = "ONE " + new ToStringThatCounts();
+      String partTwo = " TWO " + new ToStringThatCounts();
+      System.out.println(partOne + partTwo);
+    }
+
+    @NeverInline
+    public static void mergeConstants() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      try {
+        String partOne = "a " + '1';
+        String partTwo = " b " + (short) 2;
+        String partThree = " c " + (byte) 3;
+        String partFour = " d " + (long) 4;
+        String constStr = CONST_STR;
+        // Test same inValue used twice
+        String noop = (alwaysTrue ? "" : "X");
+        String partFive = " e " + constStr + noop + " f " + constStr;
+        String step1 = partOne + partTwo + partThree;
+        String step2 = noop + step1 + partFour + noop + partFive;
+        System.out.println(step2);
+      } catch (Throwable t) {
+        t.printStackTrace();
+      }
+    }
+
+    @NeverInline
+    public static void mergeStringsWithSideEffects_reverseOrder() {
+      sideEffectCounter = 0;
+      // These cannot be merged into a single concat since doing so would change the order of the
+      // side effects.
+      String partTwo = " TWO " + new ToStringThatCounts();
+      String partOne = "ONE " + new ToStringThatCounts();
+      System.out.println(partOne + partTwo);
+    }
+
+    @NeverInline
+    public static void mergeStringsWithSideEffects_interaction() {
+      Y.s = "Y";
+      String x = "X";
+      Y y = new Y();
+      Z z = new Z();
+      String xy = x + y;
+      String zxy = z + xy;
+      System.out.println(zxy);
+    }
+
+    private static void noop(String value) {
+      // Tests removing StringConcat with no out value.
+    }
+
+    @NeverInline
+    public static void noOutValues_withSideEffects() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      try {
+        // Should not be removed due to side effects.
+        noop("asdf" + (alwaysTrue ? new ToStringThatPrints() : null));
+      } catch (Throwable t) {
+        t.printStackTrace();
+      }
+    }
+
+    @NeverInline
+    @ReprocessMethod
+    public static void noOutValues_noSideEffects() {
+      try {
+        // Values should be removed.
+        noop(1 + "a" + 3 + new ToStringNoSideEffect());
+      } catch (Throwable t) {
+        t.printStackTrace();
+      }
+    }
+
+    @NeverInline
+    public static String allTheParams(
+        boolean a, byte b, char c, short d, int e, long f, float g, double h, Object i, String j) {
+      return "" + a + b + c + d + e + f + g + h + i + j;
+    }
+
+    @NeverInline
+    public static void doesNotRemoveExplicitToString() {
+      sideEffectCounter = 0;
+      String partOne = new ToStringThatCounts().toString();
+      String partTwo = new ToStringThatCounts().toString();
+      // The explicit .toString() calls should not be optimized since the toString() side effects
+      // would run in the wrong order.
+      System.out.println(partTwo + partOne);
+    }
+
+    @NeverInline
+    public static void doesRemoveExplicitToString_singleUser() {
+      String partOne = "hi";
+      Integer three = 3;
+      String partTwo = three.toString();
+      System.out.println(partOne + partTwo);
+    }
+
+    @NeverInline
+    public static void doesRemoveExplicitToString_multiUser() {
+      String partOne = "hi";
+      Integer three = 3;
+      String partTwo = three.toString();
+      System.out.print(partOne + partTwo);
+      System.out.print(three);
+      System.out.println(partTwo);
+    }
+
+    @NeverInline
+    public static void numericAndBooleanStrings() {
+      boolean alwaysTrue = System.currentTimeMillis() > 0;
+      System.out.println(
+          alwaysTrue + "" + true + alwaysTrue + "false" + alwaysTrue + 0 + alwaysTrue + "null");
+      System.out.println(alwaysTrue + "-3" + alwaysTrue + 'd' + alwaysTrue + "e");
+    }
+
+    @NeverInline
+    public static String getA() {
+      return System.currentTimeMillis() > 0 ? "a" : "x";
+    }
+
+    @NeverInline
+    public static String getB() {
+      return System.currentTimeMillis() > 0 ? "b" : "y";
+    }
+
+    @NeverInline
+    public static String getC() {
+      return System.currentTimeMillis() > 0 ? "c" : "z";
+    }
+
+    @NeverInline
+    public static void regression_AssertionError_UnexpectedValuesLiveAtEntry() {
+      String a = getA();
+      String b = getB();
+      String c = getC();
+      String s1 = a + " " + b;
+      if (s1 == null) return;
+      String s2 = s1;
+      if (s2 == null) return;
+      String s3 = s2;
+      if (s3 == null) return;
+      System.out.println(s3 + c);
+    }
+
+    @NeverInline
+    public static void regression_IllegalStateException_Split() {
+      String a = getA();
+      String b = getB();
+      String c = getC();
+      try {
+        // StringConcat(a, b, c) with 3 args to trigger StringBuilder path.
+        // We need a constant to trigger materialization split.
+        System.out.println(a + " " + b + " " + c);
+      } catch (Throwable t) {
+        System.out.println("catch");
+      }
+    }
+  }
+}

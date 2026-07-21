@@ -1,0 +1,23 @@
+// Copyright (c) 2023, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+plugins {
+  `kotlin-dsl`
+  `java-gradle-plugin`
+}
+
+dependencies {
+  implementation("net.ltgt.gradle:gradle-errorprone-plugin:3.0.1")
+  implementation("org.gradle:test-retry-gradle-plugin:1.6.4")
+  implementation("com.google.code.gson:gson:2.10.1")
+}
+
+gradlePlugin {
+  plugins.register("dependencies-plugin") {
+    id = "dependencies-plugin"
+    implementationClass = "DependenciesPlugin"
+  }
+}
+
+kotlin { explicitApi() }

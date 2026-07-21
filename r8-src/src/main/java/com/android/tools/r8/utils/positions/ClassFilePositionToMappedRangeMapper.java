@@ -1,0 +1,141 @@
+// Copyright (c) 2022, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.utils.positions;
+
+import static com.android.tools.r8.utils.positions.PositionUtils.remapAndAdd;
+
+import com.android.tools.r8.cf.code.CfInstruction;
+import com.android.tools.r8.cf.code.CfLabel;
+import com.android.tools.r8.cf.code.CfPosition;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.CfCode;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.code.Position;
+import com.android.tools.r8.ir.code.Position.SyntheticPosition;
+import com.android.tools.r8.utils.internal.collections.Pair;
+import com.android.tools.r8.utils.timing.Timing;
+import java.util.ArrayList;
+import java.util.List;
+
+public class ClassFilePositionToMappedRangeMapper implements PositionToMappedRangeMapper {
+
+  private final AppView<?> appView;
+
+  public ClassFilePositionToMappedRangeMapper(AppView<?> appView) {
+    this.appView = appView;
+  }
+
+  @Override
+  public List<MappedPosition> getMappedPositions(
+      ProgramMethod method,
+      MethodPositionRemapper positionRemapper,
+      boolean hasOverloads,
+      boolean canUseDexPc,
+      int pcEncodingCutoff,
+      Timing timing) {
+    return appView.options().getTestingOptions().usePcEncodingInCfForTesting
+        ? getPcEncodedPositions(method, positionRemapper)
+        : getMappedPositionsRemapped(method, positionRemapper, hasOverloads);
+  }
+
+  @Override
+  public void updateDebugInfoInCodeObjects() {
+    // Intentionally empty.
+  }
+
+  private List<MappedPosition> getMappedPositionsRemapped(
+      ProgramMethod method, MethodPositionRemapper positionRemapper, boolean hasOverloads) {
+    List<MappedPosition> mappedPositions = new ArrayList<>();
+    // Do the actual processing for each method.
+    CfCode oldCode = method.getDefinition().getCode().asCfCode();
+    List<CfInstruction> oldInstructions = oldCode.getInstructions();
+    List<CfInstruction> newInstructions = new ArrayList<>(oldInstructions.size());
+    boolean seenPosition = false;
+    for (CfInstruction oldInstruction : oldInstructions) {
+      CfInstruction newInstruction;
+      if (oldInstruction.isPosition()) {
+        seenPosition = true;
+        CfPosition cfPosition = oldInstruction.asPosition();
+        newInstruction =
+            new CfPosition(
+                cfPosition.getLabel(),
+                remapAndAdd(cfPosition.getPosition(), positionRemapper, mappedPositions));
+      } else {
+        newInstruction = oldInstruction;
+      }
+      newInstructions.add(newInstruction);
+    }
+    if (!seenPosition && hasOverloads) {
+      // If a method with overloads does not have an actual position then map it to the implicit
+      // preamble position.
+      DexMethod reference = method.getReference();
+      CfPosition preamblePositionForOverload =
+          new CfPosition(
+              new CfLabel(),
+              remapAndAdd(
+                  SyntheticPosition.builder()
+                      .setMethod(reference)
+                      .setLine(0)
+                      .setIsD8R8Synthesized(method.getDefinition().isD8R8Synthesized())
+                      .build(),
+                  positionRemapper,
+                  mappedPositions));
+      List<CfInstruction> shiftedPositions = new ArrayList<>(oldInstructions.size() + 2);
+      shiftedPositions.add(preamblePositionForOverload.getLabel());
+      shiftedPositions.add(preamblePositionForOverload);
+      shiftedPositions.addAll(newInstructions);
+      newInstructions = shiftedPositions;
+    }
+    method.setCode(
+        new CfCode(
+            method.getHolderType(),
+            oldCode.getMaxStack(),
+            oldCode.getMaxLocals(),
+            newInstructions,
+            oldCode.getTryCatchRanges(),
+            oldCode.getLocalVariables()),
+        appView);
+    return mappedPositions;
+  }
+
+  private List<MappedPosition> getPcEncodedPositions(
+      ProgramMethod method, MethodPositionRemapper positionRemapper) {
+    List<MappedPosition> mappedPositions = new ArrayList<>();
+    // Do the actual processing for each method.
+    CfCode oldCode = method.getDefinition().getCode().asCfCode();
+    List<CfInstruction> oldInstructions = oldCode.getInstructions();
+    List<CfInstruction> newInstructions = new ArrayList<>(oldInstructions.size() * 3);
+    Position currentPosition = null;
+    for (CfInstruction oldInstruction : oldInstructions) {
+      if (oldInstruction.isPosition()) {
+        CfPosition cfPosition = oldInstruction.asPosition();
+        currentPosition = cfPosition.getPosition();
+      } else {
+        if (currentPosition != null) {
+          Pair<Position, Position> remappedPosition =
+              positionRemapper.createRemappedPosition(currentPosition);
+          Position oldPosition = remappedPosition.getFirst();
+          Position newPosition = remappedPosition.getSecond();
+          mappedPositions.add(new MappedPosition(oldPosition, newPosition.getLine()));
+          CfPosition position = new CfPosition(new CfLabel(), newPosition);
+          newInstructions.add(position);
+          newInstructions.add(position.getLabel());
+        }
+        newInstructions.add(oldInstruction);
+      }
+    }
+    method.setCode(
+        new CfCode(
+            method.getHolderType(),
+            oldCode.getMaxStack(),
+            oldCode.getMaxLocals(),
+            newInstructions,
+            oldCode.getTryCatchRanges(),
+            oldCode.getLocalVariables()),
+        appView);
+    return mappedPositions;
+  }
+}

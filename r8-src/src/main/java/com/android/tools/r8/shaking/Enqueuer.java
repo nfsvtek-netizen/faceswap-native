@@ -1,0 +1,5634 @@
+// Copyright (c) 2016, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.shaking;
+
+import static com.android.tools.r8.graph.DexClassAndMethod.asProgramMethodOrNull;
+import static com.android.tools.r8.graph.DexClasspathClass.asClasspathClassOrNull;
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+import static com.android.tools.r8.graph.FieldAccessInfoImpl.MISSING_FIELD_ACCESS_INFO;
+import static com.android.tools.r8.ir.desugar.LambdaDescriptor.isLambdaMetafactoryMethod;
+import static com.android.tools.r8.ir.desugar.desugaredlibrary.apiconversion.VivifiedTypeUtils.methodWithVivifiedTypeInSignature;
+import static com.android.tools.r8.shaking.KeepInfo.Joiner.asClassJoinerOrNull;
+import static com.android.tools.r8.shaking.KeepInfo.Joiner.asFieldJoinerOrNull;
+import static com.android.tools.r8.utils.CovariantReturnTypeUtils.modelLibraryMethodsWithCovariantReturnTypes;
+import static com.android.tools.r8.utils.internal.FunctionUtils.ignoreArgument;
+import static com.android.tools.r8.utils.internal.MapUtils.ignoreKey;
+import static java.util.Collections.emptySet;
+
+import com.android.tools.r8.Diagnostic;
+import com.android.tools.r8.cf.code.CfInstruction;
+import com.android.tools.r8.cf.code.CfInvoke;
+import com.android.tools.r8.contexts.CompilationContext.MethodProcessingContext;
+import com.android.tools.r8.contexts.CompilationContext.ProcessorContext;
+import com.android.tools.r8.desugar.covariantreturntype.CovariantReturnTypeEnqueuerExtension;
+import com.android.tools.r8.dex.IndexedItemCollection;
+import com.android.tools.r8.dex.code.CfOrDexInstruction;
+import com.android.tools.r8.errors.InterfaceDesugarMissingTypeDiagnostic;
+import com.android.tools.r8.experimental.graphinfo.GraphConsumer;
+import com.android.tools.r8.features.IsolatedFeatureSplitsChecker;
+import com.android.tools.r8.graph.AccessControl;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.ClassDefinition;
+import com.android.tools.r8.graph.ClassResolutionResult;
+import com.android.tools.r8.graph.ClasspathOrLibraryClass;
+import com.android.tools.r8.graph.ClasspathOrLibraryDefinition;
+import com.android.tools.r8.graph.Code;
+import com.android.tools.r8.graph.Definition;
+import com.android.tools.r8.graph.DexAnnotation;
+import com.android.tools.r8.graph.DexAnnotation.AnnotatedKind;
+import com.android.tools.r8.graph.DexAnnotationSet;
+import com.android.tools.r8.graph.DexApplication;
+import com.android.tools.r8.graph.DexCallSite;
+import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexClassAndField;
+import com.android.tools.r8.graph.DexClassAndMethod;
+import com.android.tools.r8.graph.DexClasspathClass;
+import com.android.tools.r8.graph.DexDefinition;
+import com.android.tools.r8.graph.DexEncodedField;
+import com.android.tools.r8.graph.DexEncodedMember;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexItemFactory.ClassMethods;
+import com.android.tools.r8.graph.DexLibraryClass;
+import com.android.tools.r8.graph.DexMember;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexMethodHandle;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DexProto;
+import com.android.tools.r8.graph.DexReference;
+import com.android.tools.r8.graph.DexString;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.DexTypeList;
+import com.android.tools.r8.graph.DexValue;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
+import com.android.tools.r8.graph.EnclosingMethodAttribute;
+import com.android.tools.r8.graph.FieldAccessInfoCollectionImpl;
+import com.android.tools.r8.graph.FieldAccessInfoImpl;
+import com.android.tools.r8.graph.FieldResolutionResult;
+import com.android.tools.r8.graph.GenericSignatureEnqueuerAnalysis;
+import com.android.tools.r8.graph.ImmediateAppSubtypingInfo;
+import com.android.tools.r8.graph.InnerClassAttribute;
+import com.android.tools.r8.graph.InvalidCode;
+import com.android.tools.r8.graph.LazyCfCode;
+import com.android.tools.r8.graph.LookupLambdaTarget;
+import com.android.tools.r8.graph.LookupMethodTarget;
+import com.android.tools.r8.graph.LookupResult;
+import com.android.tools.r8.graph.LookupResult.LookupResultSuccess;
+import com.android.tools.r8.graph.LookupTarget;
+import com.android.tools.r8.graph.MethodResolutionResult;
+import com.android.tools.r8.graph.MethodResolutionResult.FailedResolutionResult;
+import com.android.tools.r8.graph.MethodResolutionResult.SingleResolutionResult;
+import com.android.tools.r8.graph.NestMemberClassAttribute;
+import com.android.tools.r8.graph.ObjectAllocationInfoCollectionImpl;
+import com.android.tools.r8.graph.OriginalFieldWitness;
+import com.android.tools.r8.graph.PermittedSubclassAttribute;
+import com.android.tools.r8.graph.ProgramDefinition;
+import com.android.tools.r8.graph.ProgramDerivedContext;
+import com.android.tools.r8.graph.ProgramField;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.UseRegistry.MethodHandleUse;
+import com.android.tools.r8.graph.analysis.ApiModelAnalysis;
+import com.android.tools.r8.graph.analysis.ClassInitializerAssertionEnablingAnalysis;
+import com.android.tools.r8.graph.analysis.EnqueuerAnalysisCollection;
+import com.android.tools.r8.graph.analysis.GetArrayOfMissingTypeVerifyErrorWorkaround;
+import com.android.tools.r8.graph.analysis.InitializedClassesInInstanceMethodsAnalysis;
+import com.android.tools.r8.graph.analysis.InvokeVirtualToInterfaceVerifyErrorWorkaround;
+import com.android.tools.r8.ir.analysis.proto.GeneratedMessageLiteBuilderShrinker;
+import com.android.tools.r8.ir.analysis.proto.ProtoEnqueuerUseRegistry;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoEnqueuerExtension;
+import com.android.tools.r8.ir.conversion.CfToLirConverter;
+import com.android.tools.r8.ir.desugar.CfInstructionDesugaringCollection;
+import com.android.tools.r8.ir.desugar.CfInstructionDesugaringEventConsumer;
+import com.android.tools.r8.ir.desugar.CfPostProcessingDesugaringCollection;
+import com.android.tools.r8.ir.desugar.CfPostProcessingDesugaringEventConsumer;
+import com.android.tools.r8.ir.desugar.LambdaClass;
+import com.android.tools.r8.ir.desugar.LambdaDescriptor;
+import com.android.tools.r8.ir.desugar.ProgramAdditions;
+import com.android.tools.r8.ir.desugar.constantdynamic.ConstantDynamicClass;
+import com.android.tools.r8.ir.desugar.desugaredlibrary.apiconversion.DesugaredLibraryAPIConverter;
+import com.android.tools.r8.ir.desugar.itf.InterfaceMethodProcessorFacade;
+import com.android.tools.r8.ir.desugar.itf.InterfaceProcessor;
+import com.android.tools.r8.ir.desugar.lambda.SyntheticLambdaAccessorMethodConsumer;
+import com.android.tools.r8.ir.optimize.info.MutableMethodOptimizationInfo;
+import com.android.tools.r8.keepanno.ast.KeepDeclaration;
+import com.android.tools.r8.keepradius.KeepRadiusOptions;
+import com.android.tools.r8.keepradius.KeepRadiusOptions.KeepRadiusConsumer;
+import com.android.tools.r8.keepradius.RootSetKeepRadius;
+import com.android.tools.r8.keepradius.RootSetKeepRadiusSerializer;
+import com.android.tools.r8.keepradius.proto.KeepRadiusContainer;
+import com.android.tools.r8.kotlin.KotlinMetadataEnqueuerExtension;
+import com.android.tools.r8.naming.IdentifierNameStringCollection;
+import com.android.tools.r8.optimize.interfaces.analysis.CfOpenClosedInterfacesAnalysis;
+import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.profile.rewriting.ProfileCollectionAdditions;
+import com.android.tools.r8.shaking.AnnotationMatchResult.MatchedAnnotation;
+import com.android.tools.r8.shaking.EnqueuerEvent.ClassEnqueuerEvent;
+import com.android.tools.r8.shaking.EnqueuerEvent.InstantiatedClassEnqueuerEvent;
+import com.android.tools.r8.shaking.EnqueuerEvent.LiveClassEnqueuerEvent;
+import com.android.tools.r8.shaking.EnqueuerEvent.UnconditionalKeepInfoEvent;
+import com.android.tools.r8.shaking.EnqueuerWorklist.EnqueuerAction;
+import com.android.tools.r8.shaking.EnqueuerWorklist.NonPushableEnqueuerWorklist;
+import com.android.tools.r8.shaking.EnqueuerWorklist.TraceInstanceFieldReadAction;
+import com.android.tools.r8.shaking.EnqueuerWorklist.TraceInstanceFieldWriteAction;
+import com.android.tools.r8.shaking.EnqueuerWorklist.TraceStaticFieldReadAction;
+import com.android.tools.r8.shaking.EnqueuerWorklist.TraceStaticFieldWriteAction;
+import com.android.tools.r8.shaking.GraphReporter.KeepReasonWitness;
+import com.android.tools.r8.shaking.KeepInfoCollection.MutableKeepInfoCollection;
+import com.android.tools.r8.shaking.KeepMethodInfo.Joiner;
+import com.android.tools.r8.shaking.KeepReason.ReflectiveUseFromXml;
+import com.android.tools.r8.shaking.ScopedDexMethodSet.AddMethodIfMoreVisibleResult;
+import com.android.tools.r8.shaking.reflectiveidentification.EnqueuerReflectiveIdentification;
+import com.android.tools.r8.shaking.rootset.ConsequentRootSet;
+import com.android.tools.r8.shaking.rootset.RootSet;
+import com.android.tools.r8.shaking.rootset.RootSetBase;
+import com.android.tools.r8.shaking.rootset.RootSetBuilder;
+import com.android.tools.r8.shaking.rules.ApplicableRulesEvaluator;
+import com.android.tools.r8.shaking.rules.KeepAnnotationFakeProguardRule;
+import com.android.tools.r8.shaking.rules.KeepAnnotationMatcher;
+import com.android.tools.r8.synthesis.SyntheticItems.SynthesizingContextOracle;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.StringDiagnostic;
+import com.android.tools.r8.utils.ThreadUtils;
+import com.android.tools.r8.utils.Visibility;
+import com.android.tools.r8.utils.collections.ProgramFieldSet;
+import com.android.tools.r8.utils.collections.ProgramMethodMap;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
+import com.android.tools.r8.utils.internal.Action;
+import com.android.tools.r8.utils.internal.BooleanUtils;
+import com.android.tools.r8.utils.internal.Box;
+import com.android.tools.r8.utils.internal.CollectionUtils;
+import com.android.tools.r8.utils.internal.IteratorUtils;
+import com.android.tools.r8.utils.internal.OptionalBool;
+import com.android.tools.r8.utils.internal.SetUtils;
+import com.android.tools.r8.utils.internal.TraversalContinuation;
+import com.android.tools.r8.utils.internal.collections.WorkList;
+import com.android.tools.r8.utils.internal.exceptions.Unreachable;
+import com.android.tools.r8.utils.timing.Timing;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+/**
+ * Approximates the runtime dependencies for the given set of roots.
+ *
+ * <p>The implementation filters the static call-graph with liveness information on classes to
+ * remove virtual methods that are reachable by their static type but are unreachable at runtime as
+ * they are not visible from any instance.
+ *
+ * <p>As result of the analysis, an instance of {@link AppInfoWithLiveness} is returned. See the
+ * field descriptions for details.
+ */
+public class Enqueuer {
+
+  public enum Mode {
+    INITIAL_TREE_SHAKING,
+    FINAL_TREE_SHAKING,
+    INITIAL_MAIN_DEX_TRACING,
+    FINAL_MAIN_DEX_TRACING,
+    GENERATE_MAIN_DEX_LIST,
+    WHY_ARE_YOU_KEEPING;
+
+    public boolean isTreeShaking() {
+      return isInitialTreeShaking() || isFinalTreeShaking();
+    }
+
+    public boolean isInitialTreeShaking() {
+      return this == INITIAL_TREE_SHAKING;
+    }
+
+    public boolean isFinalTreeShaking() {
+      return this == FINAL_TREE_SHAKING;
+    }
+
+    public boolean isInitialMainDexTracing() {
+      return this == INITIAL_MAIN_DEX_TRACING;
+    }
+
+    public boolean isFinalMainDexTracing() {
+      return this == FINAL_MAIN_DEX_TRACING;
+    }
+
+    public boolean isGenerateMainDexList() {
+      return this == GENERATE_MAIN_DEX_LIST;
+    }
+
+    public boolean isMainDexTracing() {
+      return isInitialMainDexTracing() || isFinalMainDexTracing() || isGenerateMainDexList();
+    }
+
+    public boolean isWhyAreYouKeeping() {
+      return this == WHY_ARE_YOU_KEEPING;
+    }
+  }
+
+  private final boolean forceProguardCompatibility;
+  private final Mode mode;
+
+  private final EnqueuerAnalysisCollection analyses;
+
+  private final Map<DexProgramClass, Boolean> rClassLookupCache = new IdentityHashMap<>();
+
+  // Don't hold a direct pointer to app info (use appView).
+  private AppInfoWithClassHierarchy appInfo;
+  // Create a fair read/write lock for appInfo: "A thread that tries to acquire a fair read lock
+  // (non-reentrantly) will block if either the write lock is held, or there is a waiting writer
+  // thread."
+  private ReentrantReadWriteLock appReadWriteLock = new ReentrantReadWriteLock(true);
+  private final AppView<AppInfoWithClassHierarchy> appView;
+  private final RootSetKeepRadius.Builder keepRadiusBuilder;
+  private final EnqueuerDeferredTracing deferredTracing;
+  private final EnqueuerDeferredAnnotationTracing deferredAnnotationTracing;
+  private final ExecutorService executorService;
+  private ImmediateAppSubtypingInfo subtypingInfo;
+  private final InternalOptions options;
+  private final EnqueuerTaskCollection taskCollection;
+  private RootSet rootSet;
+  private final EnqueuerUseRegistryFactory useRegistryFactory;
+  private AnnotationRemover.Builder annotationRemoverBuilder;
+  private final CfToLirConverter cfToLirConverter;
+
+  private final FieldAccessInfoCollectionImpl fieldAccessInfoCollection =
+      new FieldAccessInfoCollectionImpl();
+  private final ObjectAllocationInfoCollectionImpl.Builder objectAllocationInfoCollection;
+  private final Map<DexCallSite, ProgramMethodSet> callSites = new IdentityHashMap<>();
+
+  private List<KeepDeclaration> keepDeclarations = Collections.emptyList();
+  private ApplicableRulesEvaluator applicableRules = ApplicableRulesEvaluator.empty();
+
+  /**
+   * Tracks the dependency between a method and the super-method it calls, if any. Used to make
+   * super methods become live when they become reachable from a live sub-method.
+   */
+  private final Map<DexEncodedMethod, ProgramMethodSet> superInvokeDependencies =
+      Maps.newIdentityHashMap();
+
+  /** Set of instance fields that can be reached by read/write operations. */
+  private final Map<DexProgramClass, ProgramFieldSet> reachableInstanceFields =
+      Maps.newIdentityHashMap();
+
+  // TODO(b/180091213): Remove when supported by synthetic items.
+  /**
+   * The synthesizing contexts for classes synthesized by lambda desugaring and twr close resource
+   * desugaring.
+   */
+  private final Map<DexProgramClass, ProgramMethod> synthesizingContexts = new IdentityHashMap<>();
+
+  private ResourceShrinkerEnqueuerExtension resourceShrinkerExtension = null;
+
+  /**
+   * Set of types that are mentioned in the program. We at least need an empty abstract class item
+   * for these.
+   */
+  private final SetWithReportedReason<DexProgramClass> liveTypes = new SetWithReportedReason<>();
+
+  /** Set of effectively live items from the original program. */
+  // TODO(b/323816623): Add reason tracking.
+  private final Set<DexReference> effectivelyLiveOriginalReferences = SetUtils.newIdentityHashSet();
+
+  /** Set of interfaces that have been transitioned to being instantiated indirectly. */
+  private final Set<DexProgramClass> interfacesTransitionedToInstantiated =
+      Sets.newIdentityHashSet();
+
+  /** Set of classes whose initializer may execute. */
+  private final SetWithReportedReason<DexProgramClass> initializedClasses =
+      new SetWithReportedReason<>();
+
+  /**
+   * Set of interfaces whose interface initializer may execute directly in response to a static
+   * field or method access on the interface.
+   */
+  private final SetWithReportedReason<DexProgramClass> directlyInitializedInterfaces =
+      new SetWithReportedReason<>();
+
+  /**
+   * Set of interfaces whose interface initializer may execute indirectly as a side-effect of the
+   * class initialization of a (non-interface) subclass.
+   */
+  private final SetWithReportedReason<DexProgramClass> indirectlyInitializedInterfaces =
+      new SetWithReportedReason<>();
+
+  /**
+   * Set of live types defined in the library and classpath.
+   *
+   * <p>Used to build a new app of just referenced types and avoid duplicate tracing.
+   */
+  private final Set<ClasspathOrLibraryClass> liveNonProgramTypes = Sets.newIdentityHashSet();
+
+  private final Set<ClasspathOrLibraryClass> referencedNonProgramTypes = Sets.newIdentityHashSet();
+
+  /** Set of reachable proto types that will be dead code eliminated. */
+  private final Set<DexProgramClass> deadProtoTypeCandidates = Sets.newIdentityHashSet();
+
+  /** Set of missing types. */
+  private final MissingClasses.Builder missingClassesBuilder;
+
+  /** Set of proto types that were found to be dead during the first round of tree shaking. */
+  private Set<DexType> initialDeadProtoTypes = Sets.newIdentityHashSet();
+
+  /** Set of types that was pruned during the first round of tree shaking. */
+  private final Set<DexType> initialPrunedTypes;
+
+  /** List of classpath types that was pruned during the first round of tree shaking. */
+  private final Set<DexType> prunedClasspathTypes;
+
+  private final Set<DexType> noClassMerging = Sets.newIdentityHashSet();
+
+  /** Mapping from each unused interface to the set of live types that implements the interface. */
+  private final Map<DexProgramClass, Set<DexProgramClass>> unusedInterfaceTypes =
+      new IdentityHashMap<>();
+
+  /**
+   * Set of methods that are the immediate target of an invoke. They might not actually be live but
+   * are required so that invokes can find the method. If a method is only a target but not live,
+   * its implementation may be removed and it may be marked abstract.
+   */
+  private final LiveMethodsSet targetedMethods;
+
+  /** Set of classes that have invalid resolutions or loookups. */
+  private final Set<DexType> failedClassResolutionTargets;
+
+  /** Set of methods that have invalid resolutions or lookups. */
+  private final Set<DexMethod> failedMethodResolutionTargets;
+
+  /** Set of methods that have invalid resolutions or lookups. */
+  private final Set<DexField> failedFieldResolutionTargets;
+
+  /**
+   * Set of program methods that are used as the bootstrap method for an invoke-dynamic instruction.
+   */
+  private final Set<DexMethod> bootstrapMethods = Sets.newIdentityHashSet();
+
+  /** Set of virtual methods that are the immediate target of an invoke-direct. */
+  private final Set<DexMethod> virtualMethodsTargetedByInvokeDirect = Sets.newIdentityHashSet();
+
+  /**
+   * Set of methods that belong to live classes and can be reached by invokes. These need to be
+   * kept.
+   */
+  private final LiveMethodsSet liveMethods;
+
+  /**
+   * Set of fields that belong to live classes and can be reached by invokes. These need to be kept.
+   */
+  private final LiveFieldsSet liveFields;
+
+  /** A queue of items that need processing. Different items trigger different actions. */
+  private EnqueuerWorklist worklist;
+
+  private final ProguardCompatibilityActions.Builder proguardCompatibilityActionsBuilder;
+
+  /** Tracing of reflection. */
+  private final EnqueuerReflectiveIdentification reflectiveIdentification;
+
+  /** Mapping of types to the resolved methods for that type. */
+  private final Map<DexProgramClass, Set<ResolutionSearchKey>> reachableVirtualTargets =
+      new IdentityHashMap<>();
+
+  /** Collection of keep requirements for the program. Must only be accessed through its getters. */
+  private final MutableKeepInfoCollection keepInfo;
+
+  /**
+   * Conditional minimum keep info for classes, fields, and methods, which should only be applied if
+   * the outermost {@link EnqueuerEvent} is triggered during tracing (e.g., class X becomes live).
+   */
+  private final DependentMinimumKeepInfoCollection dependentMinimumKeepInfo =
+      DependentMinimumKeepInfoCollection.createConcurrent();
+
+  /**
+   * A set of seen const-class references that serve as an initial lock-candidate set and will
+   * prevent class merging.
+   */
+  private final Set<DexType> lockCandidates = Sets.newIdentityHashSet();
+
+  /**
+   * A map from seen init-class references to the minimum required visibility of the corresponding
+   * static field.
+   */
+  private final Map<DexType, Visibility> initClassReferences = new IdentityHashMap<>();
+
+  /**
+   * A map from seen init-class references to the minimum required visibility of the corresponding
+   * static field.
+   */
+  private final Set<DexMethod> recordFieldValuesReferences = Sets.newIdentityHashSet();
+
+  /**
+   * A cache of ScopedDexMethodSet for each live type used for determining that virtual methods that
+   * cannot be removed because they are widening access for another virtual method defined earlier
+   * in the type hierarchy. See b/136698023 for more information.
+   */
+  private final Map<DexType, ScopedDexMethodSet> scopedMethodsForLiveTypes =
+      new IdentityHashMap<>();
+
+  private final GraphReporter graphReporter;
+
+  private final CfInstructionDesugaringCollection desugaring;
+  private final ProgramMethodSet pendingCodeDesugaring = ProgramMethodSet.createConcurrent();
+
+  // Collections for tracing progress on interface method desugaring.
+
+  // The pending method move set is all the methods that need to be moved to companions.
+  // They may or may not need desugaring.
+  private final ProgramMethodSet pendingMethodMove = ProgramMethodSet.create();
+
+  // The inverse map records references to companion methods that may now be active but yet to
+  // be moved.
+  private final ProgramMethodMap<ProgramMethod> pendingMethodMoveInverse =
+      ProgramMethodMap.createConcurrent();
+
+  private final InterfaceProcessor interfaceProcessor;
+
+  private final Thread mainThreadForTesting = Thread.currentThread();
+
+  private final ProfileCollectionAdditions profileCollectionAdditions;
+
+  Enqueuer(
+      AppView<? extends AppInfoWithClassHierarchy> appView,
+      ProfileCollectionAdditions profileCollectionAdditions,
+      ExecutorService executorService,
+      ImmediateAppSubtypingInfo subtypingInfo,
+      GraphConsumer keptGraphConsumer,
+      Mode mode) {
+    this(
+        appView,
+        profileCollectionAdditions,
+        executorService,
+        subtypingInfo,
+        keptGraphConsumer,
+        mode,
+        null,
+        null,
+        null);
+  }
+
+  Enqueuer(
+      AppView<? extends AppInfoWithClassHierarchy> appView,
+      ProfileCollectionAdditions profileCollectionAdditions,
+      ExecutorService executorService,
+      ImmediateAppSubtypingInfo subtypingInfo,
+      GraphConsumer keptGraphConsumer,
+      Mode mode,
+      Set<DexType> initialPrunedTypes,
+      Set<DexType> prunedClasspathTypes,
+      RuntimeTypeCheckInfo.Builder runtimeTypeCheckInfoBuilder) {
+    assert appView.appServices() != null;
+    InternalOptions options = appView.options();
+    this.appInfo = appView.appInfo();
+    this.appView = appView.withClassHierarchy();
+    this.keepRadiusBuilder = RootSetKeepRadius.builder(appView, mode);
+    this.mode = mode;
+    this.profileCollectionAdditions = profileCollectionAdditions;
+    this.deferredTracing = EnqueuerDeferredTracing.create(appView, this, mode);
+    this.deferredAnnotationTracing = new EnqueuerDeferredAnnotationTracing(this);
+    this.executorService = executorService;
+    this.subtypingInfo = subtypingInfo;
+    this.forceProguardCompatibility = options.forceProguardCompatibility;
+    this.graphReporter = new GraphReporter(appView, keptGraphConsumer);
+    this.missingClassesBuilder = appView.appInfo().getMissingClasses().builder();
+    this.options = options;
+    this.taskCollection =
+        new EnqueuerTaskCollection(this, options.getThreadingModule(), executorService);
+    this.keepInfo =
+        new MutableKeepInfoCollection(
+            appView, this, KeepInfoCollectionEventConsumer.create(keepRadiusBuilder));
+    this.reflectiveIdentification = new EnqueuerReflectiveIdentification(appView, this);
+    this.useRegistryFactory = createUseRegistryFactory();
+    this.worklist = EnqueuerWorklist.createWorklist(this, options.getThreadingModule());
+    this.proguardCompatibilityActionsBuilder =
+        mode.isInitialTreeShaking() && options.forceProguardCompatibility
+            ? ProguardCompatibilityActions.builder()
+            : null;
+    this.initialPrunedTypes = initialPrunedTypes;
+    this.prunedClasspathTypes = prunedClasspathTypes;
+
+    EnqueuerAnalysisCollection.Builder analysesBuilder = EnqueuerAnalysisCollection.builder();
+    if (mode.isTreeShaking()) {
+      EnqueuerDefinitionSupplier enqueuerDefinitionSupplier = new EnqueuerDefinitionSupplier(this);
+      ApiModelAnalysis.register(appView, analysesBuilder);
+      ClassInitializerAssertionEnablingAnalysis.register(appView, this, analysesBuilder);
+      CovariantReturnTypeEnqueuerExtension.register(appView, this, analysesBuilder);
+      GeneratedMessageLiteBuilderShrinker.register(appView, analysesBuilder);
+      GenericSignatureEnqueuerAnalysis.register(
+          appView, enqueuerDefinitionSupplier, analysesBuilder);
+      GetArrayOfMissingTypeVerifyErrorWorkaround.register(appView, this, analysesBuilder);
+      IfRuleEvaluatorFactory.register(appView, this, analysesBuilder, executorService);
+      InitializedClassesInInstanceMethodsAnalysis.register(appView, this, analysesBuilder);
+      InvokeVirtualToInterfaceVerifyErrorWorkaround.register(appView, this, analysesBuilder);
+      IsolatedFeatureSplitsChecker.register(appView, analysesBuilder);
+      KotlinMetadataEnqueuerExtension.register(
+          appView, enqueuerDefinitionSupplier, initialPrunedTypes, analysesBuilder);
+      ProtoEnqueuerExtension.register(appView, this, analysesBuilder);
+      this.resourceShrinkerExtension =
+          ResourceShrinkerEnqueuerExtension.register(appView, this, analysesBuilder);
+      RuntimeTypeCheckInfo.register(runtimeTypeCheckInfoBuilder, analysesBuilder);
+      EnqueuerMockitoAnalysis.register(appView, this, analysesBuilder);
+      // Enum reflection tracing is best-effort, but since it is more common for non-Android uses to
+      // omit the Enum.values() -keep that Android Studio uses, we enable Java enum reflection
+      // tracing by default, but leave Android's behind a flag.
+      new EnqueuerEnumReflectionAnalysisJava(appView, this).register(analysesBuilder);
+      new EnqueuerEnumReflectionAnalysisAndroid(appView, this).register(analysesBuilder);
+      CfOpenClosedInterfacesAnalysis.register(appView, this, analysesBuilder);
+      cfToLirConverter = CfToLirConverter.register(appView, this, analysesBuilder);
+      deferredTracing.register(analysesBuilder);
+      taskCollection.register(analysesBuilder);
+    } else {
+      cfToLirConverter = null;
+    }
+    analyses = analysesBuilder.build();
+
+    targetedMethods = new LiveMethodsSet(graphReporter::registerMethod);
+    failedClassResolutionTargets = SetUtils.newIdentityHashSet(0);
+    // This set is only populated in edge cases due to multiple default interface methods.
+    // The set is generally expected to be empty and in the unlikely chance it is not, it will
+    // likely contain two methods. Thus the default capacity of 2.
+    failedMethodResolutionTargets = SetUtils.newIdentityHashSet(2);
+    failedFieldResolutionTargets = SetUtils.newIdentityHashSet(0);
+    liveMethods = new LiveMethodsSet(graphReporter::registerMethod);
+    liveFields = new LiveFieldsSet(graphReporter::registerField);
+    if (mode.isInitialTreeShaking()) {
+      desugaring = CfInstructionDesugaringCollection.create(appView);
+      interfaceProcessor = InterfaceProcessor.createCfToCf(appView);
+    } else {
+      desugaring = CfInstructionDesugaringCollection.empty();
+      interfaceProcessor = null;
+    }
+
+    objectAllocationInfoCollection =
+        ObjectAllocationInfoCollectionImpl.builder(mode.isInitialTreeShaking(), graphReporter);
+  }
+
+  private AppInfoWithClassHierarchy appInfo() {
+    return appView.appInfo();
+  }
+
+  public ReentrantReadWriteLock.ReadLock getAppReadLock() {
+    return appReadWriteLock.readLock();
+  }
+
+  public void withAppReadLock(Runnable runnable) {
+    ReentrantReadWriteLock.ReadLock appReadLock = getAppReadLock();
+    appReadLock.lock();
+    try {
+      runnable.run();
+    } finally {
+      appReadLock.unlock();
+    }
+  }
+
+  public ProfileCollectionAdditions getProfileCollectionAdditions() {
+    return profileCollectionAdditions;
+  }
+
+  public Mode getMode() {
+    return mode;
+  }
+
+  public GraphReporter getGraphReporter() {
+    return graphReporter;
+  }
+
+  private EnqueuerUseRegistryFactory createUseRegistryFactory() {
+    if (mode.isFinalTreeShaking()) {
+      return appView.withGeneratedMessageLiteShrinker(
+          ignore -> ProtoEnqueuerUseRegistry.getFactory(), DefaultEnqueuerUseRegistry::new);
+    }
+    return DefaultEnqueuerUseRegistry::new;
+  }
+
+  public EnqueuerUseRegistryFactory getUseRegistryFactory() {
+    return useRegistryFactory;
+  }
+
+  public void setKeepDeclarations(List<KeepDeclaration> keepDeclarations) {
+    // Keep declarations are used during initial tree shaking. Re-runs use the rule instance sets.
+    assert mode.isInitialTreeShaking();
+    assert keepDeclarations != null;
+    this.keepDeclarations = keepDeclarations;
+  }
+
+  public void setAnnotationRemoverBuilder(AnnotationRemover.Builder annotationRemoverBuilder) {
+    this.annotationRemoverBuilder = annotationRemoverBuilder;
+  }
+
+  public void setInitialDeadProtoTypes(Set<DexType> initialDeadProtoTypes) {
+    assert mode.isFinalTreeShaking();
+    this.initialDeadProtoTypes = initialDeadProtoTypes;
+  }
+
+  public void addDeadProtoTypeCandidate(DexType type) {
+    DexProgramClass clazz = asProgramClassOrNull(appView.definitionFor(type));
+    if (clazz != null) {
+      addDeadProtoTypeCandidate(clazz);
+    }
+  }
+
+  public void addDeadProtoTypeCandidate(DexProgramClass clazz) {
+    deadProtoTypeCandidates.add(clazz);
+  }
+
+  public boolean addLiveMethod(ProgramMethod method, KeepReason reason) {
+    addEffectivelyLiveOriginalMethod(method);
+    return liveMethods.add(method, reason);
+  }
+
+  public boolean addTargetedMethod(ProgramMethod method, KeepReason reason) {
+    addEffectivelyLiveOriginalMethod(method);
+    return targetedMethods.add(method, reason);
+  }
+
+  private void addEffectivelyLiveOriginalMethod(ProgramMethod method) {
+    if (method.getDefinition().hasPendingInlineFrame()) {
+      traceMethodPosition(method.getDefinition().getPendingInlineFrameAsPosition(), method);
+    } else if (!method.getDefinition().isD8R8Synthesized()) {
+      markEffectivelyLiveOriginalReference(method.getReference());
+    }
+  }
+
+  private void recordCompilerSynthesizedTypeReference(DexType type) {
+    DexClass clazz = appInfo().definitionFor(type);
+    if (clazz == null) {
+      ignoreMissingClass(type);
+    } else if (clazz.isNotProgramClass()) {
+      addLiveNonProgramType(
+          clazz.asClasspathOrLibraryClass(), true, this::ignoreMissingClasspathOrLibraryClass);
+    }
+  }
+
+  private void recordTypeReference(DexType type, ProgramDefinition context) {
+    recordTypeReference(type, context, this::recordNonProgramClass, this::reportMissingClass);
+  }
+
+  private void recordTypeReference(DexType type, ProgramDerivedContext context) {
+    recordTypeReference(type, context, this::recordNonProgramClass, this::reportMissingClass);
+  }
+
+  boolean recordReferenceFromResources(String possibleClass, Origin origin, boolean markAsLive) {
+    if (!DescriptorUtils.isValidJavaType(possibleClass)) {
+      return false;
+    }
+    DexType dexType =
+        appView
+            .dexItemFactory()
+            .createType(DescriptorUtils.javaTypeToDescriptor(possibleClass))
+            .getBaseType();
+    if (!dexType.isClassType()) {
+      return false;
+    }
+    DexProgramClass clazz = appView.definitionForProgramType(dexType);
+    if (clazz == null) {
+      return false;
+    }
+
+    ReflectiveUseFromXml reason = KeepReason.reflectiveUseFromXml(origin);
+    ensureClassKeptForResourceLookup(clazz, reason, markAsLive);
+
+    DexItemFactory factory = appView.dexItemFactory();
+    boolean isFrameworkClass =
+        appInfo
+            .traverseSuperClasses(
+                clazz,
+                (supertype, superclass, subclass) ->
+                    TraversalContinuation.breakIf(
+                        supertype.isIdenticalTo(factory.androidViewViewType)
+                            || supertype.isIdenticalTo(factory.androidPreferencePreferenceType)
+                            || supertype.isIdenticalTo(factory.androidTransitionTransitionType)))
+            .isBreak();
+
+    for (ProgramMethod programInstanceInitializer : clazz.programInstanceInitializers()) {
+      if (isFrameworkClass && !isFrameworkTargetedConstructor(programInstanceInitializer)) {
+        continue;
+      }
+      applyMinimumKeepInfoWhenLiveOrTargeted(
+          programInstanceInitializer, KeepMethodInfo.newEmptyJoiner().disallowOptimization());
+      if (markAsLive) {
+        markMethodAsTargeted(programInstanceInitializer, reason);
+        markDirectStaticOrConstructorMethodAsLive(programInstanceInitializer, reason);
+      } else {
+        recordDependentMinimumKeepInfo(
+            new LiveClassEnqueuerEvent(clazz),
+            programInstanceInitializer,
+            KeepMethodInfo.newEmptyJoiner().disallowShrinking().addReason(reason));
+      }
+    }
+    return true;
+  }
+
+  private boolean isFrameworkTargetedConstructor(ProgramMethod programInstanceInitializer) {
+    DexTypeList parameters = programInstanceInitializer.getParameters();
+    int size = parameters.size();
+    if (size == 0) {
+      return true;
+    }
+    DexItemFactory factory = appView.dexItemFactory();
+    DexType contextType = factory.androidContentContextType;
+    if (size == 1) {
+      return parameters.values[0].isIdenticalTo(contextType);
+    }
+    if (size == 2) {
+      DexType attributeSetType = factory.androidUtilAttributeSetType;
+      return parameters.values[0].isIdenticalTo(contextType)
+          && parameters.values[1].isIdenticalTo(attributeSetType);
+    }
+    return false;
+  }
+
+  private void ensureClassKeptForResourceLookup(
+      DexProgramClass clazz, ReflectiveUseFromXml reason, boolean markAsLive) {
+    applyMinimumKeepInfoWhenLive(
+        clazz,
+        KeepClassInfo.newEmptyJoiner()
+            .disallowMinification()
+            .disallowRepackaging()
+            .disallowOptimization()
+            .addReason(reason));
+    if (!markAsLive) {
+      return;
+    }
+    if (clazz.isAnnotation() || clazz.isInterface()) {
+      markTypeAsLive(clazz, reason);
+    } else {
+      markClassAsInstantiatedWithReason(clazz, reason);
+    }
+  }
+
+  private void recordTypeReference(
+      DexType type,
+      ProgramDerivedContext context,
+      BiConsumer<DexClass, ProgramDerivedContext> foundClassConsumer,
+      BiConsumer<DexType, ProgramDerivedContext> missingClassConsumer) {
+    if (type == null) {
+      return;
+    }
+    if (type.isArrayType()) {
+      type = type.getBaseType();
+    }
+    if (!type.isClassType()) {
+      return;
+    }
+    // Lookup the definition, ignoring the result. This populates the missing and referenced sets.
+    definitionFor(type, context, foundClassConsumer, missingClassConsumer);
+  }
+
+  private void recordMethodReference(DexMethod method, ProgramDerivedContext context) {
+    recordMethodReference(method, context, this::recordNonProgramClass, this::reportMissingClass);
+  }
+
+  private void recordMethodReference(
+      DexMethod method,
+      ProgramDerivedContext context,
+      BiConsumer<DexClass, ProgramDerivedContext> foundClassConsumer,
+      BiConsumer<DexType, ProgramDerivedContext> missingClassConsumer) {
+    recordTypeReference(method.holder, context, foundClassConsumer, missingClassConsumer);
+    recordTypeReference(method.proto.returnType, context, foundClassConsumer, missingClassConsumer);
+    for (DexType type : method.proto.parameters.values) {
+      recordTypeReference(type, context, foundClassConsumer, missingClassConsumer);
+    }
+  }
+
+  private void recordFieldReference(DexField field, ProgramDerivedContext context) {
+    recordTypeReference(field.getHolderType(), context);
+    recordTypeReference(field.getType(), context);
+  }
+
+  public DexEncodedMethod definitionFor(DexMethod method, ProgramDefinition context) {
+    DexClass clazz = definitionFor(method.holder, context);
+    if (clazz == null) {
+      return null;
+    }
+    return clazz.lookupMethod(method);
+  }
+
+  public DexClass definitionFor(DexType type, ProgramDefinition context) {
+    return definitionFor(type, context, this::recordNonProgramClass, this::reportMissingClass);
+  }
+
+  public boolean hasAlternativeLibraryDefinition(DexProgramClass programClass) {
+    ClassResolutionResult classResolutionResult =
+        internalDefinitionFor(
+            programClass.type, programClass, this::recordNonProgramClass, this::reportMissingClass);
+    assert classResolutionResult.hasClassResolutionResult();
+    DexClass alternativeClass = classResolutionResult.toAlternativeClass();
+    assert alternativeClass == null || alternativeClass.isLibraryClass();
+    return alternativeClass != null;
+  }
+
+  private DexClass definitionFor(
+      DexType type,
+      ProgramDerivedContext context,
+      BiConsumer<DexClass, ProgramDerivedContext> foundClassConsumer,
+      BiConsumer<DexType, ProgramDerivedContext> missingClassConsumer) {
+    assert verifyIsMainThread();
+    return internalDefinitionFor(type, context, foundClassConsumer, missingClassConsumer)
+        .toSingleClassWithProgramOverLibrary();
+  }
+
+  private ClassResolutionResult internalDefinitionFor(
+      DexType type,
+      ProgramDerivedContext context,
+      BiConsumer<DexClass, ProgramDerivedContext> foundClassConsumer,
+      BiConsumer<DexType, ProgramDerivedContext> missingClassConsumer) {
+    ClassResolutionResult classResolutionResult =
+        appInfo().contextIndependentDefinitionForWithResolutionResult(type);
+    if (classResolutionResult.hasClassResolutionResult()) {
+      classResolutionResult.forEachClassResolutionResult(
+          clazz -> foundClassConsumer.accept(clazz, context));
+    } else {
+      missingClassConsumer.accept(type, context);
+    }
+    return classResolutionResult;
+  }
+
+  public EnqueuerAnalysisCollection getAnalyses() {
+    return analyses;
+  }
+
+  public FieldAccessInfoCollectionImpl getFieldAccessInfoCollection() {
+    return fieldAccessInfoCollection;
+  }
+
+  public KeepInfoCollection getKeepInfo() {
+    return keepInfo;
+  }
+
+  public <T extends ProgramDefinition> void mutateKeepInfo(
+      T itemToChange, BiConsumer<MutableKeepInfoCollection, T> consumer) {
+    consumer.accept(keepInfo, itemToChange);
+    deferredAnnotationTracing.notifyKeepInfoChanged(itemToChange);
+  }
+
+  public KeepClassInfo getKeepInfo(DexProgramClass clazz) {
+    return keepInfo.getClassInfo(clazz);
+  }
+
+  public EnqueuerReflectiveIdentification getReflectiveIdentification() {
+    return reflectiveIdentification;
+  }
+
+  public ImmediateAppSubtypingInfo getSubtypingInfo() {
+    return subtypingInfo;
+  }
+
+  public EnqueuerTaskCollection getTaskCollection() {
+    return taskCollection;
+  }
+
+  public boolean hasMinimumKeepInfoThatMatches(
+      DexProgramClass clazz, Predicate<KeepClassInfo.Joiner> predicate) {
+    MinimumKeepInfoCollection minimumKeepInfoCollection =
+        dependentMinimumKeepInfo.getUnconditionalMinimumKeepInfoOrDefault(
+            MinimumKeepInfoCollection.empty());
+    KeepClassInfo.Joiner minimumKeepInfo =
+        asClassJoinerOrNull(minimumKeepInfoCollection.getOrDefault(clazz.getReference(), null));
+    return minimumKeepInfo != null && predicate.test(minimumKeepInfo);
+  }
+
+  public KeepFieldInfo getKeepInfo(ProgramField field) {
+    return keepInfo.getFieldInfo(field);
+  }
+
+  public boolean hasMinimumKeepInfoThatMatches(
+      ProgramField field, Predicate<KeepFieldInfo.Joiner> predicate) {
+    MinimumKeepInfoCollection minimumKeepInfoCollection =
+        dependentMinimumKeepInfo.getUnconditionalMinimumKeepInfoOrDefault(
+            MinimumKeepInfoCollection.empty());
+    KeepFieldInfo.Joiner minimumKeepInfo =
+        asFieldJoinerOrNull(minimumKeepInfoCollection.getOrDefault(field.getReference(), null));
+    return minimumKeepInfo != null && predicate.test(minimumKeepInfo);
+  }
+
+  public ObjectAllocationInfoCollectionImpl getObjectAllocationInfoCollection() {
+    return objectAllocationInfoCollection;
+  }
+
+  public EnqueuerWorklist getWorklist() {
+    return worklist;
+  }
+
+  private void addLiveNonProgramType(
+      ClasspathOrLibraryClass clazz,
+      // TODO(b/216576191): Remove when tracking live library members.
+      boolean markProgramSuperTypesAsLiveAndVisitMemberReferences,
+      BiConsumer<DexType, ClasspathOrLibraryDefinition> missingClassConsumer) {
+    WorkList<ClasspathOrLibraryClass> worklist =
+        WorkList.newIdentityWorkList(clazz, liveNonProgramTypes);
+    while (worklist.hasNext()) {
+      ClasspathOrLibraryClass definition = worklist.next();
+      processNewLiveNonProgramType(
+          definition,
+          worklist,
+          missingClassConsumer,
+          markProgramSuperTypesAsLiveAndVisitMemberReferences);
+    }
+  }
+
+  private void processNewLiveNonProgramType(
+      ClasspathOrLibraryClass clazz,
+      WorkList<ClasspathOrLibraryClass> worklist,
+      BiConsumer<DexType, ClasspathOrLibraryDefinition> missingClassConsumer,
+      boolean markProgramSuperTypesAsLiveAndVisitMemberReferences) {
+    ensureMethodsContinueToWidenAccess(clazz);
+    if (markProgramSuperTypesAsLiveAndVisitMemberReferences) {
+      if (clazz.isLibraryClass()) {
+        // Only libraries must not derive program. Classpath classes can, assuming correct keep
+        // rules.
+        handleLibraryTypeInheritingFromProgramType(clazz.asLibraryClass());
+      }
+      analyses.processNewlyLiveNonProgramType(clazz);
+      clazz.forEachClassField(
+          field ->
+              addNonProgramClassToWorklist(
+                  field.getType(),
+                  field.asClasspathOrLibraryDefinition(),
+                  referencedNonProgramTypes::add,
+                  missingClassConsumer));
+      clazz.forEachClassMethod(
+          method -> {
+            ClasspathOrLibraryDefinition derivedContext = method.asClasspathOrLibraryDefinition();
+            addNonProgramClassToWorklist(
+                method.getReturnType(),
+                derivedContext,
+                referencedNonProgramTypes::add,
+                missingClassConsumer);
+            for (DexType parameter : method.getParameters()) {
+              addNonProgramClassToWorklist(
+                  parameter, derivedContext, referencedNonProgramTypes::add, missingClassConsumer);
+            }
+          });
+    }
+    for (DexType supertype : clazz.allImmediateSupertypes()) {
+      addNonProgramClassToWorklist(
+          supertype,
+          clazz.asClasspathOrLibraryDefinition(),
+          worklist::addIfNotSeen,
+          missingClassConsumer);
+    }
+  }
+
+  private void addNonProgramClassToWorklist(
+      DexType type,
+      ClasspathOrLibraryDefinition context,
+      Consumer<ClasspathOrLibraryClass> classAdder,
+      BiConsumer<DexType, ClasspathOrLibraryDefinition> missingClassConsumer) {
+    if (type.isArrayType()) {
+      type = type.getBaseType();
+    }
+    if (!type.isClassType()) {
+      return;
+    }
+    ClassResolutionResult classResolutionResult =
+        appView.contextIndependentDefinitionForWithResolutionResult(type);
+    if (!classResolutionResult.hasClassResolutionResult()) {
+      missingClassConsumer.accept(type, context);
+      return;
+    }
+    classResolutionResult.forEachClassResolutionResult(
+        clazz -> {
+          if (!clazz.isProgramClass()) {
+            classAdder.accept(clazz.asClasspathOrLibraryClass());
+          }
+        });
+  }
+
+  public DexProgramClass getProgramClassOrNull(DexType type, ProgramDefinition context) {
+    DexClass clazz = definitionFor(type, context);
+    return clazz != null && clazz.isProgramClass() ? clazz.asProgramClass() : null;
+  }
+
+  private DexProgramClass getProgramHolderOrNull(
+      DexMember<?, ?> member, ProgramDefinition context) {
+    return getProgramClassOrNull(member.getHolderType(), context);
+  }
+
+  private DexClass getClassOrNullFromReflectiveAccess(DexType type, ProgramDefinition context) {
+    // To avoid that we report reflectively accessed types as missing.
+    return definitionFor(
+        type, context, this::recordNonProgramClassWithNoMissingReporting, this::ignoreMissingClass);
+  }
+
+  public DexProgramClass getProgramClassOrNullFromReflectiveAccess(
+      DexType type, ProgramDefinition context) {
+    return asProgramClassOrNull(getClassOrNullFromReflectiveAccess(type, context));
+  }
+
+  private void handleLibraryTypeInheritingFromProgramType(DexLibraryClass clazz) {
+    if (clazz.superType != null) {
+      ensureFromLibraryOrThrow(clazz.superType, clazz);
+    }
+    for (DexType iface : clazz.interfaces.values) {
+      ensureFromLibraryOrThrow(iface, clazz);
+    }
+  }
+
+  private void warnIfClassExtendsInterfaceOrImplementsClass(DexProgramClass clazz) {
+    if (clazz.superType != null) {
+      DexClass superClass = definitionFor(clazz.superType, clazz);
+      if (superClass != null && superClass.isInterface()) {
+        options.reporter.warning(
+            new StringDiagnostic(
+                "Class "
+                    + clazz.toSourceString()
+                    + " extends "
+                    + superClass.toSourceString()
+                    + " which is an interface"));
+      }
+    }
+    for (DexType iface : clazz.interfaces.values) {
+      DexClass ifaceClass = definitionFor(iface, clazz);
+      if (ifaceClass != null && !ifaceClass.isInterface()) {
+        options.reporter.warning(
+            new StringDiagnostic(
+                "Class "
+                    + clazz.toSourceString()
+                    + " implements "
+                    + ifaceClass.toSourceString()
+                    + " which is not an interface"));
+      }
+    }
+  }
+
+  private void enqueueAllIfNotShrinking() {
+    if (appView.options().isShrinking()) {
+      return;
+    }
+    // Add everything if we are not shrinking.
+    KeepClassInfo.Joiner keepClassInfo = KeepClassInfo.newEmptyJoiner().disallowShrinking();
+    KeepFieldInfo.Joiner keepFieldInfo = KeepFieldInfo.newEmptyJoiner().disallowShrinking();
+    KeepMethodInfo.Joiner keepMethodInfo = KeepMethodInfo.newEmptyJoiner().disallowShrinking();
+    EnqueuerEvent preconditionEvent = UnconditionalKeepInfoEvent.get();
+    for (DexProgramClass clazz : appView.appInfo().classes()) {
+      if (appView.getSyntheticItems().isSyntheticClass(clazz)
+          && !appView.getSyntheticItems().isSubjectToKeepRules(clazz)) {
+        // Don't treat compiler synthesized classes as kept roots.
+        continue;
+      }
+      enqueueClassDueToNoShrinkingRule(clazz, keepClassInfo, preconditionEvent);
+      clazz.forEachProgramField(
+          field -> enqueueFieldDueToNoShrinkingRule(field, keepFieldInfo, preconditionEvent));
+      clazz.forEachProgramMethod(
+          method -> enqueueMethodDueToNoShrinkingRule(method, keepMethodInfo, preconditionEvent));
+    }
+  }
+
+  private void enqueueClassDueToNoShrinkingRule(
+      DexProgramClass clazz,
+      KeepClassInfo.Joiner minimumKeepInfo,
+      EnqueuerEvent preconditionEvent) {
+    assert minimumKeepInfo.verifyShrinkingDisallowedWithRule(options);
+    DexDefinition precondition = preconditionEvent.getDefinition(appInfo());
+    enqueueKeepRuleInstantiatedType(
+        clazz, minimumKeepInfo.getReasons(), minimumKeepInfo.getRules(), precondition);
+  }
+
+  private void enqueueKeepRuleInstantiatedType(
+      DexProgramClass clazz,
+      Set<KeepReason> reasons,
+      Set<ProguardKeepRuleBase> rules,
+      DexDefinition precondition) {
+    KeepReasonWitness witness = graphReporter.reportKeepClass(precondition, reasons, rules, clazz);
+    if (clazz.isAnnotation()) {
+      worklist.enqueueMarkAnnotationInstantiatedAction(clazz, witness);
+    } else if (clazz.isInterface()) {
+      worklist.enqueueMarkInterfaceInstantiatedAction(clazz, witness);
+    } else {
+      worklist.enqueueMarkInstantiatedAction(clazz, null, InstantiationReason.KEEP_RULE, witness);
+      if (clazz.hasDefaultInitializer()) {
+        ProgramMethod defaultInitializer = clazz.getProgramDefaultInitializer();
+        if (forceProguardCompatibility) {
+          Joiner joiner = KeepMethodInfo.newEmptyJoiner();
+          for (ProguardKeepRuleBase rule : rules) {
+            if (!(rule instanceof KeepAnnotationFakeProguardRule)
+                && !rule.getType().equals(ProguardKeepRuleType.KEEP_CLASS_MEMBERS)) {
+              joiner.addRule(rule);
+            }
+          }
+          if (!joiner.getRules().isEmpty()) {
+            worklist.enqueueMarkMethodKeptAction(
+                defaultInitializer,
+                graphReporter.reportCompatKeepDefaultInitializer(defaultInitializer));
+            applyMinimumKeepInfoWhenLiveOrTargeted(
+                defaultInitializer, joiner.disallowOptimization());
+          }
+        }
+        if (clazz.isExternalizable(appView)) {
+          worklist.enqueueMarkMethodLiveAction(defaultInitializer, defaultInitializer, witness);
+          applyMinimumKeepInfoWhenLiveOrTargeted(
+              defaultInitializer, KeepMethodInfo.newEmptyJoiner().disallowOptimization());
+        }
+      }
+    }
+  }
+
+  private void enqueueFieldDueToNoShrinkingRule(
+      ProgramField field, KeepFieldInfo.Joiner minimumKeepInfo, EnqueuerEvent preconditionEvent) {
+    assert minimumKeepInfo.verifyShrinkingDisallowedWithRule(options);
+    DexDefinition precondition = preconditionEvent.getDefinition(appInfo());
+    worklist.enqueueMarkFieldKeptAction(
+        field,
+        graphReporter.reportKeepField(
+            precondition,
+            minimumKeepInfo.getReasons(),
+            minimumKeepInfo.getRules(),
+            field.getDefinition()));
+  }
+
+  public void enqueueMethodDueToNoShrinkingRule(
+      ProgramMethod method,
+      KeepMethodInfo.Joiner minimumKeepInfo,
+      EnqueuerEvent preconditionEvent) {
+    assert minimumKeepInfo.verifyShrinkingDisallowedWithRule(options);
+    DexDefinition precondition = preconditionEvent.getDefinition(appInfo());
+    worklist.enqueueMarkMethodKeptAction(
+        method,
+        graphReporter.reportKeepMethod(
+            precondition,
+            minimumKeepInfo.getReasons(),
+            minimumKeepInfo.getRules(),
+            method.getDefinition()));
+  }
+
+  private void enqueueFirstNonSerializableClassInitializer(
+      DexProgramClass clazz, KeepReason reason) {
+    assert clazz.isSerializable(appView);
+    // Climb up the class hierarchy. Break out if the definition is not found, or hit the library
+    // classes which are kept by definition, or encounter the first non-serializable class.
+    while (clazz.isSerializable(appView)) {
+      DexProgramClass superClass = getProgramClassOrNull(clazz.superType, clazz);
+      if (superClass == null) {
+        return;
+      }
+      clazz = superClass;
+    }
+    if (clazz.hasDefaultInitializer()) {
+      worklist.enqueueMarkMethodLiveAction(clazz.getProgramDefaultInitializer(), clazz, reason);
+      applyMinimumKeepInfoWhenLiveOrTargeted(
+          clazz.getProgramDefaultInitializer(),
+          KeepMethodInfo.newEmptyJoiner().disallowClosedWorldReasoning());
+    }
+  }
+
+  private void compatEnqueueHolderIfDependentNonStaticMember(
+      DexProgramClass holder, Set<ProguardKeepRuleBase> compatRules) {
+    if (!forceProguardCompatibility || compatRules == null) {
+      return;
+    }
+    // TODO(b/120959039): This needs the set of instance member as preconditon.
+    enqueueKeepRuleInstantiatedType(holder, Set.of(), compatRules, null);
+  }
+
+  //
+  // Things to do with registering events. This is essentially the interface for byte-code
+  // traversals.
+  //
+
+  public boolean registerFieldAccess(
+      DexField field, ProgramMethod context, FieldAccessKind accessKind) {
+    if (accessKind.isRead()) {
+      return registerFieldRead(field, context);
+    } else {
+      return registerFieldWrite(field, context);
+    }
+  }
+
+  public boolean registerFieldRead(DexField field, ProgramMethod context) {
+    return registerFieldAccess(field, context, true, false);
+  }
+
+  public boolean registerReflectiveFieldRead(ProgramField field, ProgramMethod context) {
+    return registerFieldAccess(field.getReference(), context, true, true);
+  }
+
+  public boolean registerFieldWrite(DexField field, ProgramMethod context) {
+    return registerFieldAccess(field, context, false, false);
+  }
+
+  public boolean registerReflectiveFieldWrite(ProgramField field, ProgramMethod context) {
+    return registerFieldAccess(field.getReference(), context, false, true);
+  }
+
+  public void traceReflectiveFieldAccess(ProgramField field, ProgramMethod context) {
+    deferredTracing.notifyReflectiveFieldAccess(field, context);
+    boolean changed = registerReflectiveFieldRead(field, context);
+    changed |= registerReflectiveFieldWrite(field, context);
+    if (changed) {
+      markFieldAsReachable(field, context, KeepReason.reflectiveUseIn(context));
+    }
+  }
+
+  public void traceReflectiveFieldRead(ProgramField field, ProgramMethod context) {
+    deferredTracing.notifyReflectiveFieldAccess(field, context);
+    if (registerReflectiveFieldRead(field, context)) {
+      markFieldAsReachable(field, context, KeepReason.reflectiveUseIn(context));
+    }
+  }
+
+  public void traceResourceValue(int value, ProgramMethod context) {
+    if (appView.options().removeUnreadKeptRClassResources && isRClass(context.getHolder())) {
+      return;
+    }
+    if (mode.isInitialTreeShaking()) {
+      return;
+    }
+    if (resourceShrinkerExtension != null) {
+      resourceShrinkerExtension.traceResourceValue(value);
+    }
+  }
+
+  public void traceReflectiveFieldWrite(ProgramField field, ProgramMethod context) {
+    deferredTracing.notifyReflectiveFieldAccess(field, context);
+    if (registerReflectiveFieldWrite(field, context)) {
+      markFieldAsReachable(field, context, KeepReason.reflectiveUseIn(context));
+    }
+  }
+
+  private FieldAccessInfoImpl getOrCreateFieldAccessInfo(DexClassAndField field) {
+    // Check if we have previously created a FieldAccessInfo object for the field definition.
+    FieldAccessInfoImpl info = fieldAccessInfoCollection.get(field.getReference());
+
+    // If not, we must create one.
+    if (info == null) {
+      info = new FieldAccessInfoImpl(field.getReference());
+      fieldAccessInfoCollection.extend(field.getReference(), info);
+
+      // Notify analyses.
+      if (field.isProgramField()) {
+        analyses.processNewlyReferencedField(field.asProgramField());
+      }
+    }
+
+    return info;
+  }
+
+  @SuppressWarnings("ReferenceEquality")
+  private boolean registerFieldAccess(
+      DexField field, ProgramMethod context, boolean isRead, boolean isReflective) {
+    FieldAccessInfoImpl info = fieldAccessInfoCollection.get(field);
+    if (info == null) {
+      Box<DexClassAndField> seenResult = new Box<>();
+      resolveField(field, context)
+          .forEachSuccessfulFieldResolutionResult(
+              singleResolutionResult -> {
+                DexClassAndField resolutionPair = singleResolutionResult.getResolutionPair();
+                if (!seenResult.isSet() || resolutionPair.isProgramField()) {
+                  seenResult.set(resolutionPair);
+                }
+              });
+
+      // If the field does not exist, then record this in the mapping, such that we don't have to
+      // resolve the field the next time.
+      if (!seenResult.isSet()) {
+        fieldAccessInfoCollection.extend(field, MISSING_FIELD_ACCESS_INFO);
+        return true;
+      }
+
+      DexClassAndField resolvedField = seenResult.get();
+      info = getOrCreateFieldAccessInfo(resolvedField);
+
+      // If `field` is an indirect reference, then create a mapping for it, such that we don't have
+      // to resolve the field the next time we see the reference.
+      if (field != resolvedField.getReference()) {
+        fieldAccessInfoCollection.extend(field, info);
+      }
+    } else if (info == MISSING_FIELD_ACCESS_INFO) {
+      return false;
+    }
+    if (isReflective) {
+      return isRead ? info.setHasReflectiveRead() : info.setHasReflectiveWrite();
+    } else {
+      if (isRead) {
+        if (appView.options().protoShrinking().enableGeneratedExtensionRegistryShrinking) {
+          if (appView
+              .protoShrinker()
+              .getProtoReferences()
+              .isFindLiteExtensionByNumberMethod(context)) {
+            info.setReadFromFindLiteExtensionByNumberMethod();
+          } else {
+            info.setReadFromNonFindLiteExtensionByNumberMethod();
+          }
+        }
+        return info.recordRead(field, context);
+      } else {
+        return info.recordWrite(field, context);
+      }
+    }
+  }
+
+  void traceCallSite(
+      DexCallSite callSite, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    // Do not lookup java.lang.invoke.LambdaMetafactory when compiling for DEX to avoid reporting
+    // the class as missing.
+    if (options.isGeneratingClassFiles() || !isLambdaMetafactoryMethod(callSite, appInfo())) {
+      DexProgramClass bootstrapClass =
+          getProgramHolderOrNull(callSite.bootstrapMethod.asMethod(), context);
+      if (bootstrapClass != null) {
+        bootstrapMethods.add(callSite.bootstrapMethod.asMethod());
+      }
+    }
+
+    LambdaDescriptor descriptor = LambdaDescriptor.tryInfer(callSite, appView, appInfo(), context);
+    if (descriptor == null) {
+      for (DexValue bootstrapArgument : callSite.getBootstrapArgs()) {
+        if (bootstrapArgument.isDexValueMethodHandle()) {
+          DexMethodHandle method = bootstrapArgument.asDexValueMethodHandle().getValue();
+          if (method.isMethodHandle()) {
+            disableClosedWorldReasoning(method.asMethod(), context);
+          }
+        }
+      }
+      return;
+    }
+
+    assert options.desugarState.isOff();
+
+    markLambdaAsInstantiated(descriptor, context);
+    transitionMethodsForInstantiatedLambda(descriptor);
+    callSites.computeIfAbsent(callSite, ignore -> ProgramMethodSet.create()).add(context);
+    descriptor.captures.forEach(type -> markTypeAsLive(type, context));
+
+    // For call sites representing a lambda, we link the targeted method
+    // or field as if it were referenced from the current method.
+
+    DexMethodHandle implHandle = descriptor.implHandle;
+    assert implHandle != null;
+
+    DexMethod method = implHandle.asMethod();
+    switch (implHandle.type) {
+      case INVOKE_STATIC:
+        traceInvokeStaticFromLambda(method, context, registry);
+        break;
+      case INVOKE_INTERFACE:
+        traceInvokeInterfaceFromLambda(method, context, registry);
+        break;
+      case INVOKE_INSTANCE:
+        traceInvokeVirtualFromLambda(method, context, registry);
+        break;
+      case INVOKE_DIRECT:
+        traceInvokeDirectFromLambda(method, context, registry);
+        break;
+      case INVOKE_CONSTRUCTOR:
+        assert appView.dexItemFactory().isConstructor(method);
+        traceNewInstanceFromLambda(method.holder, context);
+        traceInvokeDirectFromLambda(method, context, registry);
+        break;
+      default:
+        throw new Unreachable();
+    }
+
+    disableClosedWorldReasoning(method, context);
+  }
+
+  private void disableClosedWorldReasoning(DexMethod reference, ProgramMethod context) {
+    resolveMethod(reference, context, KeepReason.methodHandleReferencedIn(context))
+        .forEachMethodResolutionResult(
+            resolutionResult -> {
+              if (resolutionResult.isSingleResolution()
+                  && resolutionResult.asSingleResolution().getResolvedHolder().isProgramClass()) {
+                applyMinimumKeepInfoWhenLiveOrTargeted(
+                    resolutionResult.getResolvedProgramMethod(),
+                    KeepMethodInfo.newEmptyJoiner().disallowClosedWorldReasoning());
+              }
+            });
+  }
+
+  void traceCheckCast(DexType type, ProgramMethod currentMethod, boolean ignoreCompatRules) {
+    DexClass clazz = internalTraceConstClassOrCheckCast(type, currentMethod, ignoreCompatRules);
+    analyses.traceCheckCast(type, clazz, currentMethod);
+  }
+
+  void traceSafeCheckCast(DexType type, ProgramMethod currentMethod) {
+    DexClass clazz = internalTraceConstClassOrCheckCast(type, currentMethod, true);
+    analyses.traceSafeCheckCast(type, clazz, currentMethod);
+  }
+
+  void traceConstClass(
+      DexType type,
+      ProgramMethod currentMethod,
+      ListIterator<? extends CfOrDexInstruction> iterator,
+      boolean ignoreCompatRules) {
+    handleLockCandidate(type, currentMethod, iterator);
+    DexClass clazz = internalTraceConstClassOrCheckCast(type, currentMethod, ignoreCompatRules);
+    analyses.traceConstClass(type, clazz, currentMethod);
+  }
+
+  private void handleLockCandidate(
+      DexType type,
+      ProgramMethod currentMethod,
+      ListIterator<? extends CfOrDexInstruction> iterator) {
+    // We conservatively group T.class and T[].class to ensure that we do not merge T with S if
+    // potential locks on T[].class and S[].class exists.
+    DexType baseType = type.getBaseType();
+    if (baseType.isClassType()) {
+      DexProgramClass baseClass = getProgramClassOrNull(baseType, currentMethod);
+      if (baseClass != null && isConstClassMaybeUsedAsLock(currentMethod, iterator)) {
+        lockCandidates.add(baseType);
+      }
+    }
+  }
+
+  /**
+   * Returns true if the const-class value may flow into a monitor instruction.
+   *
+   * <p>Some common usages of const-class values are handled, such as calls to Class.get*Name().
+   */
+  @SuppressWarnings("ReferenceEquality")
+  private boolean isConstClassMaybeUsedAsLock(
+      ProgramMethod currentMethod, ListIterator<? extends CfOrDexInstruction> iterator) {
+    if (iterator == null) {
+      return true;
+    }
+    boolean result = true;
+    if (currentMethod.getDefinition().getCode().isCfCode()) {
+      CfInstruction nextInstruction =
+          IteratorUtils.nextUntil(
+                  iterator,
+                  instruction ->
+                      !instruction.asCfInstruction().isLabel()
+                          && !instruction.asCfInstruction().isPosition())
+              .asCfInstruction();
+      assert nextInstruction != null;
+      if (nextInstruction.isInvoke()) {
+        CfInvoke invoke = nextInstruction.asInvoke();
+        DexMethod invokedMethod = invoke.getMethod();
+        ClassMethods classMethods = appView.dexItemFactory().classMethods;
+        if (classMethods.isReflectiveNameLookup(invokedMethod)
+            || invokedMethod == classMethods.desiredAssertionStatus
+            || invokedMethod == classMethods.getClassLoader
+            || invokedMethod == classMethods.getPackage) {
+          result = false;
+        }
+      }
+      iterator.previous();
+    }
+    return result;
+  }
+
+  private DexClass internalTraceConstClassOrCheckCast(
+      DexType type, ProgramMethod currentMethod, boolean ignoreCompatRules) {
+    DexClass baseClass = resolveBaseType(type, currentMethod);
+    traceTypeReference(type, currentMethod);
+    if (!forceProguardCompatibility || ignoreCompatRules) {
+      return baseClass;
+    }
+    if (baseClass != null && baseClass.isProgramClass()) {
+      // Don't require any constructor, see b/112386012.
+      DexProgramClass baseProgramClass = baseClass.asProgramClass();
+      markClassAsInstantiatedWithCompatRule(
+          baseProgramClass,
+          () -> graphReporter.reportCompatInstantiated(baseProgramClass, currentMethod));
+    }
+    return baseClass;
+  }
+
+  void traceRecordFieldValues(DexField[] fields, ProgramMethod currentMethod) {
+    // TODO(b/203377129): Consider adding an enqueuer extension instead of growing the
+    //  number of fields in appInfoWithLiveness.
+    if (mode.isFinalTreeShaking()) {
+      recordFieldValuesReferences.add(currentMethod.getReference());
+    }
+  }
+
+  void traceInitClass(DexType type, ProgramMethod currentMethod) {
+    assert type.isClassType();
+
+    Visibility oldMinimumRequiredVisibility = initClassReferences.get(type);
+    if (oldMinimumRequiredVisibility == null) {
+      DexProgramClass clazz = getProgramClassOrNull(type, currentMethod);
+      if (clazz == null) {
+        assert false;
+        return;
+      }
+
+      initClassReferences.put(
+          type, computeMinimumRequiredVisibilityForInitClassField(type, currentMethod.getHolder()));
+
+      markTypeAsLive(clazz, currentMethod);
+      markDirectAndIndirectClassInitializersAsLive(clazz);
+      return;
+    }
+
+    if (oldMinimumRequiredVisibility.isPublic()) {
+      return;
+    }
+
+    Visibility minimumRequiredVisibilityForCurrentMethod =
+        computeMinimumRequiredVisibilityForInitClassField(type, currentMethod.getHolder());
+
+    // There should never be a need to have an InitClass instruction for the enclosing class.
+    assert !minimumRequiredVisibilityForCurrentMethod.isPrivate();
+
+    if (minimumRequiredVisibilityForCurrentMethod.isPublic()) {
+      initClassReferences.put(type, minimumRequiredVisibilityForCurrentMethod);
+      return;
+    }
+
+    if (oldMinimumRequiredVisibility.isProtected()) {
+      return;
+    }
+
+    if (minimumRequiredVisibilityForCurrentMethod.isProtected()) {
+      initClassReferences.put(type, minimumRequiredVisibilityForCurrentMethod);
+      return;
+    }
+
+    assert oldMinimumRequiredVisibility.isPackagePrivate();
+    assert minimumRequiredVisibilityForCurrentMethod.isPackagePrivate();
+  }
+
+  private Visibility computeMinimumRequiredVisibilityForInitClassField(
+      DexType clazz, DexProgramClass context) {
+    if (clazz.isSamePackage(context.type)) {
+      return Visibility.PACKAGE_PRIVATE;
+    }
+    if (appInfo.isStrictSubtypeOf(context.type, clazz)) {
+      return Visibility.PROTECTED;
+    }
+    return Visibility.PUBLIC;
+  }
+
+  void traceMethodHandle(
+      DexMethodHandle methodHandle, MethodHandleUse use, ProgramMethod currentMethod) {
+    if (methodHandle.isMethodHandle() && use != MethodHandleUse.ARGUMENT_TO_LAMBDA_METAFACTORY) {
+      KeepReason reason = KeepReason.methodHandleReferencedIn(currentMethod);
+      MethodResolutionResult result =
+          resolveMethod(methodHandle.asMethod(), currentMethod, reason, methodHandle.isInterface);
+      if (result.isSingleResolution()) {
+        DexClassAndMethod target = result.asSingleResolution().getResolutionPair();
+        if (target.isProgramMethod()) {
+          // If the method handle is targeting a program method then the structure of the method
+          // must remain, so that invoke/invokeExact dispatches will continue to match.
+          applyMinimumKeepInfoWhenLiveOrTargeted(
+              target.asProgramMethod(), KeepMethodInfo.newEmptyJoiner().disallowOptimization());
+        }
+      }
+    }
+  }
+
+  void traceTypeReference(DexType type, ProgramMethod currentMethod) {
+    markTypeAsLive(type, currentMethod);
+  }
+
+  void traceInstanceOf(DexType type, ProgramMethod currentMethod) {
+    DexClass clazz = resolveBaseType(type, currentMethod);
+    traceTypeReference(type, currentMethod);
+    analyses.traceInstanceOf(type, clazz, currentMethod);
+  }
+
+  void traceExceptionGuard(DexType type, ProgramMethod currentMethod) {
+    DexClass clazz = resolveBaseType(type, currentMethod);
+    traceTypeReference(type, currentMethod);
+    analyses.traceExceptionGuard(type, clazz, currentMethod);
+  }
+
+  void traceInvokeDirect(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    boolean skipTracing =
+        registerDeferredActionForDeadProtoBuilder(
+            invokedMethod.holder,
+            context,
+            () -> worklist.enqueueTraceInvokeDirectAction(invokedMethod, context, registry));
+    if (skipTracing) {
+      addDeadProtoTypeCandidate(invokedMethod.holder);
+      return;
+    }
+
+    traceInvokeDirect(invokedMethod, context, registry, KeepReason.invokedFrom(context));
+  }
+
+  /** Returns true if a deferred action was registered. */
+  private boolean registerDeferredActionForDeadProtoBuilder(
+      DexType type, ProgramMethod currentMethod, Action action) {
+    DexProgramClass clazz = getProgramClassOrNull(type, currentMethod);
+    if (clazz != null) {
+      return appView.withGeneratedMessageLiteBuilderShrinker(
+          shrinker ->
+              shrinker.deferDeadProtoBuilders(
+                  clazz, currentMethod, () -> liveTypes.registerDeferredAction(clazz, action)),
+          false);
+    }
+    return false;
+  }
+
+  void traceInvokeDirectFromLambda(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    traceInvokeDirect(
+        invokedMethod, context, registry, KeepReason.invokedFromLambdaCreatedIn(context));
+  }
+
+  private void traceInvokeDirect(
+      DexMethod invokedMethod,
+      ProgramMethod context,
+      DefaultEnqueuerUseRegistry registry,
+      KeepReason reason) {
+    if (registry != null && !registry.markInvokeDirectAsSeen(invokedMethod)) {
+      return;
+    }
+    markTypeAsLive(invokedMethod.getHolderType(), context);
+    MethodResolutionResult resolutionResult =
+        handleInvokeOfDirectTarget(invokedMethod, context, reason);
+    analyses.traceInvokeDirect(invokedMethod, resolutionResult, context);
+  }
+
+  void traceInvokeInterface(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    traceInvokeInterface(invokedMethod, context, registry, KeepReason.invokedFrom(context));
+  }
+
+  void traceInvokeInterfaceFromLambda(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    traceInvokeInterface(
+        invokedMethod, context, registry, KeepReason.invokedFromLambdaCreatedIn(context));
+  }
+
+  private void traceInvokeInterface(
+      DexMethod invokedMethod,
+      ProgramMethod context,
+      DefaultEnqueuerUseRegistry registry,
+      KeepReason keepReason) {
+    if (registry != null && !registry.markInvokeInterfaceAsSeen(invokedMethod)) {
+      return;
+    }
+    markTypeAsLive(invokedMethod.getHolderType(), context);
+    MethodResolutionResult result =
+        markVirtualMethodAsReachable(invokedMethod, true, context, keepReason);
+    analyses.traceInvokeInterface(invokedMethod, result, context);
+  }
+
+  void traceInvokeStatic(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    traceInvokeStatic(invokedMethod, context, registry, KeepReason.invokedFrom(context));
+  }
+
+  void traceInvokeStaticFromLambda(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    traceInvokeStatic(
+        invokedMethod, context, registry, KeepReason.invokedFromLambdaCreatedIn(context));
+  }
+
+  @SuppressWarnings("ReferenceEquality")
+  private void traceInvokeStatic(
+      DexMethod invokedMethod,
+      ProgramMethod context,
+      DefaultEnqueuerUseRegistry registry,
+      KeepReason reason) {
+    if (registry != null && !registry.markInvokeStaticAsSeen(invokedMethod)) {
+      return;
+    }
+    reflectiveIdentification.scanInvoke(invokedMethod, context);
+    markTypeAsLive(invokedMethod.getHolderType(), context);
+    MethodResolutionResult resolutionResult =
+        handleInvokeOfStaticTarget(invokedMethod, context, reason);
+    analyses.traceInvokeStatic(invokedMethod, resolutionResult, context);
+  }
+
+  void traceInvokeSuper(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    // We have to revisit super invokes based on the context they are found in. The same
+    // method descriptor will hit different targets, depending on the context it is used in.
+    if (registry != null && !registry.markInvokeSuperAsSeen(invokedMethod)) {
+      return;
+    }
+    markTypeAsLive(invokedMethod.getHolderType(), context);
+    worklist.enqueueMarkReachableSuperAction(invokedMethod, context);
+  }
+
+  void traceInvokeVirtual(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    traceInvokeVirtual(invokedMethod, context, registry, KeepReason.invokedFrom(context));
+  }
+
+  void traceInvokeVirtualFromLambda(
+      DexMethod invokedMethod, ProgramMethod context, DefaultEnqueuerUseRegistry registry) {
+    traceInvokeVirtual(
+        invokedMethod, context, registry, KeepReason.invokedFromLambdaCreatedIn(context));
+  }
+
+  private void traceInvokeVirtual(
+      DexMethod invokedMethod,
+      ProgramMethod context,
+      DefaultEnqueuerUseRegistry registry,
+      KeepReason reason) {
+    if (registry != null && !registry.markInvokeVirtualAsSeen(invokedMethod)) {
+      return;
+    }
+    reflectiveIdentification.scanInvoke(invokedMethod, context);
+    markTypeAsLive(invokedMethod.getHolderType(), context);
+    MethodResolutionResult resolutionResult =
+        markVirtualMethodAsReachable(invokedMethod, false, context, reason);
+    analyses.traceInvokeVirtual(invokedMethod, resolutionResult, context);
+  }
+
+  void traceMethodPosition(com.android.tools.r8.ir.code.Position position, ProgramMethod context) {
+    while (position.hasCallerPosition()) {
+      // Any inner position should not be non-synthetic user methods.
+      assert !position.isD8R8Synthesized();
+      markEffectivelyLiveOriginalReference(position.getMethod());
+      position = position.getCallerPosition();
+    }
+    // The outer-most position should be equal to the context.
+    // Mark it if it is not synthetic.
+    assert context.getReference().isIdenticalTo(position.getMethod());
+    if (!context.getDefinition().isD8R8Synthesized()) {
+      markEffectivelyLiveOriginalReference(context.getReference());
+    }
+  }
+
+  void traceOriginalFieldWitness(OriginalFieldWitness witness) {
+    markEffectivelyLiveOriginalReference(witness);
+  }
+
+  private void markEffectivelyLiveOriginalReference(OriginalFieldWitness witness) {
+    witness.forEachReference(this::markEffectivelyLiveOriginalReference);
+  }
+
+  private void markEffectivelyLiveOriginalReference(DexReference reference) {
+    // TODO(b/325014359): It might be reasonable to reduce this map size by tracking which items
+    //  actually are used in preconditions.
+    if (effectivelyLiveOriginalReferences.add(reference) && reference.isDexMember()) {
+      effectivelyLiveOriginalReferences.add(reference.getContextType());
+    }
+  }
+
+  void traceNewInstance(DexType type, ProgramMethod context) {
+    boolean skipTracing =
+        registerDeferredActionForDeadProtoBuilder(
+            type, context, () -> worklist.enqueueTraceNewInstanceAction(type, context));
+    if (skipTracing) {
+      addDeadProtoTypeCandidate(type);
+      return;
+    }
+
+    DexClass clazz =
+        traceNewInstance(
+            type,
+            context,
+            InstantiationReason.NEW_INSTANCE_INSTRUCTION,
+            KeepReason.instantiatedIn(context));
+    analyses.traceNewInstance(type, clazz, context);
+  }
+
+  void traceNewInstanceFromLambda(DexType type, ProgramMethod context) {
+    traceNewInstance(
+        type, context, InstantiationReason.LAMBDA, KeepReason.invokedFromLambdaCreatedIn(context));
+  }
+
+  private DexClass traceNewInstance(
+      DexType type,
+      ProgramMethod context,
+      InstantiationReason instantiationReason,
+      KeepReason keepReason) {
+    DexClass clazz = resolveBaseType(type, context);
+    if (clazz != null && clazz.isProgramClass()) {
+      DexProgramClass programClass = clazz.asProgramClass();
+      if (clazz.isAnnotation() || clazz.isInterface()) {
+        markTypeAsLive(programClass, graphReporter.registerClass(programClass, keepReason));
+      } else {
+        worklist.enqueueMarkInstantiatedAction(
+            programClass, context, instantiationReason, keepReason);
+      }
+    }
+    return clazz;
+  }
+
+  public void traceReflectiveNewInstance(ProgramMethod initializer, ProgramMethod context) {
+    assert initializer.getDefinition().isInstanceInitializer();
+    KeepReason reason = KeepReason.reflectiveUseIn(context);
+    traceNewInstance(initializer.getHolderType(), context, InstantiationReason.REFLECTION, reason);
+    markMethodAsTargeted(initializer, reason);
+    markDirectStaticOrConstructorMethodAsLive(initializer, reason);
+    applyMinimumKeepInfoWhenLiveOrTargeted(
+        initializer, KeepMethodInfo.newEmptyJoiner().disallowOptimization());
+    applyMinimumKeepInfoWhenLive(
+        initializer.getHolder(), KeepClassInfo.newEmptyJoiner().disallowOptimization());
+  }
+
+  void traceInstanceFieldRead(DexField field, ProgramMethod currentMethod) {
+    traceInstanceFieldRead(field, currentMethod, FieldAccessMetadata.DEFAULT);
+  }
+
+  void traceInstanceFieldReadFromMethodHandle(DexField field, ProgramMethod currentMethod) {
+    traceInstanceFieldRead(field, currentMethod, FieldAccessMetadata.FROM_METHOD_HANDLE);
+  }
+
+  void traceInstanceFieldReadFromRecordMethodHandle(DexField field, ProgramMethod currentMethod) {
+    traceInstanceFieldRead(field, currentMethod, FieldAccessMetadata.FROM_RECORD_METHOD_HANDLE);
+  }
+
+  public enum FieldAccessKind {
+    INSTANCE_READ,
+    INSTANCE_WRITE,
+    STATIC_READ,
+    STATIC_WRITE;
+
+    public boolean isRead() {
+      return this == INSTANCE_READ || this == STATIC_READ;
+    }
+
+    boolean isStatic() {
+      return this == STATIC_READ || this == STATIC_WRITE;
+    }
+
+    boolean isWrite() {
+      return !isRead();
+    }
+
+    EnqueuerAction toEnqueuerAction(
+        DexField fieldReference, ProgramMethod context, FieldAccessMetadata metadata) {
+      switch (this) {
+        case INSTANCE_READ:
+          return new TraceInstanceFieldReadAction(fieldReference, context, metadata);
+        case INSTANCE_WRITE:
+          return new TraceInstanceFieldWriteAction(fieldReference, context, metadata);
+        case STATIC_READ:
+          return new TraceStaticFieldReadAction(fieldReference, context, metadata);
+        case STATIC_WRITE:
+          return new TraceStaticFieldWriteAction(fieldReference, context, metadata);
+        default:
+          throw new Unreachable();
+      }
+    }
+  }
+
+  static class FieldAccessMetadata {
+
+    private static final int DEFERRED_MASK = 1;
+    private static final int FROM_METHOD_HANDLE_MASK = 2;
+    private static final int FROM_RECORD_METHOD_HANDLE_MASK = 4;
+
+    static FieldAccessMetadata DEFAULT = new FieldAccessMetadata(0);
+    static FieldAccessMetadata FROM_METHOD_HANDLE =
+        new FieldAccessMetadata(FROM_METHOD_HANDLE_MASK);
+    static FieldAccessMetadata FROM_RECORD_METHOD_HANDLE =
+        new FieldAccessMetadata(FROM_RECORD_METHOD_HANDLE_MASK);
+
+    private final FieldAccessMetadata deferred;
+    private final int flags;
+
+    private FieldAccessMetadata(int flags) {
+      this.flags = flags;
+      this.deferred = isDeferred() ? this : new FieldAccessMetadata(flags | DEFERRED_MASK);
+    }
+
+    boolean isDeferred() {
+      return (flags & DEFERRED_MASK) != 0;
+    }
+
+    boolean isFromMethodHandle() {
+      return (flags & FROM_METHOD_HANDLE_MASK) != 0;
+    }
+
+    boolean isFromRecordMethodHandle() {
+      return (flags & FROM_RECORD_METHOD_HANDLE_MASK) != 0;
+    }
+
+    public FieldAccessMetadata toDeferred() {
+      return deferred;
+    }
+
+    @Override
+    @SuppressWarnings("EqualsGetClass")
+    public boolean equals(Object obj) {
+      if (this == obj) {
+        return true;
+      }
+      if (obj == null || getClass() != obj.getClass()) {
+        return false;
+      }
+      FieldAccessMetadata metadata = (FieldAccessMetadata) obj;
+      return flags == metadata.flags;
+    }
+
+    @Override
+    public int hashCode() {
+      return flags;
+    }
+  }
+
+  void traceAnnotationFieldAccess(
+      DexField fieldReference, DexAnnotation annotation, ProgramDefinition context) {
+    recordFieldReference(fieldReference, context);
+    DexProgramClass holder = getProgramHolderOrNull(fieldReference, context);
+    if (holder == null) {
+      return;
+    }
+    ProgramField field = holder.lookupProgramField(fieldReference);
+    if (field == null) {
+      return;
+    }
+    // There is no dispatch on annotations, so only keep what is directly referenced.
+    if (field.getReference().isNotIdenticalTo(fieldReference)) {
+      return;
+    }
+    KeepReason reason = KeepReason.referencedInAnnotation(annotation, context);
+    if (field.getDefinition().isStatic()) {
+      FieldAccessInfoImpl fieldAccessInfo =
+          fieldAccessInfoCollection.contains(fieldReference)
+              ? fieldAccessInfoCollection.get(fieldReference)
+              : fieldAccessInfoCollection.extend(
+                  fieldReference, new FieldAccessInfoImpl(fieldReference));
+      fieldAccessInfo.setReadFromAnnotation();
+      markFieldAsLive(field, context, reason);
+      // In a class file an enum reference in an annotation is written as enum descriptor and
+      // enum name. At runtime the JVM use valueOf on the enum class with the name to get the
+      // instance. This indirectly use the values() method on that enum class. Also keep the
+      // name of the field and the name of the enum in sync as otherwise recovering the field to
+      // name relationship requires analysis of the enum <clinit> when this CF code is processed
+      // again (e.g. as input to D8 for converting to DEX). See b/236691999 for more info.
+      if (options.isGeneratingClassFiles() && field.getHolder().isEnum()) {
+        markEnumValuesAsReachable(field.getHolder(), reason);
+        applyMinimumKeepInfoWhenLive(field, KeepFieldInfo.newEmptyJoiner().disallowMinification());
+      }
+    } else {
+      // There is no dispatch on annotations, so only keep what is directly referenced.
+      worklist.enqueueMarkFieldAsReachableAction(field, context, reason);
+    }
+  }
+
+  void traceAnnotationMethodAccess(
+      DexMethod method, DexAnnotation annotation, ProgramDefinition context) {
+    // Record the references in case they are not program types.
+    recordMethodReference(method, context);
+    DexProgramClass holder = getProgramHolderOrNull(method, context);
+    if (holder == null) {
+      return;
+    }
+    KeepReason reason = KeepReason.referencedInAnnotation(annotation, context);
+    DexEncodedMethod target = holder.lookupDirectMethod(method);
+    if (target != null) {
+      // There is no dispatch on annotations, so only keep what is directly referenced.
+      if (target.getReference().isIdenticalTo(method)) {
+        markDirectStaticOrConstructorMethodAsLive(new ProgramMethod(holder, target), reason);
+      }
+    } else {
+      target = holder.lookupVirtualMethod(method);
+      // There is no dispatch on annotations, so only keep what is directly referenced.
+      if (target != null && target.getReference().isIdenticalTo(method)) {
+        markMethodAsTargeted(new ProgramMethod(holder, target), reason);
+      }
+    }
+  }
+
+  void traceAnnotationTypeAccess(
+      DexType type, DexAnnotation annotation, ProgramDefinition context) {
+    KeepReason reason = KeepReason.referencedInAnnotation(annotation, context);
+    markTypeAsLive(type, context, reason);
+  }
+
+  void traceInstanceFieldRead(
+      DexField fieldReference, ProgramMethod currentMethod, FieldAccessMetadata metadata) {
+    traceInstanceFieldAccess(
+        fieldReference, currentMethod, FieldAccessKind.INSTANCE_READ, metadata);
+  }
+
+  void traceInstanceFieldWrite(DexField field, ProgramMethod currentMethod) {
+    traceInstanceFieldWrite(field, currentMethod, FieldAccessMetadata.DEFAULT);
+  }
+
+  void traceInstanceFieldWriteFromMethodHandle(DexField field, ProgramMethod currentMethod) {
+    traceInstanceFieldWrite(field, currentMethod, FieldAccessMetadata.FROM_METHOD_HANDLE);
+  }
+
+  void traceInstanceFieldWrite(
+      DexField fieldReference, ProgramMethod currentMethod, FieldAccessMetadata metadata) {
+    traceInstanceFieldAccess(
+        fieldReference, currentMethod, FieldAccessKind.INSTANCE_WRITE, metadata);
+  }
+
+  private void traceInstanceFieldAccess(
+      DexField fieldReference,
+      ProgramMethod currentMethod,
+      FieldAccessKind accessKind,
+      FieldAccessMetadata metadata) {
+    if (!metadata.isDeferred() && !registerFieldAccess(fieldReference, currentMethod, accessKind)) {
+      return;
+    }
+
+    FieldResolutionResult resolutionResult = resolveField(fieldReference, currentMethod);
+    if (deferredTracing.deferTracingOfFieldAccess(
+        fieldReference, resolutionResult, currentMethod, accessKind, metadata)) {
+      assert !metadata.isDeferred();
+      return;
+    }
+
+    resolutionResult.visitFieldResolutionResults(
+        singleResolutionResult -> {
+          analyses.traceFieldAccess(
+              fieldReference, singleResolutionResult, currentMethod, worklist, accessKind);
+
+          DexClassAndField classField = singleResolutionResult.getResolutionPair();
+          assert classField != null;
+
+          DexClass initialResolutionHolder = singleResolutionResult.getInitialResolutionHolder();
+          if (initialResolutionHolder != classField.getHolder()) {
+            // Mark the initial resolution holder as live. Note that this should only be done if
+            // the field is not a dead proto field (in which case we bail-out above).
+            markTypeAsLive(initialResolutionHolder, currentMethod);
+          }
+
+          ProgramField field = classField.asProgramField();
+          if (field == null) {
+            // No need to trace into the non-program code.
+            return;
+          }
+
+          assert !mode.isFinalTreeShaking() || !field.getDefinition().getOptimizationInfo().isDead()
+              : "Unexpected reference in `"
+                  + currentMethod.toSourceString()
+                  + "` to field marked dead: "
+                  + field.getReference().toSourceString();
+
+          if (metadata.isFromMethodHandle()) {
+            fieldAccessInfoCollection
+                .get(field.getReference())
+                .setAccessedFromMethodHandle(accessKind);
+          } else if (metadata.isFromRecordMethodHandle() && accessKind.isRead()) {
+            fieldAccessInfoCollection.get(field.getReference()).setReadFromRecordInvokeDynamic();
+          }
+
+          KeepReason reason = KeepReason.fieldReferencedIn(currentMethod);
+          worklist.enqueueMarkFieldAsReachableAction(field, currentMethod, reason);
+        },
+        failedResolution -> {
+          // Must trace the types from the field reference even if it does not exist.
+          traceFieldReference(fieldReference, currentMethod);
+          noClassMerging.add(fieldReference.getHolderType());
+        });
+  }
+
+  void traceStaticFieldRead(DexField field, ProgramMethod currentMethod) {
+    traceStaticFieldRead(field, currentMethod, FieldAccessMetadata.DEFAULT);
+  }
+
+  void traceStaticFieldReadFromMethodHandle(DexField field, ProgramMethod currentMethod) {
+    traceStaticFieldRead(field, currentMethod, FieldAccessMetadata.FROM_METHOD_HANDLE);
+  }
+
+  void traceStaticFieldRead(
+      DexField fieldReference, ProgramMethod currentMethod, FieldAccessMetadata metadata) {
+    traceStaticFieldAccess(fieldReference, currentMethod, FieldAccessKind.STATIC_READ, metadata);
+  }
+
+  void traceStaticFieldWrite(DexField field, ProgramMethod currentMethod) {
+    traceStaticFieldWrite(field, currentMethod, FieldAccessMetadata.DEFAULT);
+  }
+
+  void traceStaticFieldWriteFromMethodHandle(DexField field, ProgramMethod currentMethod) {
+    traceStaticFieldWrite(field, currentMethod, FieldAccessMetadata.FROM_METHOD_HANDLE);
+  }
+
+  void traceStaticFieldWrite(
+      DexField fieldReference, ProgramMethod currentMethod, FieldAccessMetadata metadata) {
+    traceStaticFieldAccess(fieldReference, currentMethod, FieldAccessKind.STATIC_WRITE, metadata);
+  }
+
+  private void traceStaticFieldAccess(
+      DexField fieldReference,
+      ProgramMethod currentMethod,
+      FieldAccessKind accessKind,
+      FieldAccessMetadata metadata) {
+    if (!metadata.isDeferred() && !registerFieldAccess(fieldReference, currentMethod, accessKind)) {
+      return;
+    }
+
+    FieldResolutionResult resolutionResult = resolveField(fieldReference, currentMethod);
+
+    if (appView.options().protoShrinking().enableGeneratedExtensionRegistryShrinking) {
+      // If it is a dead proto extension field, don't trace onwards.
+      boolean skipTracing =
+          appView.withGeneratedExtensionRegistryShrinker(
+              shrinker ->
+                  shrinker.isDeadProtoExtensionField(
+                      resolutionResult, fieldAccessInfoCollection, getKeepInfo()),
+              false);
+      if (skipTracing) {
+        addDeadProtoTypeCandidate(resolutionResult.getSingleProgramField().getHolder());
+        return;
+      }
+    }
+
+    if (deferredTracing.deferTracingOfFieldAccess(
+        fieldReference, resolutionResult, currentMethod, accessKind, metadata)) {
+      assert !metadata.isDeferred();
+      return;
+    }
+
+    resolutionResult.visitFieldResolutionResults(
+        singleResolutionResult -> {
+          analyses.traceFieldAccess(
+              fieldReference, singleResolutionResult, currentMethod, worklist, accessKind);
+
+          DexClassAndField classField = singleResolutionResult.getResolutionPair();
+          assert classField != null;
+
+          DexClass initialResolutionHolder = singleResolutionResult.getInitialResolutionHolder();
+          if (initialResolutionHolder != classField.getHolder()) {
+            // Mark the initial resolution holder as live. Note that this should only be done if
+            // the field is not a dead proto field (in which case we bail-out above).
+            markTypeAsLive(initialResolutionHolder, currentMethod);
+          }
+
+          ProgramField field = classField.asProgramField();
+          if (field == null) {
+            // No need to trace into the non-program code.
+            return;
+          }
+
+          assert !mode.isFinalTreeShaking() || !field.getDefinition().getOptimizationInfo().isDead()
+              : "Unexpected reference in `"
+                  + currentMethod.toSourceString()
+                  + "` to field marked dead: "
+                  + field.getReference().toSourceString();
+
+          if (metadata.isFromMethodHandle()) {
+            fieldAccessInfoCollection
+                .get(field.getReference())
+                .setAccessedFromMethodHandle(accessKind);
+          }
+
+          markFieldAsLive(field, currentMethod);
+        },
+        failedResolution -> {
+          // Must trace the types from the field reference even if it does not exist.
+          traceFieldReference(fieldReference, currentMethod);
+          noClassMerging.add(fieldReference.getHolderType());
+          // Record field reference for generated extension registry shrinking.
+          appView.withGeneratedExtensionRegistryShrinker(
+              shrinker ->
+                  shrinker.handleFailedOrUnknownFieldResolution(
+                      fieldReference, currentMethod, mode));
+        });
+  }
+
+  //
+  // Actual actions performed.
+  //
+
+  private boolean verifyIsMainThread() {
+    assert Thread.currentThread() == mainThreadForTesting;
+    return true;
+  }
+
+  private boolean verifyMethodIsTargeted(ProgramMethod method) {
+    DexEncodedMethod definition = method.getDefinition();
+    assert !definition.isClassInitializer() : "Class initializers are never targeted";
+    assert targetedMethods.contains(definition);
+    return true;
+  }
+
+  private boolean verifyTypeIsLive(DexProgramClass clazz) {
+    assert liveTypes.contains(clazz);
+    return true;
+  }
+
+  private void markTypeAsLive(DexType type, ProgramDefinition context) {
+    if (type.isArrayType()) {
+      markTypeAsLive(type.getBaseType(), context);
+      return;
+    }
+    if (!type.isClassType()) {
+      // Ignore primitive types.
+      return;
+    }
+    DexProgramClass clazz = getProgramClassOrNull(type, context);
+    if (clazz == null) {
+      return;
+    }
+    markTypeAsLive(clazz, context);
+  }
+
+  private void markTypeAsLive(DexType type, ProgramDefinition context, KeepReason reason) {
+    if (type.isArrayType()) {
+      markTypeAsLive(type.getBaseType(), context, reason);
+      return;
+    }
+    if (!type.isClassType()) {
+      // Ignore primitive types and void.
+      return;
+    }
+    DexProgramClass clazz = getProgramClassOrNull(type, context);
+    if (clazz == null) {
+      return;
+    }
+    markTypeAsLive(clazz, reason);
+  }
+
+  private void markTypeAsLive(DexClass clazz, ProgramDefinition context) {
+    if (clazz.isProgramClass()) {
+      DexProgramClass programClass = clazz.asProgramClass();
+      markTypeAsLive(programClass, graphReporter.reportClassReferencedFrom(programClass, context));
+    }
+  }
+
+  private void markTypeAsLive(DexProgramClass clazz, ProgramDefinition context) {
+    markTypeAsLive(clazz, graphReporter.reportClassReferencedFrom(clazz, context));
+  }
+
+  public void markTypeAsLive(DexProgramClass clazz, KeepReason reason) {
+    assert clazz != null;
+    markTypeAsLive(
+        clazz,
+        scopedMethodsForLiveTypes.computeIfAbsent(
+            clazz.getType(), ignore -> new ScopedDexMethodSet()),
+        graphReporter.registerClass(clazz, reason));
+  }
+
+  private void markTypeAsLive(
+      DexProgramClass clazz, ScopedDexMethodSet seen, KeepReasonWitness witness) {
+    if (!liveTypes.add(clazz, witness)) {
+      return;
+    }
+    markEffectivelyLiveOriginalReference(clazz.getType());
+
+    assert !mode.isFinalMainDexTracing()
+            || !options.testing.checkForNotExpandingMainDexTracingResult
+            || appView.appInfo().getMainDexInfo().isTracedRoot(clazz, appView.getSyntheticItems())
+        : "Class " + clazz.toSourceString() + " was not a main dex root in the first round";
+
+    assert !appView.unboxedEnums().isUnboxedEnum(clazz)
+        : "Enum " + clazz.toSourceString() + " has been unboxed but is still in the program.";
+
+    // Mark types in inner-class attributes referenced.
+    {
+      BiConsumer<DexType, ProgramDerivedContext> missingClassConsumer =
+          options.reportMissingClassesInInnerClassAttributes
+              ? this::reportMissingClass
+              : this::ignoreMissingClass;
+      for (InnerClassAttribute innerClassAttribute : clazz.getInnerClasses()) {
+        recordTypeReference(
+            innerClassAttribute.getInner(),
+            clazz,
+            this::recordNonProgramClass,
+            missingClassConsumer);
+        recordTypeReference(
+            innerClassAttribute.getOuter(),
+            clazz,
+            this::recordNonProgramClass,
+            missingClassConsumer);
+      }
+    }
+
+    // Mark types in nest attributes referenced.
+    if (clazz.isNestHost()) {
+      for (NestMemberClassAttribute nestMemberClassAttribute :
+          clazz.getNestMembersClassAttributes()) {
+        recordTypeReference(nestMemberClassAttribute.getNestMember(), clazz);
+      }
+    } else {
+      recordTypeReference(clazz.getNestHost(), clazz);
+    }
+
+    EnclosingMethodAttribute enclosingMethodAttribute = clazz.getEnclosingMethodAttribute();
+    if (enclosingMethodAttribute != null) {
+      DexMethod enclosingMethod = enclosingMethodAttribute.getEnclosingMethod();
+      BiConsumer<DexType, ProgramDerivedContext> missingClassConsumer =
+          options.reportMissingClassesInEnclosingMethodAttribute
+              ? this::reportMissingClass
+              : this::ignoreMissingClass;
+      if (enclosingMethod != null) {
+        recordMethodReference(
+            enclosingMethod, clazz, this::recordNonProgramClass, missingClassConsumer);
+      } else {
+        DexType enclosingClass = enclosingMethodAttribute.getEnclosingClass();
+        recordTypeReference(
+            enclosingClass, clazz, this::recordNonProgramClass, missingClassConsumer);
+      }
+    }
+
+    // Mark types in permitted-subclasses attributes referenced.
+    List<PermittedSubclassAttribute> permittedSubclassAttributes =
+        clazz.getPermittedSubclassAttributes();
+    if (!permittedSubclassAttributes.isEmpty()) {
+      BiConsumer<DexType, ProgramDerivedContext> missingClassConsumer =
+          options.reportMissingClassesInPermittedSubclassesAttributes
+              ? this::reportMissingClass
+              : this::ignoreMissingClass;
+      for (PermittedSubclassAttribute permittedSubclassAttribute : permittedSubclassAttributes) {
+        recordTypeReference(
+            permittedSubclassAttribute.getPermittedSubclass(),
+            clazz,
+            this::recordNonProgramClass,
+            missingClassConsumer);
+      }
+    }
+
+    KeepReason reason = KeepReason.reachableFromLiveType(clazz.type);
+
+    for (DexType iface : clazz.getInterfaces()) {
+      markInterfaceTypeAsLiveViaInheritanceClause(iface, clazz);
+    }
+
+    if (clazz.superType != null) {
+      ScopedDexMethodSet seenForSuper =
+          scopedMethodsForLiveTypes.computeIfAbsent(
+              clazz.superType, ignore -> new ScopedDexMethodSet());
+      seen.setParent(seenForSuper);
+      markTypeAsLive(clazz.superType, clazz);
+    }
+
+    // Warn if the class extends an interface or implements a class
+    warnIfClassExtendsInterfaceOrImplementsClass(clazz);
+
+    // If this is an interface that has just become live, then report previously seen but unreported
+    // implemented-by edges.
+    transitionUnusedInterfaceToLive(clazz);
+
+    // We cannot remove virtual methods defined earlier in the type hierarchy if it is widening
+    // access and is defined in an interface:
+    //
+    // public interface I {
+    //   void clone();
+    // }
+    //
+    // class Model implements I {
+    //   public void clone() { ... } <-- this cannot be removed
+    // }
+    //
+    // Any class loading of Model with Model.clone() removed will result in an illegal access
+    // error because their exists an existing implementation (here it is Object.clone()). This is
+    // only a problem in the DEX VM. We have to make this check no matter the output because
+    // CF libraries can be used by Android apps. See b/136698023 for more information.
+    ensureMethodsContinueToWidenAccess(clazz, seen, reason);
+
+    if (clazz.isSerializable(appView)) {
+      enqueueFirstNonSerializableClassInitializer(clazz, reason);
+    }
+
+    // Update keep info.
+    applyMinimumKeepInfo(clazz);
+    applyMinimumKeepInfoDependentOn(new LiveClassEnqueuerEvent(clazz));
+    if (hasAlternativeLibraryDefinition(clazz)) {
+      mutateKeepInfo(clazz, MutableKeepInfoCollection::keepClass);
+    }
+
+    processAnnotations(clazz);
+
+    if (clazz.isAnnotation()) {
+      markAnnotationAsInstantiated(clazz, witness);
+      deferredAnnotationTracing.notifyNewlyLiveAnnotation(clazz);
+    }
+
+    compatEnqueueHolderIfDependentNonStaticMember(
+        clazz, rootSet.getDependentKeepClassCompatRule(clazz.getType()));
+
+    analyses.processNewlyLiveClass(clazz, worklist);
+  }
+
+  private void ensureMethodsContinueToWidenAccess(ClassDefinition clazz) {
+    assert !clazz.isProgramClass();
+    ScopedDexMethodSet seen =
+        scopedMethodsForLiveTypes.computeIfAbsent(
+            clazz.getType(), ignore -> new ScopedDexMethodSet());
+    clazz.getMethodCollection().forEachVirtualMethod(seen::addMethodIfMoreVisible);
+  }
+
+  private void ensureMethodsContinueToWidenAccess(
+      DexProgramClass clazz, ScopedDexMethodSet seen, KeepReason reason) {
+    clazz.forEachProgramVirtualMethodMatching(
+        definition ->
+            seen.addMethodIfMoreVisible(definition)
+                    == AddMethodIfMoreVisibleResult.ADDED_MORE_VISIBLE
+                && appView.appInfo().methodDefinedInInterfaces(definition, clazz.type),
+        method -> markMethodAsTargeted(method, reason));
+  }
+
+  private void markInterfaceTypeAsLiveViaInheritanceClause(
+      DexType type, DexProgramClass implementer) {
+    ClassResolutionResult resolutionResult =
+        appView.definitionForWithResolutionResult(type, implementer);
+    if (!resolutionResult.hasClassResolutionResult()) {
+      return;
+    }
+
+    DexProgramClass clazz = resolutionResult.toSingleClassWithProgramOverLibrary().asProgramClass();
+    if (clazz == null) {
+      return;
+    }
+
+    if (!options.enableUnusedInterfaceRemoval
+        || hasMinimumKeepInfoThatMatches(clazz, info -> !info.isUnusedInterfaceRemovalAllowed())
+        || mode.isMainDexTracing()
+        || resolutionResult.isMultipleClassResolutionResult()) {
+      markTypeAsLive(clazz, implementer);
+      return;
+    }
+
+    if (liveTypes.contains(clazz)) {
+      // The interface is already live, so make sure to report this implements-edge.
+      graphReporter.reportClassReferencedFrom(clazz, implementer);
+      return;
+    }
+
+    if (mode.isInitialTreeShaking()) {
+      if (!clazz.isInterface()) {
+        appView
+            .reporter()
+            .warning(
+                "The class "
+                    + implementer
+                    + " implements the interface "
+                    + type
+                    + " but "
+                    + type
+                    + " is not an interface.");
+      }
+    }
+
+    // No need to mark the type as live. If an interface type is only reachable via the
+    // inheritance clause of another type it can simply be removed from the inheritance clause.
+    // The interface is needed if it has a live default interface method or field, though.
+    // Therefore, we record that this implemented-by edge has not been reported, such that we
+    // can report it in the future if one its members becomes live.
+    WorkList<DexProgramClass> worklist = WorkList.newIdentityWorkList();
+    worklist.addIfNotSeen(clazz);
+    while (worklist.hasNext()) {
+      DexProgramClass current = worklist.next();
+      if (liveTypes.contains(current)) {
+        continue;
+      }
+      Set<DexProgramClass> implementors =
+          unusedInterfaceTypes.computeIfAbsent(current, ignore -> Sets.newIdentityHashSet());
+      if (implementors.add(implementer)) {
+        for (DexType iface : current.getInterfaces()) {
+          DexClass definition = definitionFor(iface, current);
+          if (definition == null) {
+            continue;
+          }
+          if (definition.isPublic() || implementer.getType().isSamePackage(definition.getType())) {
+            if (definition.isProgramClass()) {
+              worklist.addIfNotSeen(definition.asProgramClass());
+            }
+          } else {
+            markTypeAsLive(current, implementer);
+          }
+        }
+      }
+    }
+  }
+
+  private void enqueueHolderWithDependentInstanceConstructor(
+      ProgramMethod instanceInitializer, Set<KeepReason> reasons, Set<ProguardKeepRuleBase> rules) {
+    DexProgramClass holder = instanceInitializer.getHolder();
+    applyMinimumKeepInfoWhenLive(holder, KeepClassInfo.newEmptyJoiner().disallowOptimization());
+    enqueueKeepRuleInstantiatedType(holder, reasons, rules, instanceInitializer.getDefinition());
+  }
+
+  private void processAnnotations(ProgramDefinition annotatedItem) {
+    processAnnotations(
+        annotatedItem,
+        annotatedItem.getDefinition().annotations(),
+        AnnotatedKind.from(annotatedItem));
+  }
+
+  private void processAnnotations(
+      ProgramDefinition annotatedItem, DexAnnotationSet annotations, AnnotatedKind kind) {
+    processAnnotations(annotatedItem, annotations.annotations, kind);
+  }
+
+  private void processAnnotations(
+      ProgramDefinition annotatedItem, DexAnnotation[] annotations, AnnotatedKind kind) {
+    for (DexAnnotation annotation : annotations) {
+      processAnnotation(annotatedItem, annotation, kind);
+    }
+  }
+
+  void processAnnotation(
+      ProgramDefinition annotatedItem, DexAnnotation annotation, AnnotatedKind kind) {
+    DexType type = annotation.getAnnotationType();
+    DexClass annotationClass = definitionFor(type, annotatedItem);
+    processAnnotation(annotatedItem, annotation, kind, annotationClass);
+  }
+
+  void processAnnotation(
+      ProgramDefinition annotatedItem,
+      DexAnnotation annotation,
+      AnnotatedKind kind,
+      DexClass annotationClass) {
+    boolean annotationTypeIsNotProgramClass =
+        annotationClass == null || annotationClass.isNotProgramClass();
+    boolean isLive =
+        annotationTypeIsNotProgramClass || liveTypes.contains(annotationClass.asProgramClass());
+    if (shouldKeepAnnotation(annotatedItem, annotation, kind, isLive)) {
+      traceAnnotation(annotatedItem, annotation);
+      return;
+    }
+    if (isLive) {
+      // Enqueue for reprocessing when the keep info of the annotated item changes.
+      deferredAnnotationTracing.enqueueAnnotationForProcessingWhenKeepInfoChanges(
+          annotatedItem, annotation, annotationClass, kind);
+    } else {
+      // Enqueue for reprocessing when the annotation type becomes live.
+      assert annotationClass.isProgramClass();
+      deferredAnnotationTracing.enqueueAnnotationForProcessingWhenAnnotationTypeBecomesLive(
+          annotatedItem, annotation, annotationClass.asProgramClass(), kind);
+    }
+  }
+
+  private void traceAnnotation(ProgramDefinition annotatedItem, DexAnnotation annotation) {
+    // Report that the annotation is retained due to the annotated item.
+    graphReporter.registerAnnotation(annotation, annotatedItem);
+
+    // Report that the items referenced from inside the annotation are retained due to the
+    // annotation.
+    AnnotationReferenceMarker referenceMarker =
+        new AnnotationReferenceMarker(annotation, annotatedItem);
+    annotation.collectIndexedItems(appView, referenceMarker);
+  }
+
+  private boolean shouldKeepAnnotation(
+      ProgramDefinition annotatedItem,
+      DexAnnotation annotation,
+      AnnotatedKind annotatedKind,
+      boolean isLive) {
+    if (annotationRemoverBuilder != null
+        && annotationRemoverBuilder.isRetainedForFinalTreeShaking(annotation)) {
+      assert mode.isInitialTreeShaking();
+      return true;
+    }
+    KeepInfo<?, ?> itemKeepInfo = getKeepInfo().getInfo(annotatedItem);
+    return AnnotationRemover.shouldKeepAnnotation(
+        appView, annotatedItem, annotation, isLive, annotatedKind, mode, itemKeepInfo);
+  }
+
+  private DexClass resolveBaseType(DexType type, ProgramDefinition context) {
+    if (type.isArrayType()) {
+      return resolveBaseType(type.getBaseType(), context);
+    }
+    if (type.isClassType()) {
+      DexClass clazz = appView.definitionFor(type, context.getContextClass());
+      if (clazz != null) {
+        checkAccess(clazz, context);
+      }
+      return clazz;
+    }
+    return null;
+  }
+
+  private FieldResolutionResult resolveField(DexField field, ProgramDefinition context) {
+    // Record the references in case they are not program types.
+    FieldResolutionResult fieldResolutionResult = appInfo.resolveField(field);
+    fieldResolutionResult.visitFieldResolutionResults(
+        resolutionResult -> {
+          checkAccess(resolutionResult, context);
+          recordFieldReference(
+              field, resolutionResult.getResolutionPair().asProgramDerivedContext(context));
+        },
+        failedResolution -> {
+          failedFieldResolutionTargets.add(field);
+          recordFieldReference(field, context);
+        });
+    return fieldResolutionResult;
+  }
+
+  private MethodResolutionResult resolveMethod(
+      DexMethod method, ProgramDefinition context, KeepReason reason) {
+    // Record the references in case they are not program types.
+    MethodResolutionResult resolutionResult =
+        appInfo.unsafeResolveMethodDueToDexFormatLegacy(method);
+    resolutionResult.visitMethodResolutionResults(
+        result -> {
+          checkAccess(resolutionResult, context);
+          recordMethodReference(method, context);
+        },
+        failedResult -> {
+          markFailedMethodResolutionTargets(
+              method, resolutionResult.asFailedResolution(), context, reason);
+          recordMethodReference(method, context, this::recordFoundClass, this::reportMissingClass);
+        });
+    return resolutionResult;
+  }
+
+  private MethodResolutionResult resolveMethod(
+      DexMethod method, ProgramDefinition context, KeepReason reason, boolean interfaceInvoke) {
+    // Record the references in case they are not program types.
+    MethodResolutionResult methodResolutionResult =
+        appInfo.resolveMethodLegacy(method, interfaceInvoke);
+    methodResolutionResult.visitMethodResolutionResults(
+        resolutionResult -> {
+          if (!resolutionResult.isArrayCloneMethodResult()) {
+            checkAccess(resolutionResult, context);
+            recordMethodReference(
+                method, resolutionResult.getResolutionPair().asProgramDerivedContext(context));
+          }
+        },
+        failedResolutionResult -> {
+          markFailedMethodResolutionTargets(method, failedResolutionResult, context, reason);
+          recordMethodReference(method, context, this::recordFoundClass, this::reportMissingClass);
+        });
+    return methodResolutionResult;
+  }
+
+  private MethodResolutionResult handleInvokeOfStaticTarget(
+      DexMethod reference, ProgramDefinition context, KeepReason reason) {
+    MethodResolutionResult resolutionResults = resolveMethod(reference, context, reason);
+    resolutionResults.forEachMethodResolutionResult(
+        resolutionResult -> {
+          if (!resolutionResult.isSingleResolution()) {
+            return;
+          }
+          SingleResolutionResult<?> resolution = resolutionResult.asSingleResolution();
+          if (resolution.getResolvedHolder().isNotProgramClass()) {
+            return;
+          }
+          DexProgramClass clazz = resolution.getResolvedHolder().asProgramClass();
+          DexEncodedMethod encodedMethod = resolution.getResolvedMethod();
+
+          // We have to mark the resolved method as targeted even if it cannot actually be
+          // invoked to make sure the invocation will keep failing in the appropriate way.
+          ProgramMethod method = new ProgramMethod(clazz, encodedMethod);
+          markMethodAsTargeted(method, reason);
+
+          // Only mark methods for which invocation will succeed at runtime live.
+          if (encodedMethod.isStatic()) {
+            markDirectAndIndirectClassInitializersAsLive(clazz);
+            markDirectStaticOrConstructorMethodAsLive(method, reason);
+          }
+        });
+    return resolutionResults;
+  }
+
+  public void markDirectAndIndirectClassInitializersAsLive(DexProgramClass clazz) {
+    if (clazz.isInterface()) {
+      // Accessing a static field or method on an interface does not trigger the class initializer
+      // of any parent interfaces.
+      markInterfaceInitializedDirectly(clazz);
+      return;
+    }
+
+    WorkList<DexProgramClass> worklist = WorkList.newIdentityWorkList(clazz);
+    while (worklist.hasNext()) {
+      DexProgramClass current = worklist.next();
+      if (current.isInterface()) {
+        if (!markInterfaceInitializedIndirectly(current)) {
+          continue;
+        }
+      } else {
+        if (!markDirectClassInitializerAsLive(current)) {
+          continue;
+        }
+      }
+
+      // Mark all class initializers in all super types as live.
+      for (DexType superType : current.allImmediateSupertypes()) {
+        DexProgramClass superClass = getProgramClassOrNull(superType, current);
+        if (superClass != null) {
+          worklist.addIfNotSeen(superClass);
+        }
+      }
+    }
+  }
+
+  /** Returns true if the class became initialized for the first time. */
+  private boolean markDirectClassInitializerAsLive(DexProgramClass clazz) {
+    ProgramMethod clinit = clazz.getProgramClassInitializer();
+    KeepReasonWitness witness = graphReporter.reportReachableClassInitializer(clazz, clinit);
+    if (!initializedClasses.add(clazz, witness)) {
+      return false;
+    }
+    if (clinit != null && clinit.getDefinition().getOptimizationInfo().mayHaveSideEffects()) {
+      markDirectStaticOrConstructorMethodAsLive(clinit, witness);
+    }
+    return true;
+  }
+
+  /**
+   * Marks the interface as initialized directly and promotes the interface initializer to being
+   * live if it isn't already.
+   */
+  private void markInterfaceInitializedDirectly(DexProgramClass clazz) {
+    ProgramMethod clinit = clazz.getProgramClassInitializer();
+    // Mark the interface as initialized directly.
+    KeepReasonWitness witness = graphReporter.reportReachableClassInitializer(clazz, clinit);
+    if (!directlyInitializedInterfaces.add(clazz, witness)) {
+      return;
+    }
+    // Promote the interface initializer to being live if it isn't already.
+    if (clinit == null || !clinit.getDefinition().getOptimizationInfo().mayHaveSideEffects()) {
+      return;
+    }
+    if (indirectlyInitializedInterfaces.contains(clazz)
+        && clazz.getMethodCollection().hasVirtualMethods(DexEncodedMethod::isDefaultMethod)) {
+      assert liveMethods.contains(clinit);
+      return;
+    }
+    markDirectStaticOrConstructorMethodAsLive(clinit, witness);
+  }
+
+  /**
+   * Marks the interface as initialized indirectly and promotes the interface initializer to being
+   * live if the interface has a default interface method and is not already live.
+   *
+   * @return true if the interface became initialized indirectly for the first time.
+   */
+  private boolean markInterfaceInitializedIndirectly(DexProgramClass clazz) {
+    ProgramMethod clinit = clazz.getProgramClassInitializer();
+    // Mark the interface as initialized indirectly.
+    KeepReasonWitness witness = graphReporter.reportReachableClassInitializer(clazz, clinit);
+    if (!indirectlyInitializedInterfaces.add(clazz, witness)) {
+      return false;
+    }
+    // Promote the interface initializer to being live if it has a default interface method and
+    // isn't already live.
+    if (clinit == null
+        || !clinit.getDefinition().getOptimizationInfo().mayHaveSideEffects()
+        || !clazz.getMethodCollection().hasVirtualMethods(DexEncodedMethod::isDefaultMethod)) {
+      return true;
+    }
+    if (directlyInitializedInterfaces.contains(clazz)) {
+      assert liveMethods.contains(clinit);
+      return true;
+    }
+    markDirectStaticOrConstructorMethodAsLive(clinit, witness);
+    return true;
+  }
+
+  // Package protected due to entry point from worklist.
+  void markNonStaticDirectMethodAsReachable(
+      DexMethod method, ProgramDefinition context, KeepReason reason) {
+    handleInvokeOfDirectTarget(method, context, reason);
+  }
+
+  private MethodResolutionResult handleInvokeOfDirectTarget(
+      DexMethod reference, ProgramDefinition context, KeepReason reason) {
+    MethodResolutionResult resolutionResults = resolveMethod(reference, context, reason);
+    resolutionResults.forEachMethodResolutionResult(
+        resolutionResult -> {
+          if (resolutionResult.isFailedResolution()) {
+            failedMethodResolutionTargets.add(reference);
+            return;
+          }
+
+          if (!resolutionResult.isSingleResolution()
+              || !resolutionResult.getResolvedHolder().isProgramClass()) {
+            return;
+          }
+
+          ProgramMethod resolvedMethod =
+              resolutionResult.asSingleResolution().getResolvedProgramMethod();
+
+          // We have to mark the resolved method as targeted even if it cannot actually be
+          // invoked to make sure the invocation will keep failing in the appropriate way.
+          markMethodAsTargeted(resolvedMethod, reason);
+
+          // Only mark methods for which invocation will succeed at runtime live.
+          if (resolvedMethod.getAccessFlags().isStatic()) {
+            return;
+          }
+
+          markDirectStaticOrConstructorMethodAsLive(resolvedMethod, reason);
+
+          // It is valid to have an invoke-direct instruction in a default interface method that
+          // targets another default method in the same interface. In a class, that would lead
+          // to a verification error. See also testInvokeSpecialToDefaultMethod.
+          if (resolvedMethod.getDefinition().isNonPrivateVirtualMethod()
+              && virtualMethodsTargetedByInvokeDirect.add(resolvedMethod.getReference())) {
+            worklist.enqueueMarkMethodLiveAction(resolvedMethod, context, reason);
+          }
+        });
+    return resolutionResults;
+  }
+
+  private void ensureFromLibraryOrThrow(DexType type, DexLibraryClass context) {
+    if (mode.isMainDexTracing()) {
+      // b/72312389: android.jar contains parts of JUnit and most developers include JUnit in
+      // their programs. This leads to library classes extending program classes. When tracing
+      // main dex lists we allow this.
+      return;
+    }
+    DexProgramClass clazz = asProgramClassOrNull(appInfo().definitionFor(type));
+    if (clazz == null) {
+      return;
+    }
+    DexClass alternativeResolutionResult =
+        appInfo().contextIndependentDefinitionForWithResolutionResult(type).toAlternativeClass();
+    if (alternativeResolutionResult != null && alternativeResolutionResult.isLibraryClass()) {
+      // We are in a situation where a library class inherits from a library class, which has a
+      // program class duplicated version for low API levels.
+      recordNonProgramClass(alternativeResolutionResult, clazz);
+      return;
+    }
+    if (forceProguardCompatibility) {
+      // To ensure that the program works correctly we have to pin all super types and members
+      // in the tree.
+      KeepReason keepReason = KeepReason.reachableFromLiveType(context.type);
+      keepClassAndAllMembers(clazz, keepReason);
+      appInfo.traverseSuperTypes(
+          clazz,
+          (supertype, superclass, subclassOfSuperclass, isInterface) -> {
+            if (superclass != null && superclass.isProgramClass()) {
+              keepClassAndAllMembers(superclass.asProgramClass(), keepReason);
+            }
+            return TraversalContinuation.doContinue();
+          });
+    }
+    if (appView.getDontWarnConfiguration().matches(context)) {
+      // Ignore.
+      return;
+    }
+    // Only report an error during the first round of treeshaking.
+    if (mode.isInitialTreeShaking()) {
+      Diagnostic message =
+          new StringDiagnostic(
+              "Library class "
+                  + context.type.toSourceString()
+                  + (clazz.isInterface() ? " implements " : " extends ")
+                  + "program class "
+                  + type.toSourceString()
+                  + " (origin: "
+                  + clazz.getOrigin()
+                  + ")");
+      if (forceProguardCompatibility
+          || options.getTestingOptions().allowLibraryExtendsProgramInFullMode) {
+        options.reporter.warning(message);
+      } else {
+        options.reporter.error(message);
+      }
+    }
+  }
+
+  private void shouldNotBeMinified(ProgramDefinition definition) {
+    if (options.isMinificationEnabled()) {
+      rootSet.shouldNotBeMinified(definition);
+    }
+  }
+
+  private void keepClassAndAllMembers(DexProgramClass clazz, KeepReason keepReason) {
+    KeepReasonWitness keepReasonWitness = graphReporter.registerClass(clazz, keepReason);
+    markClassAsInstantiatedWithCompatRule(clazz.asProgramClass(), () -> keepReasonWitness);
+    mutateKeepInfo(clazz, MutableKeepInfoCollection::keepClass);
+    shouldNotBeMinified(clazz);
+    clazz.forEachProgramField(
+        field -> {
+          mutateKeepInfo(field, MutableKeepInfoCollection::keepField);
+          shouldNotBeMinified(field);
+          markFieldAsKept(field, keepReasonWitness);
+        });
+    clazz.forEachProgramMethod(
+        method -> {
+          mutateKeepInfo(method, MutableKeepInfoCollection::keepMethod);
+          shouldNotBeMinified(method);
+          markMethodAsKept(method, keepReasonWitness);
+        });
+  }
+
+  private void recordFoundClass(DexClass clazz, ProgramDerivedContext context) {
+    if (clazz.isProgramClass()) {
+      if (context.isProgramContext()) {
+        markTypeAsLive(clazz, context.getContext().asProgramDefinition());
+      }
+    } else {
+      recordNonProgramClass(clazz, context);
+    }
+  }
+
+  private void recordNonProgramClass(DexClass clazz, ProgramDerivedContext context) {
+    if (!clazz.isProgramClass()) {
+      addLiveNonProgramType(
+          clazz.asClasspathOrLibraryClass(),
+          true,
+          (missingType, derivedContext) ->
+              reportMissingClass(missingType, derivedContext.asProgramDerivedContext(context)));
+    }
+  }
+
+  public void recordNonProgramClassWithNoMissingReporting(
+      DexClass clazz, ProgramDerivedContext context) {
+    if (!clazz.isProgramClass()) {
+      addLiveNonProgramType(
+          clazz.asClasspathOrLibraryClass(), true, this::ignoreMissingClasspathOrLibraryClass);
+    }
+  }
+
+  private void ignoreMissingClass(DexType clazz) {
+    missingClassesBuilder.ignoreNewMissingClass(clazz);
+  }
+
+  private void ignoreMissingClass(DexType clazz, ProgramDerivedContext context) {
+    ignoreMissingClass(clazz);
+  }
+
+  private void ignoreMissingClasspathOrLibraryClass(DexType clazz) {
+    ignoreMissingClass(clazz);
+  }
+
+  private void ignoreMissingClasspathOrLibraryClass(
+      DexType clazz, ClasspathOrLibraryDefinition context) {
+    ignoreMissingClasspathOrLibraryClass(clazz);
+  }
+
+  private void reportMissingClass(DexType clazz, ProgramDerivedContext context) {
+    assert !mode.isFinalTreeShaking()
+            || missingClassesBuilder.wasAlreadyMissing(clazz)
+            || appView.dexItemFactory().isPossiblyCompilerSynthesizedType(clazz)
+            || initialDeadProtoTypes.contains(clazz)
+            // TODO(b/157107464): See if we can clean this up.
+            || (initialPrunedTypes != null && initialPrunedTypes.contains(clazz))
+        : "Unexpected missing class `" + clazz.toSourceString() + "`";
+    // Do not report missing classes from D8/R8 synthesized methods on non-synthetic classes (for
+    // example, lambda accessibility bridges).
+    // TODO(b/180376674): Clean this up. Ideally the D8/R8 synthesized methods would be synthesized
+    //  using synthetic items, such that the synthetic items infrastructure would track the
+    //  synthesizing contexts for these methods as well. That way, this would just work without any
+    //  special handling because the mapping to the synthesizing contexts would also work for these
+    //  synthetic methods.
+    if (context.isProgramContext()
+        && context.getContext().isMethod()
+        && context.getContext().asMethod().getDefinition().isD8R8Synthesized()
+        && !appView
+            .getSyntheticItems()
+            .isSyntheticClass(context.getContext().asProgramDefinition().getContextClass())) {
+      missingClassesBuilder.ignoreNewMissingClass(clazz);
+    } else {
+      missingClassesBuilder.addNewMissingClass(clazz, context);
+    }
+  }
+
+  /**
+   * Adds the class to the set of instantiated classes and marks its fields and methods live
+   * depending on the currently seen invokes and field reads.
+   */
+  // Package protected due to entry point from worklist.
+  void processNewlyInstantiatedClass(
+      DexProgramClass clazz,
+      ProgramMethod context,
+      InstantiationReason instantiationReason,
+      KeepReason keepReason,
+      Timing timing) {
+    try (Timing t = timing.begin("processNewlyInstantiatedClass")) {
+      assert !clazz.isAnnotation();
+      assert !clazz.isInterface();
+
+      // Notify analyses. This is done even if `clazz` has already been marked as instantiated,
+      // because each analysis may depend on seeing all the (clazz, reason) pairs. Thus, not doing
+      // so could lead to nondeterminism.
+      analyses.processNewlyInstantiatedClass(clazz.asProgramClass(), context, timing, worklist);
+
+      if (!markInstantiatedClass(clazz, context, instantiationReason, keepReason, timing)) {
+        return;
+      }
+
+      // This class becomes live, so it and all its supertypes become live types.
+      timing.time(
+          "Mark live", () -> markTypeAsLive(clazz, graphReporter.registerClass(clazz, keepReason)));
+      // Instantiation triggers class initialization.
+      timing.time(
+          "Class initialization", () -> markDirectAndIndirectClassInitializersAsLive(clazz));
+      timing.time(
+          "Transition items", () -> transitionItemsDueToNewlyInstantiatedClass(clazz, timing));
+    }
+  }
+
+  private void transitionItemsDueToNewlyInstantiatedClass(DexProgramClass clazz, Timing timing) {
+    // For all methods of the class, if we have seen a call, mark the method live.
+    // We only do this for virtual calls, as the other ones will be done directly.
+    timing.time("Transition methods", () -> transitionMethodsForInstantiatedClass(clazz, timing));
+    // For all instance fields visible from the class, mark them live if we have seen a read.
+    timing.time("Transition fields", () -> transitionFieldsForInstantiatedClass(clazz));
+    // Add all dependent instance members to the workqueue.
+    timing.time(
+        "Transition dependent items", () -> transitionDependentItemsForInstantiatedClass(clazz));
+  }
+
+  // TODO(b/146016987): Make this the single instantiation entry rather than the worklist action.
+  private boolean markInstantiatedClass(
+      DexProgramClass clazz,
+      ProgramMethod context,
+      InstantiationReason instantiationReason,
+      KeepReason keepReason,
+      Timing timing) {
+    assert !clazz.isInterface();
+    try (Timing t = timing.begin("Mark instantiated class")) {
+      return objectAllocationInfoCollection.recordDirectAllocationSite(
+          clazz, context, instantiationReason, keepReason, appInfo);
+    }
+  }
+
+  void markAnnotationAsInstantiated(DexProgramClass clazz, KeepReasonWitness witness) {
+    assert clazz.isAnnotation();
+    if (!objectAllocationInfoCollection.recordInstantiatedAnnotation(clazz, appInfo)) {
+      return;
+    }
+    markTypeAsLive(clazz, witness);
+    transitionDependentItemsForInstantiatedInterface(clazz);
+  }
+
+  public void markInterfaceAsInstantiated(DexProgramClass clazz, KeepReasonWitness witness) {
+    assert !clazz.isAnnotation();
+    assert clazz.isInterface();
+    if (!objectAllocationInfoCollection.recordInstantiatedInterface(clazz, appInfo)) {
+      return;
+    }
+    markTypeAsLive(clazz, witness);
+    transitionDependentItemsForInstantiatedInterface(clazz);
+    transitionMethodsForInstantiatedClass(clazz, Timing.empty());
+  }
+
+  private void markLambdaAsInstantiated(LambdaDescriptor descriptor, ProgramMethod context) {
+    // Each descriptor is unique, so there is no check for already marking the lambda.
+    for (DexType iface : descriptor.interfaces) {
+      checkLambdaInterface(iface, context);
+      objectAllocationInfoCollection.recordInstantiatedLambdaInterface(iface, descriptor, appInfo);
+    }
+  }
+
+  private void checkLambdaInterface(DexType itf, ProgramMethod context) {
+    DexClass clazz = definitionFor(itf, context);
+    if (clazz == null) {
+      if (!appView.getDontWarnConfiguration().matches(itf)) {
+        StringDiagnostic message =
+            new StringDiagnostic(
+                "Lambda expression implements missing interface `" + itf.toSourceString() + "`",
+                context.getOrigin());
+        options.reporter.warning(message);
+      }
+    } else if (!clazz.isInterface()) {
+      if (!appView.getDontWarnConfiguration().matches(itf)) {
+        StringDiagnostic message =
+            new StringDiagnostic(
+                "Lambda expression expected to implement an interface, but found "
+                    + "`"
+                    + itf.toSourceString()
+                    + "`",
+                context.getOrigin());
+        options.reporter.warning(message);
+      }
+    }
+  }
+
+  private void transitionMethodsForInstantiatedLambda(LambdaDescriptor lambda) {
+    transitionMethodsForInstantiatedObject(
+        InstantiatedObject.of(lambda),
+        appInfo.dexItemFactory().objectType,
+        lambda.interfaces,
+        Timing.empty());
+  }
+
+  private void transitionMethodsForInstantiatedClass(DexProgramClass clazz, Timing timing) {
+    assert !clazz.isAnnotation();
+    transitionMethodsForInstantiatedObject(
+        InstantiatedObject.of(clazz), clazz.type, Collections.emptyList(), timing);
+  }
+
+  /**
+   * Marks all methods live that are overrides of reachable methods for a given instantiation.
+   *
+   * <p>Only reachable methods in the hierarchy of the given instantiation and above are considered,
+   * and only the lowest such reachable target (ie, mirroring resolution). All library and classpath
+   * methods are considered reachable.
+   */
+  private void transitionMethodsForInstantiatedObject(
+      InstantiatedObject instantiation, DexType type, List<DexType> interfaces, Timing timing) {
+    WorkList<DexType> worklist = WorkList.newIdentityWorkList(type);
+    worklist.addIfNotSeen(interfaces);
+    while (worklist.hasNext()) {
+      ClassResolutionResult classResolutionResult =
+          appInfo().contextIndependentDefinitionForWithResolutionResult(worklist.next());
+      classResolutionResult.forEachClassResolutionResult(
+          clazz -> {
+            if (clazz.isProgramClass()) {
+              timing.time(
+                  "Program",
+                  () -> markProgramMethodOverridesAsLive(instantiation, clazz.asProgramClass()));
+            } else {
+              timing.time(
+                  "Library",
+                  () -> markLibraryAndClasspathMethodOverridesAsLive(instantiation, clazz));
+            }
+            if (clazz.superType != null) {
+              worklist.addIfNotSeen(clazz.superType);
+            }
+            worklist.addIfNotSeen(clazz.interfaces);
+          });
+    }
+  }
+
+  private Set<ResolutionSearchKey> getReachableVirtualTargets(DexProgramClass clazz) {
+    return reachableVirtualTargets.getOrDefault(clazz, Collections.emptySet());
+  }
+
+  private void markProgramMethodOverridesAsLive(
+      InstantiatedObject instantiation, DexProgramClass currentClass) {
+    assert instantiation.isLambda() || appInfo.isSubtype(instantiation.asClass(), currentClass);
+    getReachableVirtualTargets(currentClass)
+        .forEach(
+            resolutionSearchKey ->
+                resolutionSearchKey
+                    .resolve(appInfo)
+                    .forEachMethodResolutionResult(
+                        resolutionResult -> {
+                          SingleResolutionResult<?> singleResolution =
+                              resolutionResult.asSingleResolution();
+                          if (singleResolution == null) {
+                            assert false : "Should not be null";
+                            return;
+                          }
+                          // Lookup virtual dispatch targets only uses the given context to judge
+                          // accessibility. Since we've already evaluated accessibility upon adding
+                          // this to reachableVirtualTargets, we use context=null to bypass the
+                          // access check here.
+                          ProgramMethod context = null;
+                          LookupResultSuccess lookupResult =
+                              singleResolution
+                                  .lookupVirtualDispatchTargets(
+                                      context,
+                                      appView,
+                                      instantiation,
+                                      definition ->
+                                          getKeepInfo().isPinned(definition, options, appInfo))
+                                  .asLookupResultSuccess();
+                          assert lookupResult != null;
+                          handleVirtualDispatchTargets(lookupResult, singleResolution);
+                          handleVirtualDispatchFailureDependencies(lookupResult, singleResolution);
+                        }));
+  }
+
+  private void handleVirtualDispatchTargets(
+      LookupResult lookupResult, SingleResolutionResult<?> resolutionResult) {
+    lookupResult.forEach(
+        target ->
+            markVirtualDispatchTargetAsLive(
+                target,
+                programMethod ->
+                    graphReporter.reportReachableMethodAsLive(
+                        resolutionResult.getResolvedMethod().getReference(), programMethod)));
+  }
+
+  private void handleVirtualDispatchFailureDependencies(
+      LookupResultSuccess lookupResult, SingleResolutionResult<?> singleResolution) {
+    if (!lookupResult.hasFailureDependencies()) {
+      return;
+    }
+    lookupResult.forEachFailureDependency(
+        method -> {
+          ProgramMethod programMethod = method.asProgramMethod(appInfo);
+          if (programMethod != null) {
+            markMethodAsTargeted(
+                programMethod,
+                graphReporter.reportFailureDependencyAsTargeted(
+                    singleResolution.getResolvedMethod().getReference(), programMethod));
+            failedMethodResolutionTargets.add(method.getReference());
+          }
+        });
+  }
+
+  @SuppressWarnings("ReferenceEquality")
+  private void markLibraryAndClasspathMethodOverridesAsLive(
+      InstantiatedObject instantiation, DexClass libraryClass) {
+    assert libraryClass.isNotProgramClass();
+    if (mode.isMainDexTracing()) {
+      // Library roots must be specified for tracing of library methods. For classpath the expected
+      // use case is that the classes will be classloaded, thus they should have no bearing on the
+      // content of the main dex file.
+      return;
+    }
+    for (DexEncodedMethod method : libraryClass.virtualMethods()) {
+      assert !method.isPrivateMethod();
+      // Note: It would be reasonable to not process methods already seen during the marking of
+      // program usages, but that would cause the methods to not be marked as library overrides.
+      markLibraryOrClasspathOverrideLive(
+          instantiation,
+          libraryClass,
+          appInfo.resolveMethodOnLegacy(libraryClass, method.getReference()));
+
+      // Due to API conversion, some overrides can be hidden since they will be rewritten. See
+      // class comment of DesugaredLibraryAPIConverter and vivifiedType logic.
+      // In the first enqueuer phase, the signature has not been desugared, so firstResolution
+      // maintains the library override. In the second enqueuer phase, the signature has been
+      // desugared, and the second resolution maintains the the library override.
+      if (instantiation.isClass()
+          && appView
+              .options()
+              .getLibraryDesugaringOptions()
+              .getTypeRewriter()
+              .hasRewrittenTypeInSignature(method.getProto())) {
+        DexMethod methodToResolve =
+            methodWithVivifiedTypeInSignature(
+                method.getReference(), method.getHolderType(), appView);
+        assert methodToResolve != method.getReference();
+        markLibraryOrClasspathOverrideLive(
+            instantiation,
+            libraryClass,
+            appInfo.resolveMethodOnLegacy(instantiation.asClass(), methodToResolve));
+      }
+    }
+  }
+
+  private void markLibraryOrClasspathOverrideLive(
+      InstantiatedObject instantiation,
+      DexClass libraryOrClasspathClass,
+      MethodResolutionResult resolution) {
+    LookupTarget lookup = resolution.lookupVirtualDispatchTarget(instantiation, appInfo);
+    if (lookup == null) {
+      return;
+    }
+    if (!shouldMarkLibraryMethodOverrideAsReachable(lookup)) {
+      return;
+    }
+    markVirtualDispatchTargetAsLive(
+        lookup,
+        method ->
+            graphReporter.reportLibraryMethodAsLive(
+                instantiation, method, libraryOrClasspathClass));
+    if (instantiation.isClass()) {
+      // TODO(b/149976493): We need to mark these for lambdas too!
+      markOverridesAsLibraryMethodOverrides(
+          instantiation.asClass(), lookup.asMethodTarget().getDefinition().getReference());
+    }
+  }
+
+  private void markOverridesAsLibraryMethodOverrides(
+      DexProgramClass instantiatedClass, DexMethod libraryMethodOverride) {
+    WorkList<DexProgramClass> worklist = WorkList.newIdentityWorkList();
+    worklist.addIfNotSeen(instantiatedClass);
+    while (worklist.hasNext()) {
+      DexProgramClass clazz = worklist.next();
+      ProgramMethod override = clazz.lookupProgramMethod(libraryMethodOverride);
+      if (override != null) {
+        if (override.getDefinition().isLibraryMethodOverride().isTrue()) {
+          continue;
+        }
+        override.getDefinition().setLibraryMethodOverride(OptionalBool.TRUE);
+        // TODO(b/243483849): The minifier does not detect library overrides if the library class
+        //  is present both as program and library class. We force disable minification here as a
+        //  work-around until this is fixed.
+        if (options.loadAllClassDefinitions) {
+          shouldNotBeMinified(override);
+        }
+      }
+      clazz.forEachImmediateSupertype(
+          superType -> {
+            DexProgramClass superclass = getProgramClassOrNull(superType, clazz);
+            if (superclass != null) {
+              worklist.addIfNotSeen(superclass);
+            }
+          });
+    }
+  }
+
+  /**
+   * Marks all fields live that can be reached by a read assuming that the given type or one of its
+   * subtypes is instantiated.
+   */
+  private void transitionFieldsForInstantiatedClass(DexProgramClass clazz) {
+    do {
+      ProgramFieldSet reachableFields = reachableInstanceFields.get(clazz);
+      if (reachableFields != null) {
+        // TODO(b/120959039): Should the reason this field is reachable come from the set?
+        KeepReason reason = KeepReason.reachableFromLiveType(clazz.type);
+        for (ProgramField field : reachableFields) {
+          markFieldAsLive(field, clazz, reason);
+        }
+      }
+      if (clazz.superType == null) {
+        break;
+      }
+      clazz = getProgramClassOrNull(clazz.superType, clazz);
+    } while (clazz != null && !objectAllocationInfoCollection.isInstantiatedDirectly(clazz));
+  }
+
+  private void transitionDependentItemsForInstantiatedClass(DexProgramClass clazz) {
+    assert !clazz.isAnnotation();
+    assert !clazz.isInterface();
+    transitionDependentItemsForInstantiatedItem(clazz);
+  }
+
+  private void transitionDependentItemsForInstantiatedInterface(DexProgramClass clazz) {
+    assert clazz.isInterface();
+    transitionDependentItemsForInstantiatedItem(clazz);
+  }
+
+  private void transitionDependentItemsForInstantiatedItem(DexProgramClass clazz) {
+    WorkList<DexProgramClass> interfacesToTransition =
+        WorkList.newWorkList(interfacesTransitionedToInstantiated);
+    if (clazz.getAccessFlags().isInterface()) {
+      interfacesToTransition.addIfNotSeen(clazz);
+    } else {
+      do {
+        // Handle keep rules that are dependent on the class being instantiated.
+        applyMinimumKeepInfoDependentOn(new InstantiatedClassEnqueuerEvent(clazz));
+
+        for (DexType interfaceType : clazz.getInterfaces()) {
+          DexProgramClass interfaceClass =
+              asProgramClassOrNull(definitionFor(interfaceType, clazz));
+          if (interfaceClass != null) {
+            interfacesToTransition.addIfNotSeen(interfaceClass);
+          }
+        }
+
+        // Visit the super type.
+        clazz =
+            clazz.superType != null
+                ? asProgramClassOrNull(appView.definitionFor(clazz.superType))
+                : null;
+      } while (clazz != null && !objectAllocationInfoCollection.isInstantiatedDirectly(clazz));
+    }
+
+    while (interfacesToTransition.hasNext()) {
+      DexProgramClass interfaceClass = interfacesToTransition.next();
+      applyMinimumKeepInfoDependentOn(new InstantiatedClassEnqueuerEvent(interfaceClass));
+
+      for (DexType indirectInterfaceType : interfaceClass.getInterfaces()) {
+        DexProgramClass indirectInterfaceClass =
+            asProgramClassOrNull(definitionFor(indirectInterfaceType, interfaceClass));
+        if (indirectInterfaceClass != null) {
+          interfacesToTransition.addIfNotSeen(indirectInterfaceClass);
+        }
+      }
+    }
+  }
+
+  private void transitionUnusedInterfaceToLive(DexProgramClass clazz) {
+    if (clazz.isInterface()) {
+      Set<DexProgramClass> implementedBy = unusedInterfaceTypes.remove(clazz);
+      if (implementedBy != null) {
+        for (DexProgramClass implementer : implementedBy) {
+          markTypeAsLive(clazz, implementer);
+        }
+      }
+    } else {
+      assert !unusedInterfaceTypes.containsKey(clazz);
+    }
+  }
+
+  private void addEffectivelyLiveOriginalField(ProgramField field) {
+    if (field.getDefinition().hasOriginalFieldWitness()) {
+      markEffectivelyLiveOriginalReference(field.getDefinition().getOriginalFieldWitness());
+    } else {
+      markEffectivelyLiveOriginalReference(field.getReference());
+    }
+  }
+
+  private void markFieldAsLive(ProgramField field, ProgramMethod context) {
+    markFieldAsLive(field, context, KeepReason.fieldReferencedIn(context));
+  }
+
+  private void markFieldAsLive(ProgramField field, ProgramDefinition context, KeepReason reason) {
+    // This field might be an instance field reachable from a static context, e.g. a getStatic that
+    // resolves to an instance field. We have to keep the instance field nonetheless, as otherwise
+    // we might unmask a shadowed static field and hence change semantics.
+    if (!liveFields.add(field, reason)) {
+      // Already live.
+      return;
+    }
+    addEffectivelyLiveOriginalField(field);
+
+    // Mark the field as targeted.
+    if (field.getAccessFlags().isStatic()) {
+      traceFieldDefinition(field);
+      markDirectAndIndirectClassInitializersAsLive(field.getHolder());
+    } else if (!reachableInstanceFields
+        .getOrDefault(field.getHolder(), ProgramFieldSet.empty())
+        .contains(field)) {
+      traceFieldDefinition(field);
+    }
+
+    // Update keep info.
+    applyMinimumKeepInfo(field);
+    if (hasAlternativeLibraryDefinition(field.getHolder()) && !field.getDefinition().isPrivate()) {
+      mutateKeepInfo(field, MutableKeepInfoCollection::keepField);
+    }
+
+    // Notify analyses.
+    analyses.processNewlyLiveField(field, context, worklist);
+  }
+
+  // Package protected due to entry point from worklist.
+  void markFieldAsReachable(ProgramField field, ProgramDefinition context, KeepReason reason) {
+    // We might have a instance field access that is dispatched to a static field. In such case,
+    // we have to keep the static field, so that the dispatch fails at runtime in the same way that
+    // it did before. We have to keep the field even if the receiver has no live inhabitants, as
+    // field resolution happens before the receiver is inspected.
+    if (field.getDefinition().isStatic()
+        || objectAllocationInfoCollection.isInstantiatedDirectlyOrHasInstantiatedSubtype(
+            field.getHolder())) {
+      markFieldAsLive(field, context, reason);
+    }
+
+    if (liveFields.contains(field)
+        || !reachableInstanceFields
+            .computeIfAbsent(field.getHolder(), ignore -> ProgramFieldSet.create())
+            .add(field)) {
+      // Already reachable.
+      graphReporter.registerField(field.getDefinition(), reason);
+      return;
+    }
+    addEffectivelyLiveOriginalField(field);
+    traceFieldDefinition(field);
+
+    analyses.processNewlyReachableField(field, worklist);
+  }
+
+  private void traceFieldDefinition(ProgramField field) {
+    markTypeAsLive(field.getHolder(), field);
+    markTypeAsLive(field.getType(), field);
+    processAnnotations(field);
+  }
+
+  private void traceFieldReference(DexField field, ProgramMethod context) {
+    markTypeAsLive(field.getHolderType(), context);
+    markTypeAsLive(field.getType(), context);
+  }
+
+  public void markDirectStaticOrConstructorMethodAsLive(ProgramMethod method, KeepReason reason) {
+    if (appView.options().isGeneratingDex()
+        && method.getReference().match(appView.dexItemFactory().deserializeLambdaMethod)
+        && method.getAccessFlags().isPrivate()) {
+      return;
+    }
+    if (worklist.enqueueMarkMethodLiveAction(method, method, reason)) {
+      assert worklist.enqueueAssertAction(
+          () -> {
+            // Should have marked the holder type live.
+            assert method.getDefinition().isClassInitializer() || verifyMethodIsTargeted(method);
+            assert verifyTypeIsLive(method.getHolder());
+          });
+    } else {
+      assert method.getDefinition().isClassInitializer() || verifyMethodIsTargeted(method);
+      assert worklist.enqueueAssertAction(() -> verifyTypeIsLive(method.getHolder()));
+    }
+  }
+
+  public void markVirtualMethodAsLive(ProgramMethod method, KeepReason reason) {
+    // Only explicit keep rules or reflective use should make abstract methods live.
+    assert !method.getDefinition().isAbstract()
+        || reason.isDueToKeepRule()
+        || reason.isDueToReflectiveUse();
+    worklist.enqueueMarkMethodLiveAction(method, method, reason);
+  }
+
+  public boolean isFieldReferenced(DexEncodedField field) {
+    FieldAccessInfoImpl info = fieldAccessInfoCollection.get(field.getReference());
+    return info != null;
+  }
+
+  public boolean isFieldReferenced(ProgramField field) {
+    return isFieldReferenced(field.getDefinition());
+  }
+
+  public boolean isFieldLive(ProgramField field) {
+    return liveFields.contains(field);
+  }
+
+  public boolean isFieldLive(DexEncodedField field) {
+    return liveFields.contains(field);
+  }
+
+  public boolean isFieldRead(ProgramField field) {
+    FieldAccessInfoImpl info = fieldAccessInfoCollection.get(field.getReference());
+    return info != null && info.isRead();
+  }
+
+  public boolean isFieldWrittenInMethodSatisfying(
+      ProgramField field, Predicate<ProgramMethod> predicate) {
+    FieldAccessInfoImpl info = fieldAccessInfoCollection.get(field.getReference());
+    return info != null && info.isWrittenInMethodSatisfying(predicate);
+  }
+
+  public boolean isFieldWrittenOutsideDefaultConstructor(ProgramField field) {
+    FieldAccessInfoImpl info = fieldAccessInfoCollection.get(field.getReference());
+    if (info == null) {
+      return false;
+    }
+    DexEncodedMethod defaultInitializer = field.getHolder().getDefaultInitializer();
+    return defaultInitializer != null
+        ? info.isWrittenOutside(defaultInitializer)
+        : info.isWritten();
+  }
+
+  public boolean isPreconditionForMinimumKeepInfoSatisfied(EnqueuerEvent preconditionEvent) {
+    if (preconditionEvent == null || preconditionEvent.isUnconditionalKeepInfoEvent()) {
+      return true;
+    }
+    if (preconditionEvent.isClassEvent()) {
+      ClassEnqueuerEvent classEvent = preconditionEvent.asClassEvent();
+      DexProgramClass clazz = asProgramClassOrNull(appView.definitionFor(classEvent.getType()));
+      if (clazz == null) {
+        return false;
+      }
+      if (preconditionEvent.isLiveClassEvent()) {
+        return liveTypes.contains(clazz);
+      }
+      if (preconditionEvent.isInstantiatedClassEvent()) {
+        return objectAllocationInfoCollection.isInstantiatedDirectlyOrHasInstantiatedSubtype(clazz);
+      }
+    }
+    assert false;
+    return false;
+  }
+
+  public boolean isMemberLive(DexEncodedMember<?, ?> member) {
+    assert member != null;
+    return member.isDexEncodedField()
+        ? liveFields.contains(member.asDexEncodedField())
+        : liveMethods.contains(member.asDexEncodedMethod());
+  }
+
+  public boolean isMethodLive(DexEncodedMethod method) {
+    return liveMethods.contains(method);
+  }
+
+  public boolean isMethodLive(ProgramMethod method) {
+    return isMethodLive(method.getDefinition());
+  }
+
+  public boolean isMethodTargeted(DexEncodedMethod method) {
+    return targetedMethods.contains(method);
+  }
+
+  public boolean isMethodTargeted(ProgramMethod method) {
+    return isMethodTargeted(method.getDefinition());
+  }
+
+  public boolean isTypeLive(DexClass clazz) {
+    return clazz.isProgramClass()
+        ? isTypeLive(clazz.asProgramClass())
+        : isNonProgramTypeLive(clazz);
+  }
+
+  public boolean isTypeLive(DexProgramClass clazz) {
+    return liveTypes.contains(clazz);
+  }
+
+  public boolean isOriginalReferenceEffectivelyLive(DexReference reference) {
+    // The effectively-live original set contains types, fields and methods witnessed by
+    // instructions, such as method inlining positions.
+    return effectivelyLiveOriginalReferences.contains(reference);
+  }
+
+  public boolean isNonProgramTypeLive(DexClass clazz) {
+    assert !clazz.isProgramClass();
+    return liveNonProgramTypes.contains(clazz);
+  }
+
+  public boolean isReachable(Definition definition) {
+    assert definition != null;
+
+    if (definition.isClass()) {
+      return isTypeLive(definition.asClass());
+    }
+
+    assert definition.isMember();
+
+    if (definition.getContextClass().isProgramClass()) {
+      if (definition.isField()) {
+        ProgramField field = definition.asProgramField();
+        return isFieldLive(field) || isFieldReferenced(field);
+      } else {
+        assert definition.isMethod();
+        ProgramMethod method = definition.asProgramMethod();
+        return isMethodLive(method) || isMethodTargeted(method);
+      }
+    }
+
+    return isNonProgramTypeLive(definition.getContextClass());
+  }
+
+  public void forAllLiveClasses(Consumer<DexProgramClass> consumer) {
+    liveTypes.getItems().forEach(consumer);
+  }
+
+  public MethodResolutionResult markVirtualMethodAsReachable(
+      DexMethod method, boolean interfaceInvoke, ProgramMethod context, KeepReason reason) {
+    MethodResolutionResult resolutionResults =
+        resolveMethod(method, context, reason, interfaceInvoke);
+    if (method.getHolderType().isArrayType()) {
+      // This is an array type, so the actual class will be generated at runtime. We treat this
+      // like an invoke on a direct subtype of java.lang.Object that has no further subtypes.
+      // As it has no subtypes, it cannot affect liveness of the program we are processing.
+      // Ergo, we can ignore it. We need to make sure that the element type is available, though.
+      markTypeAsLive(method.getHolderType(), context, reason);
+      return resolutionResults;
+    }
+
+    resolutionResults.forEachMethodResolutionResult(
+        resolutionResult -> {
+          if (!resolutionResult.isSingleResolution()) {
+            return;
+          }
+          SingleResolutionResult<?> resolution = resolutionResult.asSingleResolution();
+          ProgramMethod resolvedMethod = resolution.getResolvedProgramMethod();
+          if (resolvedMethod == null) {
+            // TODO(b/70160030): If the resolution is on a library method, then the keep edge
+            //  needs to go directly to the target method in the program. Thus this method will
+            //  need to ensure that 'reason' is not already reported (eg, must be delayed /
+            //  non-witness) and report that for each possible target edge below.
+            return;
+          }
+
+          // Note that all virtual methods derived from library methods are kept regardless of
+          // being reachable, so the following only needs to consider reachable targets in the
+          // program.
+          // TODO(b/70160030): Revise this to support tree shaking library and classpath methods on
+          //  non-escaping types.
+          DexClass initialResolutionHolder = resolution.getInitialResolutionHolder();
+          if (initialResolutionHolder.isClasspathClass()
+              && resolution.getResolvedHolder().isProgramClass()) {
+            // Implicitly treat the classpath class as instantiated.
+            markMethodAsTargeted(resolvedMethod, reason);
+            markVirtualDispatchMethodTargetAsLive(
+                resolvedMethod,
+                programMethod ->
+                    graphReporter.reportReachableMethodAsLive(
+                        resolvedMethod.getReference(), programMethod));
+            return;
+          }
+
+          DexProgramClass initialProgramResolutionHolder = initialResolutionHolder.asProgramClass();
+          if (initialProgramResolutionHolder == null) {
+            recordMethodReference(method, context);
+            return;
+          }
+
+          // If the method has already been marked, just report the new reason for the resolved
+          // target and save the context to ensure correct lookup of virtual dispatch targets.
+          ResolutionSearchKey resolutionSearchKey =
+              new ResolutionSearchKey(method, interfaceInvoke);
+          if (getReachableVirtualTargets(initialProgramResolutionHolder)
+              .contains(resolutionSearchKey)) {
+            graphReporter.registerMethod(resolution.getResolvedMethod(), reason);
+            return;
+          }
+
+          // We have to mark the resolution targeted, even if it does not become live, we
+          // need at least an abstract version of it so that it can be targeted.
+          markMethodAsTargeted(resolvedMethod, reason);
+          if (resolution.isAccessibleForVirtualDispatchFrom(context, appView).isFalse()) {
+            // Not accessible from this context, so this call will cause a runtime exception.
+            return;
+          }
+
+          if (resolution.isAccessibleFrom(context, appView).isFalse()) {
+            return;
+          }
+
+          // The method resolved and is accessible, so currently live overrides become live.
+          reachableVirtualTargets
+              .computeIfAbsent(initialProgramResolutionHolder, ignoreArgument(HashSet::new))
+              .add(resolutionSearchKey);
+
+          LookupResult lookupResult =
+              resolution.lookupVirtualDispatchTargets(
+                  null,
+                  appView,
+                  (type, subTypeConsumer, lambdaConsumer) ->
+                      objectAllocationInfoCollection.forEachInstantiatedSubType(
+                          type, subTypeConsumer, lambdaConsumer, appInfo),
+                  definition -> getKeepInfo().isPinned(definition, options, appInfo));
+          handleVirtualDispatchTargets(lookupResult, resolution);
+        });
+    return resolutionResults;
+  }
+
+  private void markVirtualDispatchTargetAsLive(
+      LookupTarget target, Function<ProgramMethod, KeepReasonWitness> reason) {
+    target.accept(
+        method -> markVirtualDispatchMethodTargetAsLive(method, reason),
+        lambda -> markVirtualDispatchLambdaTargetAsLive(lambda, reason));
+  }
+
+  private void markVirtualDispatchMethodTargetAsLive(
+      LookupMethodTarget target, Function<ProgramMethod, KeepReasonWitness> reason) {
+    ProgramMethod programMethod = target.getTarget().asProgramMethod();
+    if (programMethod == null) {
+      return;
+    }
+    if (programMethod.getDefinition().isAbstract()) {
+      applyMinimumKeepInfoWhenLiveOrTargeted(
+          programMethod,
+          KeepMethodInfo.newEmptyJoiner().disallowAbstractToNonAbstractOptimization());
+      return;
+    }
+    KeepReasonWitness appliedReason = reason.apply(programMethod);
+    markVirtualMethodAsLive(programMethod, appliedReason);
+    DexClassAndMethod accessOverride = target.getAccessOverride();
+    if (accessOverride != null && accessOverride.isProgramMethod()) {
+      markMethodAsTargeted(accessOverride.asProgramMethod(), appliedReason);
+    }
+  }
+
+  private void markVirtualDispatchLambdaTargetAsLive(
+      LookupLambdaTarget target, Function<ProgramMethod, KeepReasonWitness> reason) {
+    ProgramMethod implementationMethod = target.getImplementationMethod().asProgramMethod();
+    if (implementationMethod != null) {
+      worklist.enqueueMarkMethodLiveAction(
+          implementationMethod, implementationMethod, reason.apply(implementationMethod));
+    }
+  }
+
+  private void checkAccess(DexClass clazz, ProgramDefinition context) {
+    if (clazz.isProgramClass()
+        && AccessControl.isClassAccessible(clazz, context, appView).isPossiblyFalse()) {
+      failedClassResolutionTargets.add(clazz.getType());
+    }
+  }
+
+  private void checkAccess(FieldResolutionResult resolutionResult, ProgramDefinition context) {
+    if (resolutionResult.getResolvedHolder().isProgramClass()
+        && resolutionResult.isAccessibleFrom(context, appView).isPossiblyFalse()) {
+      failedFieldResolutionTargets.add(resolutionResult.getResolvedField().getReference());
+    }
+    checkAccess(resolutionResult.getInitialResolutionHolder(), context);
+  }
+
+  private void checkAccess(MethodResolutionResult resolutionResult, ProgramDefinition context) {
+    if (resolutionResult.getResolvedHolder().isProgramClass()
+        && resolutionResult.isAccessibleFrom(context, appView).isPossiblyFalse()) {
+      failedMethodResolutionTargets.add(resolutionResult.getResolvedMethod().getReference());
+    }
+    checkAccess(resolutionResult.getInitialResolutionHolder(), context);
+  }
+
+  private void markFailedMethodResolutionTargets(
+      DexMethod symbolicMethod,
+      FailedResolutionResult failedResolution,
+      ProgramDefinition context,
+      KeepReason reason) {
+    failedMethodResolutionTargets.add(symbolicMethod);
+    failedResolution.forEachFailureDependency(
+        type -> recordTypeReference(type, context),
+        method -> {
+          DexProgramClass clazz = getProgramClassOrNull(method.getHolderType(), context);
+          if (clazz != null) {
+            failedMethodResolutionTargets.add(method.getReference());
+            markMethodAsTargeted(new ProgramMethod(clazz, method), reason);
+          }
+        });
+
+    // Disallow minification and optimization of types referenced from unresolvable methods. The
+    // graph lenses created by various optimizations only store mappings for method definitions,
+    // thus no lenses contain mappings for unresolvable methods. This can be problematic if an
+    // unresolvable method refers to a class that no longer exists as a result of an optimization.
+    for (DexType referencedType : symbolicMethod.getReferencedBaseTypes(appView.dexItemFactory())) {
+      if (referencedType.isClassType()) {
+        DexProgramClass clazz = asProgramClassOrNull(definitionFor(referencedType, context));
+        if (clazz != null) {
+          applyMinimumKeepInfoWhenLive(
+              clazz,
+              KeepClassInfo.newEmptyJoiner()
+                  .disallowMinification()
+                  .disallowOptimization()
+                  .disallowRepackaging());
+        }
+      }
+    }
+  }
+
+  private DexMethod generatedEnumValuesMethod(DexClass enumClass) {
+    DexType arrayOfEnumClass =
+        appView
+            .dexItemFactory()
+            .createType(
+                appView.dexItemFactory().createString("[" + enumClass.type.toDescriptorString()));
+    DexProto proto = appView.dexItemFactory().createProto(arrayOfEnumClass);
+    return appView
+        .dexItemFactory()
+        .createMethod(enumClass.type, proto, appView.dexItemFactory().createString("values"));
+  }
+
+  void markEnumValuesAsReachable(DexProgramClass clazz, KeepReason reason) {
+    ProgramMethod valuesMethod = clazz.lookupProgramMethod(generatedEnumValuesMethod(clazz));
+    if (valuesMethod != null) {
+      // TODO(sgjesse): Does this have to be enqueued as a root item? Right now it is done as the
+      // marking for not renaming it is in the root set.
+      worklist.enqueueMarkMethodKeptAction(valuesMethod, reason);
+      mutateKeepInfo(
+          valuesMethod,
+          (k, m) ->
+              k.joinMethod(
+                  m,
+                  joiner ->
+                      joiner.disallowMinification().disallowOptimization().disallowShrinking()));
+      shouldNotBeMinified(valuesMethod);
+    }
+  }
+
+  // Package protected due to entry point from worklist.
+  void markSuperMethodAsReachable(DexMethod reference, ProgramMethod context) {
+    KeepReason reason = KeepReason.targetedBySuperFrom(context);
+    MethodResolutionResult resolutionResults = resolveMethod(reference, context, reason);
+    resolutionResults.forEachMethodResolutionResult(
+        resolutionResult -> {
+          if (!resolutionResult.isSingleResolution()) {
+            return;
+          }
+          SingleResolutionResult<?> resolution = resolutionResult.asSingleResolution();
+          // If the resolution is in the program, mark it targeted.
+          if (resolution.getResolvedHolder().isProgramClass()) {
+            markMethodAsTargeted(
+                new ProgramMethod(
+                    resolution.getResolvedHolder().asProgramClass(),
+                    resolution.getResolvedMethod()),
+                reason);
+          }
+          // If invoke target is invalid (inaccessible or not an instance-method) record it and
+          // stop.
+          DexClassAndMethod target =
+              resolution.lookupInvokeSuperTarget(context.getHolder(), appView);
+          if (target == null) {
+            failedMethodResolutionTargets.add(resolution.getResolvedMethod().getReference());
+            analyses.processNewlyFailedMethodResolutionTarget(
+                resolution.getResolvedMethod(), worklist);
+            return;
+          }
+
+          DexProgramClass clazz = target.getHolder().asProgramClass();
+          if (clazz == null) {
+            return;
+          }
+
+          ProgramMethod method = target.asProgramMethod();
+
+          if (superInvokeDependencies
+              .computeIfAbsent(context.getDefinition(), ignore -> ProgramMethodSet.create())
+              .add(method)) {
+            if (liveMethods.contains(context)) {
+              markMethodAsTargeted(method, KeepReason.invokedViaSuperFrom(context));
+              if (!target.getAccessFlags().isAbstract()) {
+                markVirtualMethodAsLive(method, KeepReason.invokedViaSuperFrom(context));
+              }
+            }
+          }
+        });
+    analyses.traceInvokeSuper(reference, resolutionResults, context);
+  }
+
+  public boolean isRClass(DexProgramClass dexProgramClass) {
+    return rClassLookupCache.computeIfAbsent(
+        dexProgramClass,
+        clazz -> DescriptorUtils.isRClassDescriptor(clazz.getType().toDescriptorString()));
+  }
+
+  // Returns the set of live types.
+  public MainDexInfo traceMainDex(ExecutorService executorService, Timing timing)
+      throws ExecutionException {
+    assert analyses.isEmpty();
+    assert mode.isMainDexTracing();
+    this.rootSet = appView.getMainDexRootSet();
+    analyses.onStarted(this);
+    // Translate the result of root-set computation into enqueuer actions.
+    includeMinimumKeepInfo(rootSet);
+    trace(executorService, timing);
+    options.reporter.failIfPendingErrors();
+    // Calculate the automatic main dex list according to legacy multidex constraints.
+    MainDexInfo.Builder builder = appView.appInfo().getMainDexInfo().builder();
+    liveTypes.getItems().forEach(builder::addRoot);
+    if (mode.isInitialMainDexTracing()) {
+      liveMethods.getItems().forEach(method -> builder.addRoot(method.getReference()));
+    } else {
+      assert appView.appInfo().getMainDexInfo().isTracedMethodRootsCleared()
+          || mode.isGenerateMainDexList();
+    }
+    new MainDexListBuilder(appView, builder.getRoots(), builder).run();
+    MainDexInfo previousMainDexInfo = appInfo.getMainDexInfo();
+    return builder.build(previousMainDexInfo);
+  }
+
+  public EnqueuerResult traceApplication(
+      RootSet rootSet, ExecutorService executorService, Timing timing) throws ExecutionException {
+    this.rootSet = rootSet;
+    analyses.onStarted(this);
+    rootSet.pendingMethodMoveInverse.forEach(pendingMethodMoveInverse::put);
+
+    // Transfer the minimum keep info from the root set into the Enqueuer state.
+    timing.begin("Transfer minimum keep info");
+    includeMinimumKeepInfo(rootSet);
+    timing.end();
+
+    assert applicableRules == ApplicableRulesEvaluator.empty();
+    if (mode.isInitialTreeShaking()) {
+      applicableRules =
+          KeepAnnotationMatcher.computeInitialRules(appView, keepDeclarations, executorService);
+      // Amend library methods with covariant return types.
+      timing.begin("Model library");
+      modelLibraryMethodsWithCovariantReturnTypes(appView);
+      timing.end();
+    } else {
+      KeepInfoCollection keepInfoCollection = appView.getKeepInfo();
+      if (keepInfoCollection != null) {
+        timing.begin("Retain keep info");
+        applicableRules = keepInfoCollection.getApplicableRules();
+        keepInfo.registerCompilerSynthesizedItems(keepInfoCollection);
+        timing.end();
+      }
+    }
+    timing.time("Unconditional rules", () -> applicableRules.evaluateUnconditionalRules(this));
+    timing.begin("Enqueue all");
+    enqueueAllIfNotShrinking();
+    timing.end();
+    timing.begin("Trace");
+    trace(executorService, timing);
+    timing.end();
+    options.reporter.failIfPendingErrors();
+    timing.begin("Finalize library override");
+    finalizeLibraryMethodOverrideInformation();
+    timing.end();
+    timing.begin("Finish analysis");
+    taskCollection.awaitEnqueuerIndependentTasks();
+    analyses.done(this, executorService);
+    timing.end();
+    assert verifyKeptGraph();
+    timing.begin("Finish compat building");
+    if (mode.isInitialTreeShaking() && forceProguardCompatibility) {
+      appView.setProguardCompatibilityActions(proguardCompatibilityActionsBuilder.build());
+    } else {
+      assert proguardCompatibilityActionsBuilder == null;
+    }
+    options.dumpHeap(mode.toString().toLowerCase());
+    timing.end();
+    if (mode.isWhyAreYouKeeping()) {
+      // For why are you keeping the information is reported through the kept graph callbacks and
+      // no AppInfo is returned.
+      return null;
+    }
+    timing.begin("Create result");
+    EnqueuerResult result = createEnqueuerResult(appInfo, timing);
+    reportKeepRadius(result, timing);
+    profileCollectionAdditions.commit(appView);
+    timing.end();
+    return result;
+  }
+
+  private void includeMinimumKeepInfo(RootSetBase rootSet) {
+    rootSet
+        .getDependentMinimumKeepInfo()
+        .forEach(
+            appView,
+            this::recordDependentMinimumKeepInfo,
+            this::recordDependentMinimumKeepInfo,
+            this::recordDependentMinimumKeepInfo);
+  }
+
+  public void includeMinimumKeepInfo(MinimumKeepInfoCollection minimumKeepInfo) {
+    minimumKeepInfo.forEach(
+        appView,
+        (i, j) -> recordDependentMinimumKeepInfo(EnqueuerEvent.unconditional(), i, j),
+        (i, j) -> recordDependentMinimumKeepInfo(EnqueuerEvent.unconditional(), i, j),
+        (i, j) -> recordDependentMinimumKeepInfo(EnqueuerEvent.unconditional(), i, j));
+  }
+
+  private void applyMinimumKeepInfo(DexProgramClass clazz) {
+    EnqueuerEvent preconditionEvent = UnconditionalKeepInfoEvent.get();
+    KeepClassInfo.Joiner minimumKeepInfoForClass =
+        dependentMinimumKeepInfo.remove(preconditionEvent, clazz.getType());
+    if (minimumKeepInfoForClass != null) {
+      mutateKeepInfo(clazz, (k, c) -> k.joinClass(c, info -> info.merge(minimumKeepInfoForClass)));
+      enqueueClassIfShrinkingIsDisallowed(clazz, preconditionEvent, minimumKeepInfoForClass);
+    }
+  }
+
+  public void applyMinimumKeepInfoWhenLive(
+      DexProgramClass clazz, KeepClassInfo.Joiner minimumKeepInfo) {
+    applyMinimumKeepInfoWhenLive(clazz, minimumKeepInfo, EnqueuerEvent.unconditional());
+  }
+
+  private void applyMinimumKeepInfoWhenLive(
+      DexProgramClass clazz,
+      KeepClassInfo.Joiner minimumKeepInfo,
+      EnqueuerEvent preconditionEvent) {
+    if (liveTypes.contains(clazz)) {
+      mutateKeepInfo(clazz, (k, c) -> k.joinClass(c, info -> info.merge(minimumKeepInfo)));
+    } else {
+      dependentMinimumKeepInfo
+          .getOrCreateUnconditionalMinimumKeepInfo()
+          .mergeMinimumKeepInfoFor(clazz.getType(), minimumKeepInfo);
+    }
+    enqueueClassIfShrinkingIsDisallowed(clazz, preconditionEvent, minimumKeepInfo);
+  }
+
+  private void enqueueClassIfShrinkingIsDisallowed(
+      DexProgramClass clazz,
+      EnqueuerEvent preconditionEvent,
+      KeepClassInfo.Joiner minimumKeepInfo) {
+    if ((options.isShrinking() || mode.isMainDexTracing())
+        && !minimumKeepInfo.isShrinkingAllowed()) {
+      assert minimumKeepInfo.verifyShrinkingDisallowedWithRule(options);
+      enqueueClassDueToNoShrinkingRule(clazz, minimumKeepInfo, preconditionEvent);
+    }
+  }
+
+  private void recordDependentMinimumKeepInfo(
+      EnqueuerEvent preconditionEvent,
+      DexProgramClass clazz,
+      KeepClassInfo.Joiner minimumKeepInfo) {
+    if (isPreconditionForMinimumKeepInfoSatisfied(preconditionEvent)) {
+      applyMinimumKeepInfoWhenLive(clazz, minimumKeepInfo, preconditionEvent);
+    } else {
+      dependentMinimumKeepInfo
+          .getOrCreateMinimumKeepInfoFor(preconditionEvent)
+          .mergeMinimumKeepInfoFor(clazz.getType(), minimumKeepInfo);
+    }
+    if (preconditionEvent.isUnconditionalKeepInfoEvent()) {
+      enqueueClassIfShrinkingIsDisallowed(clazz, preconditionEvent, minimumKeepInfo);
+    }
+  }
+
+  private void applyMinimumKeepInfo(ProgramField field) {
+    EnqueuerEvent preconditionEvent = UnconditionalKeepInfoEvent.get();
+    KeepFieldInfo.Joiner minimumKeepInfoForField =
+        dependentMinimumKeepInfo.remove(preconditionEvent, field.getReference());
+    if (minimumKeepInfoForField != null) {
+      mutateKeepInfo(field, (k, f) -> k.joinField(f, info -> info.merge(minimumKeepInfoForField)));
+      enqueueFieldIfShrinkingIsDisallowed(field, preconditionEvent, minimumKeepInfoForField);
+    }
+  }
+
+  public void applyMinimumKeepInfoWhenLive(
+      ProgramField field, KeepFieldInfo.Joiner minimumKeepInfo) {
+    applyMinimumKeepInfoWhenLive(field, minimumKeepInfo, EnqueuerEvent.unconditional());
+  }
+
+  private void applyMinimumKeepInfoWhenLive(
+      ProgramField field, KeepFieldInfo.Joiner minimumKeepInfo, EnqueuerEvent preconditionEvent) {
+    if (liveFields.contains(field)) {
+      mutateKeepInfo(field, (k, f) -> k.joinField(f, info -> info.merge(minimumKeepInfo)));
+    } else {
+      dependentMinimumKeepInfo
+          .getOrCreateUnconditionalMinimumKeepInfo()
+          .mergeMinimumKeepInfoFor(field.getReference(), minimumKeepInfo);
+    }
+    enqueueFieldIfShrinkingIsDisallowed(field, preconditionEvent, minimumKeepInfo);
+  }
+
+  private void enqueueFieldIfShrinkingIsDisallowed(
+      ProgramField field, EnqueuerEvent preconditionEvent, KeepFieldInfo.Joiner minimumKeepInfo) {
+    if ((options.isShrinking() || mode.isMainDexTracing())
+        && !minimumKeepInfo.isShrinkingAllowed()) {
+      assert minimumKeepInfo.verifyShrinkingDisallowedWithRule(options);
+      enqueueFieldDueToNoShrinkingRule(field, minimumKeepInfo, preconditionEvent);
+    }
+  }
+
+  private void recordDependentMinimumKeepInfo(
+      EnqueuerEvent preconditionEvent, ProgramField field, KeepFieldInfo.Joiner minimumKeepInfo) {
+    if (isPreconditionForMinimumKeepInfoSatisfied(preconditionEvent)) {
+      applyMinimumKeepInfoWhenLive(field, minimumKeepInfo, preconditionEvent);
+    } else {
+      dependentMinimumKeepInfo
+          .getOrCreateMinimumKeepInfoFor(preconditionEvent)
+          .mergeMinimumKeepInfoFor(field.getReference(), minimumKeepInfo);
+    }
+    if (preconditionEvent.isUnconditionalKeepInfoEvent()) {
+      enqueueFieldIfShrinkingIsDisallowed(field, preconditionEvent, minimumKeepInfo);
+    }
+  }
+
+  private void applyMinimumKeepInfo(ProgramMethod method) {
+    EnqueuerEvent preconditionEvent = UnconditionalKeepInfoEvent.get();
+    KeepMethodInfo.Joiner minimumKeepInfoForMethod =
+        dependentMinimumKeepInfo.remove(preconditionEvent, method.getReference());
+    if (minimumKeepInfoForMethod != null) {
+      mutateKeepInfo(
+          method, (k, m) -> k.joinMethod(m, info -> info.merge(minimumKeepInfoForMethod)));
+      enqueueMethodIfShrinkingIsDisallowed(method, preconditionEvent, minimumKeepInfoForMethod);
+    }
+  }
+
+  public void applyMinimumKeepInfo(ProgramMethod method, KeepMethodInfo.Joiner minimumKeepInfo) {
+    mutateKeepInfo(method, (k, m) -> k.joinMethod(m, info -> info.merge(minimumKeepInfo)));
+    enqueueMethodIfShrinkingIsDisallowed(method, UnconditionalKeepInfoEvent.get(), minimumKeepInfo);
+  }
+
+  public void applyMinimumKeepInfoWhenLiveOrTargeted(
+      ProgramMethod method, KeepMethodInfo.Joiner minimumKeepInfo) {
+    applyMinimumKeepInfoWhenLiveOrTargeted(method, minimumKeepInfo, EnqueuerEvent.unconditional());
+  }
+
+  private void applyMinimumKeepInfoWhenLiveOrTargeted(
+      ProgramMethod method,
+      KeepMethodInfo.Joiner minimumKeepInfo,
+      EnqueuerEvent preconditionEvent) {
+    if (liveMethods.contains(method) || targetedMethods.contains(method)) {
+      mutateKeepInfo(method, (k, m) -> k.joinMethod(m, info -> info.merge(minimumKeepInfo)));
+    } else {
+      dependentMinimumKeepInfo
+          .getOrCreateUnconditionalMinimumKeepInfo()
+          .mergeMinimumKeepInfoFor(method.getReference(), minimumKeepInfo);
+    }
+    enqueueMethodIfShrinkingIsDisallowed(method, preconditionEvent, minimumKeepInfo);
+  }
+
+  private void enqueueMethodIfShrinkingIsDisallowed(
+      ProgramMethod method,
+      EnqueuerEvent preconditionEvent,
+      KeepMethodInfo.Joiner minimumKeepInfo) {
+    if ((options.isShrinking() || mode.isMainDexTracing())
+        && !minimumKeepInfo.isShrinkingAllowed()) {
+      assert minimumKeepInfo.verifyShrinkingDisallowedWithRule(options);
+      enqueueMethodDueToNoShrinkingRule(method, minimumKeepInfo, preconditionEvent);
+
+      if (method.getDefinition().isInstanceInitializer()) {
+        enqueueHolderWithDependentInstanceConstructor(
+            method, minimumKeepInfo.getReasons(), minimumKeepInfo.getRules());
+      }
+    }
+  }
+
+  private void recordDependentMinimumKeepInfo(
+      EnqueuerEvent preconditionEvent,
+      ProgramMethod method,
+      KeepMethodInfo.Joiner minimumKeepInfo) {
+    if (isPreconditionForMinimumKeepInfoSatisfied(preconditionEvent)) {
+      applyMinimumKeepInfoWhenLiveOrTargeted(method, minimumKeepInfo, preconditionEvent);
+    } else {
+      dependentMinimumKeepInfo
+          .getOrCreateMinimumKeepInfoFor(preconditionEvent)
+          .mergeMinimumKeepInfoFor(method.getReference(), minimumKeepInfo);
+    }
+
+    if (preconditionEvent.isUnconditionalKeepInfoEvent()) {
+      enqueueMethodIfShrinkingIsDisallowed(method, preconditionEvent, minimumKeepInfo);
+    }
+  }
+
+  private void applyMinimumKeepInfoDependentOn(EnqueuerEvent preconditionEvent) {
+    MinimumKeepInfoCollection minimumKeepClassInfoDependentOnPrecondition =
+        dependentMinimumKeepInfo.remove(preconditionEvent);
+    if (minimumKeepClassInfoDependentOnPrecondition != null) {
+      minimumKeepClassInfoDependentOnPrecondition.forEach(
+          appView,
+          (clazz, minimumKeepInfoForClass) ->
+              applyMinimumKeepInfoWhenLive(clazz, minimumKeepInfoForClass, preconditionEvent),
+          (field, minimumKeepInfoForField) ->
+              applyMinimumKeepInfoWhenLive(field, minimumKeepInfoForField, preconditionEvent),
+          (method, minimumKeepInfoForMethod) ->
+              applyMinimumKeepInfoWhenLiveOrTargeted(
+                  method, minimumKeepInfoForMethod, preconditionEvent));
+    }
+  }
+
+  public static class SyntheticAdditions {
+
+    private final ProcessorContext processorContext;
+    private Map<DexMethod, MethodProcessingContext> methodProcessingContexts =
+        new ConcurrentHashMap<>();
+
+    // TODO(b/270398965): Replace LinkedList.
+    @SuppressWarnings("JdkObsolete")
+    private final List<ProgramMethod> desugaredMethods = new LinkedList<>();
+
+    private final Map<DexMethod, ProgramMethod> liveMethods = new ConcurrentHashMap<>();
+
+    private final ProgramMethodMap<KeepMethodInfo.Joiner> minimumSyntheticKeepInfo =
+        ProgramMethodMap.createConcurrent();
+
+    private final Map<DexType, DexClasspathClass> syntheticClasspathClasses =
+        new ConcurrentHashMap<>();
+
+    private final Map<DexProgramClass, Set<DexClass>> injectedInterfaces =
+        new ConcurrentHashMap<>();
+
+    SyntheticAdditions(ProcessorContext processorContext) {
+      this.processorContext = processorContext;
+    }
+
+    MethodProcessingContext getMethodContext(ProgramMethod method) {
+      return methodProcessingContexts.computeIfAbsent(
+          method.getReference(), k -> processorContext.createMethodProcessingContext(method));
+    }
+
+    boolean isEmpty() {
+      return desugaredMethods.isEmpty()
+          && liveMethods.isEmpty()
+          && syntheticClasspathClasses.isEmpty()
+          && injectedInterfaces.isEmpty();
+    }
+
+    public void addLiveClasspathClass(DexClasspathClass clazz) {
+      DexClasspathClass old = syntheticClasspathClasses.put(clazz.type, clazz);
+      assert old == null || old == clazz;
+    }
+
+    public Set<DexMethod> getNewlyLiveMethods() {
+      return liveMethods.keySet();
+    }
+
+    public void addLiveMethod(ProgramMethod method) {
+      DexMethod signature = method.getDefinition().getReference();
+      ProgramMethod old = liveMethods.put(signature, method);
+      assert old == null;
+    }
+
+    public void addMethodWithDesugaredCodeForTracing(ProgramMethod method) {
+      desugaredMethods.add(method);
+    }
+
+    public void injectInterface(DexProgramClass clazz, DexClass newInterface) {
+      Set<DexClass> newInterfaces =
+          injectedInterfaces.computeIfAbsent(clazz, ignored -> SetUtils.newConcurrentHashSet());
+      newInterfaces.add(newInterface);
+    }
+
+    public void addMinimumSyntheticKeepInfo(
+        ProgramMethod method, Consumer<KeepMethodInfo.Joiner> consumer) {
+      consumer.accept(
+          minimumSyntheticKeepInfo.computeIfAbsent(
+              method, ignoreKey(KeepMethodInfo::newEmptyJoiner)));
+    }
+
+    void enqueueWorkItems(Enqueuer enqueuer) {
+      assert enqueuer.mode.isInitialTreeShaking();
+
+      // All synthetic additions are initial tree shaking only. No need to track keep reasons.
+      KeepReasonWitness fakeReason = enqueuer.graphReporter.fakeReportShouldNotBeUsed();
+      for (ProgramMethod desugaredMethod : desugaredMethods) {
+        enqueuer.worklist.enqueueProcessCodeBeforeTracingAction(desugaredMethod);
+      }
+      for (ProgramMethod liveMethod : liveMethods.values()) {
+        assert !enqueuer.targetedMethods.contains(liveMethod.getDefinition());
+        enqueuer.markMethodAsTargeted(liveMethod, fakeReason);
+        enqueuer.worklist.enqueueMarkMethodLiveAction(liveMethod, liveMethod, fakeReason);
+      }
+      enqueuer.liveNonProgramTypes.addAll(syntheticClasspathClasses.values());
+      injectedInterfaces.forEach(
+          (clazz, itfs) -> {
+            enqueuer.objectAllocationInfoCollection.injectInterfaces(
+                enqueuer.appInfo(), clazz, itfs);
+          });
+      minimumSyntheticKeepInfo.forEach(
+          (method, minimumKeepInfoForMethod) -> {
+            enqueuer.getKeepInfo().registerCompilerSynthesizedMethod(method);
+            enqueuer.applyMinimumKeepInfoWhenLiveOrTargeted(method, minimumKeepInfoForMethod);
+          });
+    }
+  }
+
+  private void synthesize(Timing timing) throws ExecutionException {
+    if (!mode.isInitialTreeShaking()) {
+      return;
+    }
+    // Verify that there are no active dependent tasks, or we would need each dependent task to
+    // acquire the app read lock.
+    assert taskCollection.verifyNoEnqueuerDependentTasks();
+
+    // Acquire lock for mutating app.
+    assert !appReadWriteLock.isWriteLocked();
+    ReentrantReadWriteLock.WriteLock appWriteLock = appReadWriteLock.writeLock();
+    appWriteLock.lock();
+
+    try {
+      synthesizeWithLock(timing);
+    } finally {
+      // Release lock.
+      appReadWriteLock.writeLock().unlock();
+    }
+  }
+
+  private void synthesizeWithLock(Timing timing) throws ExecutionException {
+    // First part of synthesis is to create and register all reachable synthetic additions.
+    // In particular these additions are order independent, i.e., it does not matter which are
+    // registered first and no dependencies may exist among them.
+    SyntheticAdditions additions = new SyntheticAdditions(appView.createProcessorContext());
+    timing.time("Desugar", () -> desugar(additions));
+    timing.time("Synthesize interface method bridges", this::synthesizeInterfaceMethodBridges);
+    if (additions.isEmpty()) {
+      assert !appView.getSyntheticItems().hasPendingSyntheticClasses();
+      return;
+    }
+
+    // Commit the pending synthetics and recompute subtypes.
+    subtypingInfo.update(appView);
+    appInfo =
+        timing.time("Rebuild AppInfo", () -> appInfo.rebuildWithClassHierarchy(app -> app, timing));
+    appView.setAppInfo(appInfo);
+    assert subtypingInfo.verifyUpToDate(appView);
+
+    // Finally once all synthesized items "exist" it is now safe to continue tracing. The new work
+    // items are enqueued and the fixed point will continue once this subroutine returns.
+    timing.time("Enqueue work items", () -> additions.enqueueWorkItems(this));
+  }
+
+  private boolean mustMoveToInterfaceCompanionMethod(ProgramMethod method) {
+    return method.getHolder().isInterface()
+        && method.getDefinition().isNonAbstractNonNativeMethod()
+        && !method.getDefinition().isInitializer();
+  }
+
+  private boolean addToPendingDesugaring(ProgramMethod method, Timing timing) {
+    // DEX code is not a supported input and can be ignored. Some legacy tests still pass DEX as
+    // input (smali tests).
+    assert method.getDefinition().hasCode();
+    Code code = method.getDefinition().getCode();
+    if (code.isDexCode()) {
+      return false;
+    }
+    if (code.isLirCode()) {
+      // This is a forwarding method inserted by post processing desugaring.
+      assert method.getDefinition().isD8R8Synthesized();
+      assert worklist.isNonPushable();
+      return false;
+    }
+    // TODO(b/294886627): This no longer includes the time to parse and check needs desugaring.
+    //  Consider timing this on the thread and merging it into the main timing when awaiting
+    //  futures.
+    try (Timing t0 = timing.begin("Analyze needs desugaring")) {
+      try (Timing t1 = timing.begin("Analyze interface method desugaring")) {
+        if (options.isInterfaceMethodDesugaringEnabled()) {
+          if (mustMoveToInterfaceCompanionMethod(method)) {
+            // TODO(b/199043500): Once "live moved methods" are tracked this can avoid the code
+            // check.
+            if (!InvalidCode.isInvalidCode(method.getDefinition().getCode())) {
+              pendingMethodMove.add(method);
+            }
+            return true;
+          }
+          ProgramMethod nonMovedMethod = pendingMethodMoveInverse.get(method);
+          if (nonMovedMethod != null) {
+            // Any non-moved code must be a proper pending item.
+            assert InvalidCode.isInvalidCode(method.getDefinition().getCode());
+            assert !InvalidCode.isInvalidCode(nonMovedMethod.getDefinition().getCode());
+            pendingMethodMove.add(nonMovedMethod);
+            return true;
+          }
+        }
+      }
+      if (worklist instanceof NonPushableEnqueuerWorklist) {
+        assert !method.getDefinition().getCode().isLazyCfCode();
+        assert !desugaring.needsDesugaring(method);
+        return false;
+      }
+      taskCollection.submitEnqueuerDependentTask(
+          () -> {
+            Timing threadTiming = timing.createThreadTiming("Parse CF", options);
+            parseCodeAndCheckNeedsDesugaring(method);
+            threadTiming.end().notifyThreadTimingFinished();
+            return null;
+          });
+      return true;
+    }
+  }
+
+  private void parseCodeAndCheckNeedsDesugaring(ProgramMethod method) {
+    LazyCfCode code = method.getDefinition().getCode().asLazyCfCode();
+    if (code != null) {
+      code.parseCodeConcurrently();
+    }
+    if (desugaring.needsDesugaring(method)) {
+      pendingCodeDesugaring.add(method);
+    } else {
+      worklist.enqueueProcessCodeBeforeTracingAction(method);
+    }
+  }
+
+  private void desugar(SyntheticAdditions additions) throws ExecutionException {
+    assert worklist.verifyNotProcessing();
+
+    if (pendingCodeDesugaring.isEmpty() && pendingMethodMove.isEmpty()) {
+      return;
+    }
+
+    // All non-moving methods are ready for tracing post desugar.
+    pendingCodeDesugaring.forEach(additions::addMethodWithDesugaredCodeForTracing);
+    // Then amend the desugar set with the move methods that need desugaring.
+    for (ProgramMethod method : pendingMethodMove) {
+      pendingCodeDesugaring.add(method);
+    }
+
+    BiConsumer<LambdaClass, ProgramMethod> lambdaCallback = this::recordLambdaSynthesizingContext;
+    // TODO(b/233868787): If a lambda implements unknown interfaces its methods won't be live and if
+    //  the tree-pruner is disabled they won't be removed. Workaround this by making them live.
+    if (!options.isShrinking()) {
+      lambdaCallback =
+          lambdaCallback.andThen(
+              (clazz, context) -> {
+                for (DexType itf : clazz.getLambdaProgramClass().getInterfaces()) {
+                  if (appInfo().definitionFor(itf, context) == null) {
+                    for (ProgramMethod method :
+                        clazz.getLambdaProgramClass().virtualProgramMethods()) {
+                      synchronized (additions) {
+                        additions.addLiveMethod(method);
+                      }
+                    }
+                    break;
+                  }
+                }
+              });
+    }
+
+    CfInstructionDesugaringEventConsumer eventConsumer =
+        CfInstructionDesugaringEventConsumer.createForR8(
+            appView,
+            profileCollectionAdditions,
+            lambdaCallback,
+            this::recordConstantDynamicSynthesizingContext,
+            this::recordSyntheticLambdaAccessorMethod,
+            this::recordTwrCloseResourceMethodSynthesizingContext,
+            additions,
+            (method, companion) -> {
+              if (!isMethodLive(method)) {
+                // Record the original placement of the companion method such that we can desugar
+                // and transfer the code if and when the companion method becomes live.
+                pendingMethodMoveInverse.put(companion, method);
+              }
+            });
+
+    // Concurrently parse code.
+    Set<DexProgramClass> reparseContexts = ConcurrentHashMap.newKeySet();
+    ThreadUtils.processItems(
+        pendingCodeDesugaring,
+        method -> {
+          LazyCfCode lazyCfCode = method.getDefinition().getCode().asLazyCfCode();
+          if (lazyCfCode != null && reparseContexts.add(method.getHolder())) {
+            lazyCfCode.parseCodeConcurrently();
+          }
+        },
+        appView.options().getThreadingModule(),
+        executorService);
+
+    // Prepare desugaring by collecting all the synthetic methods required on program classes.
+    ProgramAdditions programAdditions = new ProgramAdditions();
+    ThreadUtils.processItems(
+        pendingCodeDesugaring,
+        method -> {
+          if (method.getDefinition().getCode().isCfCode()) {
+            desugaring.prepare(method, eventConsumer, programAdditions);
+          }
+        },
+        appView.options().getThreadingModule(),
+        executorService);
+    programAdditions.apply(appView.options().getThreadingModule(), executorService);
+
+    // Then do the actual desugaring.
+    ThreadUtils.processItems(
+        pendingCodeDesugaring,
+        method -> {
+          if (desugaring.needsDesugaring(method)) {
+            desugaring.desugar(method, additions.getMethodContext(method), eventConsumer);
+          }
+        },
+        appView.options().getThreadingModule(),
+        executorService);
+
+    // Move the pending methods and mark them live and ready for tracing.
+    for (ProgramMethod method : pendingMethodMove) {
+      assert interfaceProcessor != null;
+      ProgramMethod companion =
+          interfaceProcessor
+              .getHelper()
+              .ensureMethodOfProgramCompanionClassStub(method, eventConsumer);
+      interfaceProcessor.finalizeMoveToCompanionMethod(method, companion);
+      pendingMethodMoveInverse.remove(companion);
+      // TODO(b/199043500): Once "live moved methods" are tracked this can be removed.
+      if (isMethodLive(companion)) {
+        additions.addMethodWithDesugaredCodeForTracing(companion);
+      } else {
+        additions.addLiveMethod(companion);
+      }
+    }
+
+    List<ProgramMethod> needsProcessing = eventConsumer.finalizeDesugaring();
+    assert needsProcessing.isEmpty();
+
+    pendingMethodMove.clear();
+    pendingCodeDesugaring.clear();
+  }
+
+  private void recordLambdaSynthesizingContext(LambdaClass lambdaClass, ProgramMethod context) {
+    synchronized (synthesizingContexts) {
+      synthesizingContexts.put(lambdaClass.getLambdaProgramClass(), context);
+    }
+  }
+
+  private void recordConstantDynamicSynthesizingContext(
+      ConstantDynamicClass constantDynamicClass, ProgramMethod context) {
+    synchronized (synthesizingContexts) {
+      synthesizingContexts.put(constantDynamicClass.getConstantDynamicProgramClass(), context);
+    }
+  }
+
+  private SyntheticLambdaAccessorMethodConsumer recordSyntheticLambdaAccessorMethod(
+      LambdaClass lambdaClass) {
+    return (accessor, target) -> recordSyntheticLambdaAccessorMethod(lambdaClass, accessor, target);
+  }
+
+  private void recordSyntheticLambdaAccessorMethod(
+      LambdaClass lambdaClass, ProgramMethod accessor, DexMethod target) {
+    assert mode.isInitialTreeShaking();
+    if (options.debug) {
+      return;
+    }
+    if (options.isOptimizing() && options.isShrinking()) {
+      return;
+    }
+    if (!lambdaClass.canAccessModifyLambdaImplMethodInD8()) {
+      return;
+    }
+    ProgramMethod targetMethod = asProgramMethodOrNull(appView.definitionFor(target));
+    if (targetMethod != null && targetMethod.getHolder() == accessor.getHolder()) {
+      MutableMethodOptimizationInfo optimizationInfo =
+          targetMethod.getDefinition().getMutableOptimizationInfo();
+      optimizationInfo.markSingleCallerInlineIntoSyntheticLambdaAccessor();
+    } else {
+      assert false;
+    }
+  }
+
+  private void recordTwrCloseResourceMethodSynthesizingContext(
+      ProgramMethod closeMethod, ProgramMethod context) {
+    synchronized (synthesizingContexts) {
+      synthesizingContexts.put(closeMethod.getHolder(), context);
+    }
+  }
+
+  private void synthesizeInterfaceMethodBridges() {
+    for (InterfaceMethodSyntheticBridgeAction action : syntheticInterfaceMethodBridges.values()) {
+      ProgramMethod bridge = action.getMethodToKeep();
+      DexProgramClass holder = bridge.getHolder();
+      DexEncodedMethod method = bridge.getDefinition();
+      holder.addVirtualMethod(method);
+      profileCollectionAdditions.addMethodIfContextIsInProfile(bridge, action.getSingleTarget());
+    }
+    syntheticInterfaceMethodBridges.clear();
+  }
+
+  private void finalizeLibraryMethodOverrideInformation() {
+    for (DexProgramClass liveType : liveTypes.getItems()) {
+      for (DexEncodedMethod method : liveType.virtualMethods()) {
+        if (method.isLibraryMethodOverride().isUnknown()) {
+          method.setLibraryMethodOverride(OptionalBool.FALSE);
+        }
+      }
+    }
+  }
+
+  private boolean verifyKeptGraph() {
+    if (appView.options().testing.verifyKeptGraphInfo) {
+      for (DexProgramClass liveType : liveTypes.getItems()) {
+        assert graphReporter.verifyRootedPath(liveType);
+      }
+    }
+    return true;
+  }
+
+  private void reportKeepRadius(EnqueuerResult result, Timing timing) {
+    if (keepRadiusBuilder == null) {
+      return;
+    }
+    try (Timing t0 = timing.begin("Report keep radius")) {
+      RootSetKeepRadius keepRadius = keepRadiusBuilder.build(appView);
+      KeepRadiusOptions keepRadiusOptions = options.getKeepRadiusOptions();
+      KeepRadiusConsumer keepRadiusConsumer = keepRadiusOptions.getKeepRadiusConsumer();
+      if (keepRadiusConsumer != null) {
+        keepRadiusConsumer.accept(appView, result.getAppInfo(), keepRadius);
+      }
+      Consumer<KeepRadiusContainer> keepRadiusContainerConsumer =
+          keepRadiusOptions.getKeepRadiusContainerConsumer();
+      if (keepRadiusContainerConsumer != null) {
+        KeepRadiusContainer container =
+            new RootSetKeepRadiusSerializer(appView, result)
+                .serialize(keepRadius, appView.options().getKeepRadiusOptions());
+        keepRadiusContainerConsumer.accept(container);
+      }
+    }
+  }
+
+  @SuppressWarnings("ReferenceEquality")
+  private EnqueuerResult createEnqueuerResult(AppInfoWithClassHierarchy appInfo, Timing timing)
+      throws ExecutionException {
+    timing.begin("Rewrite with deferred results");
+    deferredTracing.rewriteApplication(executorService);
+    timing.end();
+
+    timing.begin("Remove dead protos");
+    // Compute the set of dead proto types.
+    deadProtoTypeCandidates.removeIf(this::isTypeLive);
+    Set<DexType> deadProtoTypes =
+        SetUtils.newIdentityHashSet(deadProtoTypeCandidates.size() + initialDeadProtoTypes.size());
+    deadProtoTypeCandidates.forEach(deadProtoType -> deadProtoTypes.add(deadProtoType.type));
+    deadProtoTypes.addAll(initialDeadProtoTypes);
+    timing.end();
+
+    // Remove the temporary mappings that have been inserted into the field access info collection
+    // and verify that the mapping is then one-to-one.
+    timing.begin("Prune field access mappings");
+    fieldAccessInfoCollection.removeIf(
+        (field, info) -> {
+          if (field != info.getField() || info == MISSING_FIELD_ACCESS_INFO) {
+            return true;
+          }
+          info.destroyAccessContexts(mode);
+          return false;
+        });
+    assert fieldAccessInfoCollection.verifyMappingIsOneToOne();
+    timing.end();
+
+    // Verify all references on the input app before synthesizing definitions.
+    assert verifyReferences(appInfo.app());
+
+    // Prune the root set items that turned out to be dead.
+    // TODO(b/150736225): Pruning of dead root set items is still incomplete.
+    timing.begin("Prune dead items");
+    rootSet.pruneDeadItems(appView, this, timing);
+    if (mode.isTreeShaking() && appView.hasMainDexRootSet()) {
+      assert rootSet != appView.getMainDexRootSet();
+      appView.getMainDexRootSet().pruneDeadItems(appView, this, timing);
+    }
+    timing.end();
+
+    // Ensure references from all hard coded factory items.
+    timing.begin("Ensure static factory references");
+    appView
+        .dexItemFactory()
+        .forEachPossiblyCompilerSynthesizedType(this::recordCompilerSynthesizedTypeReference);
+    appView.rootSet().rootNonProgramTypes.forEach(this::recordCompilerSynthesizedTypeReference);
+    if (appView
+        .options()
+        .getLibraryDesugaringOptions()
+        .isLirToLirLibraryDesugaringEnabled(appView)) {
+      appView
+          .options()
+          .getLibraryDesugaringOptions()
+          .forEachPossiblyCompilerSynthesizedType(this::recordCompilerSynthesizedTypeReference);
+    }
+    timing.end();
+
+    // Rebuild a new app only containing referenced types.
+    timing.begin("Rebuild application");
+    Set<DexLibraryClass> libraryClasses = Sets.newIdentityHashSet();
+    Set<DexClasspathClass> classpathClasses = Sets.newIdentityHashSet();
+    // Mark all D8 classes in R8 partial as referenced.
+    if (options.partialSubCompilationConfiguration != null) {
+      for (DexProgramClass programClass :
+          options.partialSubCompilationConfiguration.asR8().getDexingOutputClasses()) {
+        DexClasspathClass classpathClass =
+            asClasspathClassOrNull(appView.definitionFor(programClass.getType()));
+        if (classpathClass != null) {
+          referencedNonProgramTypes.add(classpathClass);
+        } else {
+          assert false;
+        }
+      }
+    }
+    // Ensure all referenced non program types have their hierarchy built as live.
+    referencedNonProgramTypes.forEach(
+        clazz -> addLiveNonProgramType(clazz, false, this::ignoreMissingClasspathOrLibraryClass));
+    for (ClasspathOrLibraryClass clazz : liveNonProgramTypes) {
+      if (clazz.isLibraryClass()) {
+        libraryClasses.add(clazz.asLibraryClass());
+      } else if (clazz.isClasspathClass()) {
+        DexClasspathClass classpathClass = clazz.asClasspathClass();
+        if (appView.getSyntheticItems().isPendingSynthetic(classpathClass.getType())) {
+          // This class will be committed later.
+        } else {
+          classpathClasses.add(classpathClass);
+        }
+      } else {
+        assert false;
+      }
+    }
+    // Verify the synthetic classpath classes are live before we commit them to the app below.
+    assert appView.getSyntheticItems().getPendingSyntheticClasses().stream()
+        .filter(DexClass::isClasspathClass)
+        .allMatch(liveNonProgramTypes::contains);
+
+    // Add just referenced non-program types. We can't replace the program classes at this point as
+    // they are needed in tree pruning.
+    ImmutableSet.Builder<DexType> prunedClasspathTypesBuilder = ImmutableSet.builder();
+    if (prunedClasspathTypes != null) {
+      prunedClasspathTypesBuilder.addAll(prunedClasspathTypes);
+    }
+    for (DexClasspathClass classpathClass : appInfo.app().asDirect().classpathClasses()) {
+      if (!classpathClasses.contains(classpathClass)) {
+        prunedClasspathTypesBuilder.add(classpathClass.getType());
+      }
+    }
+    DirectMappedDexApplication app =
+        appInfo
+            .app()
+            .asDirect()
+            .builder()
+            .replaceLibraryClasses(libraryClasses)
+            .replaceClasspathClasses(classpathClasses)
+            .build(timing);
+    timing.end();
+
+    // Verify the references on the pruned application after type synthesis.
+    assert verifyReferences(app);
+
+    SynthesizingContextOracle lambdaSynthesizingContextOracle =
+        syntheticClass -> {
+          ProgramMethod lambdaSynthesisContext = synthesizingContexts.get(syntheticClass);
+          return lambdaSynthesisContext != null
+              ? ImmutableSet.of(lambdaSynthesisContext.getReference())
+              : ImmutableSet.of(syntheticClass.getType());
+        };
+    amendKeepInfoWithCompanionMethods();
+    keepInfo.setMaterializedRules(applicableRules.getMaterializedRules());
+
+    timing.begin("Create app info with liveness");
+    AppInfoWithLiveness appInfoWithLiveness =
+        new AppInfoWithLiveness(
+            appInfo.getSyntheticItems().commit(app, timing),
+            appInfo.getClassToFeatureSplitMap(),
+            appInfo.getMainDexInfo(),
+            mode.isInitialTreeShaking()
+                ? missingClassesBuilder.reportMissingClasses(
+                    appView, lambdaSynthesizingContextOracle)
+                : missingClassesBuilder.assertNoMissingClasses(appView),
+            deadProtoTypes,
+            SetUtils.mapIdentityHashSet(liveTypes.getItems(), DexProgramClass::getType),
+            Enqueuer.toDescriptorSet(targetedMethods.getItems()),
+            failedClassResolutionTargets,
+            failedMethodResolutionTargets,
+            failedFieldResolutionTargets,
+            bootstrapMethods,
+            virtualMethodsTargetedByInvokeDirect,
+            toDescriptorSet(liveMethods.getItems()),
+            // Filter out library fields and pinned fields, because these are read by default.
+            fieldAccessInfoCollection,
+            objectAllocationInfoCollection.build(appInfo),
+            callSites,
+            getKeepInfo().rebuildWithoutEventConsumer(),
+            rootSet.mayHaveSideEffects,
+            amendWithCompanionMethods(rootSet.alwaysInline),
+            amendWithCompanionMethods(rootSet.reprocess),
+            rootSet.alwaysClassInline,
+            new IdentifierNameStringCollection(
+                SetUtils.newIdentityHashSet(rootSet.identifierNameStrings),
+                reflectiveIdentification.getIdentifierNameStringAdditions()),
+            emptySet(),
+            prunedClasspathTypesBuilder.build(),
+            Collections.emptyMap(),
+            lockCandidates,
+            initClassReferences,
+            recordFieldValuesReferences);
+    timing.end();
+    appInfo.markObsolete();
+    if (options.testing.enqueuerInspector != null) {
+      options.testing.enqueuerInspector.accept(appInfoWithLiveness, mode, timing);
+    }
+    return new EnqueuerResult(appInfoWithLiveness);
+  }
+
+  private void forEachCompanionMethod(BiConsumer<DexMethod, DexMethod> consumer) {
+    if (interfaceProcessor != null) {
+      interfaceProcessor.forEachMethodToMove(consumer);
+    }
+  }
+
+  private void amendKeepInfoWithCompanionMethods() {
+    forEachCompanionMethod(
+        (methodReference, companionReference) -> {
+          ProgramMethod companion = appView.definitionFor(companionReference).asProgramMethod();
+          KeepMethodInfo.Joiner minimumKeepInfoForCompanion =
+              getKeepInfo().getMethodInfoWithDefinitionLookup(methodReference, appInfo).joiner();
+          KeepMethodInfo.Joiner extraMinimumKeepInfoForCompanion =
+              dependentMinimumKeepInfo
+                  .getUnconditionalMinimumKeepInfoOrDefault(MinimumKeepInfoCollection.empty())
+                  .getOrDefault(methodReference, KeepMethodInfo.newEmptyJoiner())
+                  .asMethodJoiner();
+          if (minimumKeepInfoForCompanion.isBottom()
+              && extraMinimumKeepInfoForCompanion.isBottom()) {
+            return;
+          }
+          DependentMinimumKeepInfoCollection minimumKeepInfo =
+              appView.rootSet().getDependentMinimumKeepInfo();
+          minimumKeepInfo
+              .getOrCreateUnconditionalMinimumKeepInfo()
+              .getOrCreateMinimumKeepInfoFor(companionReference)
+              .asMethodJoiner()
+              .merge(minimumKeepInfoForCompanion)
+              .merge(extraMinimumKeepInfoForCompanion);
+          mutateKeepInfo(
+              companion,
+              (k, m) ->
+                  k.joinMethod(
+                      m,
+                      joiner ->
+                          joiner
+                              .merge(minimumKeepInfoForCompanion)
+                              .merge(extraMinimumKeepInfoForCompanion)));
+        });
+  }
+
+  private Set<DexMethod> amendWithCompanionMethods(Set<DexMethod> methods) {
+    if (methods.isEmpty() || interfaceProcessor == null) {
+      return methods;
+    }
+    Set<DexMethod> companionMethods = Sets.newIdentityHashSet();
+    interfaceProcessor.forEachMethodToMove(
+        (method, companion) -> {
+          if (methods.contains(method)) {
+            companionMethods.add(companion);
+          }
+        });
+    methods.addAll(companionMethods);
+    return methods;
+  }
+
+  private boolean verifyReferences(DexApplication app) {
+    WorkList<DexClass> worklist = WorkList.newIdentityWorkList();
+    for (DexProgramClass clazz : liveTypes.getItems()) {
+      worklist.addIfNotSeen(clazz);
+    }
+    while (worklist.hasNext()) {
+      DexClass clazz = worklist.next();
+      assert verifyReferencedType(clazz, worklist, app);
+    }
+    return true;
+  }
+
+  private boolean verifyReferencedType(
+      DexType type, WorkList<DexClass> worklist, DexApplication app) {
+    if (type.isArrayType()) {
+      type = type.getBaseType();
+    }
+    if (!type.isClassType()) {
+      return true;
+    }
+    DexClass clazz = app.definitionFor(type);
+    if (clazz == null) {
+      assert missingClassesBuilder.contains(type)
+          : "Expected type to be in missing types': " + type;
+    } else {
+      assert !missingClassesBuilder.contains(type)
+          : "Type with definition also in missing types: " + type;
+      // Eager assert while the context is still present.
+      assert clazz.isProgramClass()
+              || liveNonProgramTypes.contains(clazz.asClasspathOrLibraryClass())
+          : "Expected type to be in live non-program types: " + clazz;
+      worklist.addIfNotSeen(clazz);
+    }
+    return true;
+  }
+
+  private boolean verifyReferencedType(
+      DexClass clazz, WorkList<DexClass> worklist, DexApplication app) {
+    for (DexType supertype : clazz.allImmediateSupertypes()) {
+      assert verifyReferencedType(supertype, worklist, app);
+    }
+    assert clazz.isProgramClass() || liveNonProgramTypes.contains(clazz.asClasspathOrLibraryClass())
+        : "Expected type to be in live non-program types: " + clazz;
+    if (clazz.isProgramClass()) {
+      for (DexEncodedField field : clazz.fields()) {
+        if (isFieldReferenced(field)) {
+          assert verifyReferencedType(field.getType(), worklist, app);
+        }
+      }
+      for (DexEncodedMethod method : clazz.methods()) {
+        if (isMethodTargeted(method)) {
+          assert verifyReferencedMethod(method, worklist, app);
+        }
+      }
+    }
+    return true;
+  }
+
+  private boolean verifyReferencedMethod(
+      DexEncodedMethod method, WorkList<DexClass> worklist, DexApplication app) {
+    for (DexType type : method.getReference().getReferencedTypes()) {
+      assert verifyReferencedType(type, worklist, app);
+    }
+    return true;
+  }
+
+  private static <D extends DexEncodedMember<D, R>, R extends DexMember<D, R>>
+      Set<R> toDescriptorSet(Set<D> set) {
+    Set<R> result = Sets.newIdentityHashSet();
+    for (D item : set) {
+      result.add(item.getReference());
+    }
+    return result;
+  }
+
+  private void trace(ExecutorService executorService, Timing timing) throws ExecutionException {
+    timing.begin("Grow the tree.");
+    try {
+      int round = 1;
+      while (true) {
+        timing.begin("Compute fixpoint #" + round++);
+        long numberOfLiveItems = getNumberOfLiveItems();
+
+        // During the initial round of tree shaking we concurrently parse the code objects. Commit
+        // dex items before every wave to minimize synchronization overhead.
+        if (mode.isInitialTreeShaking()) {
+          timing.begin("Commit pending dex items");
+          withAppReadLock(appView.dexItemFactory()::commitPendingItems);
+          timing.end();
+        }
+
+        timing.begin("Process worklist");
+        worklist.process(timing);
+        timing.end();
+
+        // Continue fix-point processing if -if rules are enabled by items that newly became live.
+        long numberOfLiveItemsAfterProcessing = getNumberOfLiveItems();
+        if (numberOfLiveItemsAfterProcessing > numberOfLiveItems) {
+          timing.time("Conditional rules", () -> applicableRules.evaluateConditionalRules(this));
+          assert getNumberOfLiveItems() == numberOfLiveItemsAfterProcessing;
+          if (worklist.hasNext()) {
+            timing.end();
+            continue;
+          }
+        }
+
+        // Continue fix-point processing while there are additional work items to ensure items that
+        // are passed to Java reflections are traced.
+        reflectiveIdentification.processWorklist(timing);
+        if (worklist.hasNext()) {
+          timing.end();
+          continue;
+        }
+
+        // Notify each analysis that a fixpoint has been reached, and give each analysis an
+        // opportunity to add items to the worklist.
+        timing.time(
+            "Notify analyses",
+            () -> analyses.notifyFixpoint(this, worklist, executorService, timing));
+        if (worklist.hasNext()) {
+          timing.end();
+          continue;
+        }
+
+        timing.begin("Process delayed root set items");
+        for (InterfaceMethodSyntheticBridgeAction delayedRootSetActionItem :
+            rootSet.delayedInterfaceMethodSyntheticBridgeActions) {
+          identifySyntheticInterfaceMethodBridges(delayedRootSetActionItem);
+        }
+        timing.end();
+
+        timing.time("Synthesize", () -> synthesize(timing));
+
+        timing.begin("Delayed interface method synthetic bridges");
+        ConsequentRootSet consequentRootSet = computeDelayedInterfaceMethodSyntheticBridges();
+        addConsequentRootSet(consequentRootSet);
+        rootSet
+            .getDependentMinimumKeepInfo()
+            .merge(consequentRootSet.getDependentMinimumKeepInfo());
+        rootSet.delayedInterfaceMethodSyntheticBridgeActions.clear();
+        timing.end();
+
+        if (worklist.hasNext()) {
+          timing.end();
+          continue;
+        }
+
+        // Reached the fixpoint.
+        timing.end();
+        break;
+      }
+
+      if (mode.isInitialTreeShaking()) {
+        timing.time("Post processing desugaring", () -> postProcessingDesugaring(timing));
+      }
+    } finally {
+      timing.end();
+    }
+  }
+
+  private void postProcessingDesugaring(Timing timing) throws ExecutionException {
+    desugaring.withDesugaredLibraryAPIConverter(
+        DesugaredLibraryAPIConverter::generateTrackingWarnings);
+
+    SyntheticAdditions syntheticAdditions =
+        new SyntheticAdditions(appView.createProcessorContext());
+
+    assert worklist.isEmpty();
+
+    CfPostProcessingDesugaringEventConsumer eventConsumer =
+        CfPostProcessingDesugaringEventConsumer.createForR8(
+            appView,
+            syntheticAdditions,
+            profileCollectionAdditions,
+            desugaring,
+            (context, missing) ->
+                missingClassesBuilder.addNewMissingClassWithDesugarDiagnostic(
+                    missing,
+                    context,
+                    new InterfaceDesugarMissingTypeDiagnostic(
+                        context.getOrigin(),
+                        com.android.tools.r8.position.Position.UNKNOWN,
+                        missing.asClassReference(),
+                        context.getType().asClassReference(),
+                        null)));
+    InterfaceMethodProcessorFacade interfaceDesugaring =
+        desugaring.getInterfaceMethodPostProcessingDesugaringR8(
+            liveMethods::contains, interfaceProcessor);
+    CfPostProcessingDesugaringCollection.createForR8CfToCfDesugaring(
+            appView, interfaceDesugaring, this)
+        .postProcessingDesugaring(liveTypes.getItems(), eventConsumer, executorService, timing);
+
+    if (syntheticAdditions.isEmpty() && !options.testing.forceEnqueuerFullProcessingDesugaring) {
+      return;
+    }
+
+    // Commit the pending synthetics and recompute subtypes.
+    appInfo = appInfo.rebuildWithClassHierarchy(app -> app, timing);
+    appView.setAppInfo(appInfo);
+    subtypingInfo =
+        timing.time("Create SubtypingInfo", () -> ImmediateAppSubtypingInfo.create(appView));
+
+    syntheticAdditions.enqueueWorkItems(this);
+
+    timing.begin("Process worklist");
+    worklist = worklist.nonPushable();
+    worklist.process(timing);
+    timing.end();
+  }
+
+  public long getNumberOfLiveItems() {
+    long result = liveTypes.getItems().size();
+    result += liveMethods.items.size();
+    result += liveFields.fields.size();
+    result += effectivelyLiveOriginalReferences.size();
+    return result;
+  }
+
+  void addConsequentRootSet(ConsequentRootSet consequentRootSet) {
+    // TODO(b/132600955): This modifies the root set, but the consequent should not be persistent.
+    //  Instead, the consequent root set should be added to collections that are owned by the
+    //  enqueuer, similar to Enqueuer#dependentMinimumKeepClassInfo.
+    rootSet.addConsequentRootSet(consequentRootSet);
+    includeMinimumKeepInfo(consequentRootSet);
+    consequentRootSet.pendingMethodMoveInverse.forEach(pendingMethodMoveInverse::put);
+
+    // Check for compatibility rules indicating that the holder must be implicitly kept.
+    if (forceProguardCompatibility) {
+      consequentRootSet.dependentKeepClassCompatRule.forEach(
+          (precondition, compatRules) -> {
+            assert precondition.isDexType();
+            DexProgramClass preconditionHolder =
+                asProgramClassOrNull(appInfo().definitionFor(precondition.asDexType()));
+            compatEnqueueHolderIfDependentNonStaticMember(preconditionHolder, compatRules);
+          });
+    }
+  }
+
+  private ConsequentRootSet computeDelayedInterfaceMethodSyntheticBridges() {
+    RootSetBuilder builder = RootSet.builder(appView, subtypingInfo);
+    for (InterfaceMethodSyntheticBridgeAction delayedInterfaceMethodSyntheticBridgeAction :
+        rootSet.delayedInterfaceMethodSyntheticBridgeActions) {
+      handleInterfaceMethodSyntheticBridgeAction(
+          delayedInterfaceMethodSyntheticBridgeAction, builder);
+    }
+    return builder.buildConsequentRootSet();
+  }
+
+  private final Map<DexMethod, InterfaceMethodSyntheticBridgeAction>
+      syntheticInterfaceMethodBridges = new LinkedHashMap<>();
+
+  @SuppressWarnings("ReferenceEquality")
+  private void identifySyntheticInterfaceMethodBridges(
+      InterfaceMethodSyntheticBridgeAction action) {
+    ProgramMethod methodToKeep = action.getMethodToKeep();
+    ProgramMethod singleTarget = action.getSingleTarget();
+    if (rootSet.isShrinkingDisallowedUnconditionally(singleTarget, options)) {
+      return;
+    }
+    if (methodToKeep != singleTarget
+        && !syntheticInterfaceMethodBridges.containsKey(
+            methodToKeep.getDefinition().getReference())) {
+      syntheticInterfaceMethodBridges.put(methodToKeep.getDefinition().getReference(), action);
+    }
+  }
+
+  private void handleInterfaceMethodSyntheticBridgeAction(
+      InterfaceMethodSyntheticBridgeAction action, RootSetBuilder builder) {
+    ProgramMethod methodToKeep = action.getMethodToKeep();
+    ProgramMethod singleTarget = action.getSingleTarget();
+    DexEncodedMethod singleTargetMethod = singleTarget.getDefinition();
+    if (rootSet.isShrinkingDisallowedUnconditionally(singleTarget, options)) {
+      return;
+    }
+    if (singleTargetMethod.isLibraryMethodOverride().isTrue()) {
+      methodToKeep.getDefinition().setLibraryMethodOverride(OptionalBool.TRUE);
+    }
+    builder.addItemToSets(
+        methodToKeep,
+        action.getContext(),
+        action.getRule(),
+        action.getPrecondition(),
+        action.getIfRulePreconditionMatch());
+  }
+
+  public void retainAnnotationForFinalTreeShaking(List<MatchedAnnotation> matchedAnnotations) {
+    assert mode.isInitialTreeShaking();
+    if (annotationRemoverBuilder != null) {
+      for (MatchedAnnotation matchedAnnotation : matchedAnnotations) {
+        if (matchedAnnotation.getAnnotatedItem().isProgramDefinition()) {
+          annotationRemoverBuilder.retainAnnotation(matchedAnnotation.getAnnotation());
+          worklist.enqueueTraceAnnotationAction(
+              matchedAnnotation.getAnnotatedItem().asProgramDefinition(),
+              matchedAnnotation.getAnnotation(),
+              matchedAnnotation.getAnnotatedKind());
+        }
+      }
+    }
+  }
+
+  // Package protected due to entry point from worklist.
+  void markMethodAsKept(ProgramMethod target, KeepReason reason) {
+    DexEncodedMethod definition = target.getDefinition();
+    DexProgramClass holder = target.getHolder();
+    DexMethod reference = target.getReference();
+    markMethodAsTargeted(target, reason);
+    if (definition.isVirtualMethod()) {
+      // A virtual method. Mark it as reachable so that subclasses, if instantiated, keep
+      // their overrides. However, we don't mark it live, as a keep rule might not imply that
+      // the corresponding class is live.
+      markVirtualMethodAsReachable(reference, holder.isInterface(), target, reason);
+      // When generating interface bridges the method may be inserted into a live hierarchy.
+      // If so we need to also mark it as live as the reachable check above will not reprocess the
+      // hierarchy.
+      if (definition.isNonAbstractVirtualMethod()
+          && objectAllocationInfoCollection.isInstantiatedDirectlyOrHasInstantiatedSubtype(
+              holder)) {
+        // TODO(b/120959039): Codify the kept-graph expectations for these cases in tests.
+        markVirtualMethodAsLive(target, reason);
+      }
+    } else {
+      markDirectStaticOrConstructorMethodAsLive(target, reason);
+    }
+  }
+
+  // Package protected due to entry point from worklist.
+  void markFieldAsKept(ProgramField field, KeepReason reason) {
+    FieldAccessInfoImpl fieldAccessInfo = getOrCreateFieldAccessInfo(field);
+    fieldAccessInfo.setHasReflectiveRead();
+    fieldAccessInfo.setHasReflectiveWrite();
+
+    if (field.getDefinition().isStatic()) {
+      markFieldAsLive(field, field, reason);
+    } else {
+      worklist.enqueueMarkFieldAsReachableAction(field, field, reason);
+    }
+    analyses.processMarkFieldKept(field, reason, worklist);
+  }
+
+  private boolean shouldMarkLibraryMethodOverrideAsReachable(LookupTarget override) {
+    if (override.isLambdaTarget()) {
+      return true;
+    }
+    ProgramMethod programMethod = override.asMethodTarget().getTarget().asProgramMethod();
+    if (programMethod == null) {
+      return false;
+    }
+    DexProgramClass clazz = programMethod.getHolder();
+    DexEncodedMethod method = programMethod.getDefinition();
+    assert method.isVirtualMethod();
+
+    if (method.isAbstract() || method.isPrivateMethod()) {
+      return false;
+    }
+
+    if (appView.isClassEscapingIntoLibrary(clazz.type)) {
+      return true;
+    }
+
+    // If there is an instantiated subtype of `clazz` that escapes into the library and does not
+    // override `method` then we need to mark the method as being reachable.
+    Set<DexProgramClass> immediateSubtypes = getImmediateSubtypesInInstantiatedHierarchy(clazz);
+    if (immediateSubtypes.isEmpty()) {
+      return false;
+    }
+    Deque<DexProgramClass> worklist = new ArrayDeque<>(immediateSubtypes);
+    Set<DexProgramClass> visited = SetUtils.newIdentityHashSet(immediateSubtypes);
+
+    while (!worklist.isEmpty()) {
+      DexProgramClass current = worklist.removeFirst();
+      assert visited.contains(current);
+
+      if (current.lookupVirtualMethod(method.getReference()) != null) {
+        continue;
+      }
+
+      if (appView.isClassEscapingIntoLibrary(current.type)) {
+        return true;
+      }
+
+      for (DexProgramClass subtype : getImmediateSubtypesInInstantiatedHierarchy(current)) {
+        if (visited.add(subtype)) {
+          worklist.add(subtype);
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private Set<DexProgramClass> getImmediateSubtypesInInstantiatedHierarchy(DexProgramClass clazz) {
+    Set<DexClass> subtypes =
+        objectAllocationInfoCollection.getImmediateSubtypesInInstantiatedHierarchy(clazz.type);
+    if (subtypes == null) {
+      return emptySet();
+    }
+    Set<DexProgramClass> programClasses = SetUtils.newIdentityHashSet(subtypes.size());
+    for (DexClass subtype : subtypes) {
+      if (subtype.isProgramClass()) {
+        programClasses.add(subtype.asProgramClass());
+      }
+    }
+    return programClasses;
+  }
+
+  // Package protected due to entry point from worklist.
+  void markMethodAsLive(ProgramMethod method, ProgramDefinition context, Timing timing) {
+    assert liveMethods.contains(method);
+
+    DexEncodedMethod definition = method.getDefinition();
+    assert !definition.getOptimizationInfo().forceInline();
+
+    timing.begin("Clinit");
+    if (definition.isStatic()) {
+      markDirectAndIndirectClassInitializersAsLive(method.getHolder());
+    }
+    timing.end();
+
+    if (method.getDefinition().hasCode()) {
+      timing.begin("Trace code (non-desugared)");
+      traceNonDesugaredCode(method, timing);
+      timing.end();
+    }
+
+    timing.begin("Super");
+    ProgramMethodSet superCallTargets = superInvokeDependencies.get(method.getDefinition());
+    if (superCallTargets != null) {
+      for (ProgramMethod superCallTarget : superCallTargets) {
+        markMethodAsTargeted(superCallTarget, KeepReason.invokedViaSuperFrom(method));
+        markVirtualMethodAsLive(superCallTarget, KeepReason.invokedViaSuperFrom(method));
+      }
+    }
+    timing.end();
+
+    timing.begin("Notify");
+    analyses.processNewlyLiveMethod(method, context, this, worklist);
+    timing.end();
+  }
+
+  public void markMethodAsTargeted(ProgramMethod method, KeepReason reason) {
+    if (!addTargetedMethod(method, reason)) {
+      // Already targeted.
+      return;
+    }
+
+    if (!liveMethods.contains(method)) {
+      traceMethodDefinitionExcludingCode(method);
+    }
+
+    if (forceProguardCompatibility) {
+      // Keep targeted default methods in compatibility mode. The tree pruner will otherwise make
+      // these methods abstract, whereas Proguard does not (seem to) touch their code.
+      if (!method.getAccessFlags().isAbstract() && method.getHolder().isInterface()) {
+        markMethodAsLiveWithCompatRule(method);
+      }
+    }
+    analyses.processNewlyTargetedMethod(method, worklist);
+  }
+
+  void traceMethodDefinitionExcludingCode(ProgramMethod method) {
+    markReferencedTypesAsLive(method);
+    processAnnotations(method);
+    method
+        .getDefinition()
+        .getParameterAnnotations()
+        .forEachAnnotation(
+            annotation -> processAnnotation(method, annotation, AnnotatedKind.PARAMETER));
+
+    // Update keep info.
+    applyMinimumKeepInfo(method);
+    if (hasAlternativeLibraryDefinition(method.getHolder())
+        && !method.getDefinition().isPrivateMethod()) {
+      mutateKeepInfo(method, MutableKeepInfoCollection::keepMethod);
+    }
+  }
+
+  private void traceNonDesugaredCode(ProgramMethod method, Timing timing) {
+    if (mode.isInitialTreeShaking()) {
+      if (method.getDefinition().getCode().isLirCode()) {
+        // We should only encounter LIR here in the post processing desugaring. The traced methods
+        // are synthetic forwarding methods that do not require desugaring.
+        assert method.getDefinition().isD8R8Synthesized();
+        assert worklist.isNonPushable();
+        traceCode(method, timing);
+        return;
+      }
+      if (addToPendingDesugaring(method, timing)) {
+        return;
+      }
+    }
+
+    processCodeBeforeTracing(method, timing);
+  }
+
+  void processCodeBeforeTracing(ProgramMethod method, Timing timing) {
+    timing.begin("Notify processNewlyLiveUnprocessedCode");
+    analyses.processNewlyLiveUnprocessedCode(method);
+    timing.end();
+    if (cfToLirConverter != null && !appView.isCfByteCodePassThrough(method)) {
+      cfToLirConverter.processMethod(method, timing);
+    } else {
+      traceCode(method, timing);
+    }
+  }
+
+  public void traceCode(ProgramMethod method, Timing timing) {
+    timing.begin("Trace code");
+    DefaultEnqueuerUseRegistry registry =
+        useRegistryFactory.create(appView, method, this, appView.apiLevelCompute());
+    timing.begin("Register code references");
+    method.registerCodeReferences(registry);
+    timing.end();
+    timing.begin("Notify processNewlyLiveCode");
+    analyses.processNewlyLiveCode(method, registry, worklist);
+    timing.end();
+    timing.end();
+  }
+
+  private void markReferencedTypesAsLive(ProgramMethod method) {
+    markTypeAsLive(method.getHolder(), method);
+    markParameterAndReturnTypesAsLive(method);
+  }
+
+  private void markParameterAndReturnTypesAsLive(ProgramMethod method) {
+    for (DexType parameterType : method.getParameters()) {
+      markTypeAsLive(parameterType, method);
+    }
+    markTypeAsLive(method.getReturnType(), method);
+  }
+
+  public void markClassAsInstantiatedWithReason(DexProgramClass clazz, KeepReason reason) {
+    worklist.enqueueMarkInstantiatedAction(clazz, null, InstantiationReason.REFLECTION, reason);
+    if (clazz.hasDefaultInitializer()) {
+      ProgramMethod defaultInitializer = clazz.getProgramDefaultInitializer();
+      worklist.enqueueMarkReachableDirectAction(
+          defaultInitializer.getReference(), defaultInitializer, reason);
+    }
+  }
+
+  public void markClassAsInstantiatedWithCompatRule(
+      DexProgramClass clazz, Supplier<KeepReason> reasonSupplier) {
+    assert forceProguardCompatibility;
+
+    if (!addCompatInstantiatedClass(clazz)) {
+      return;
+    }
+
+    KeepReasonWitness witness = graphReporter.registerClass(clazz, reasonSupplier.get());
+    if (clazz.isAnnotation()) {
+      markTypeAsLive(clazz, witness);
+    } else if (clazz.isInterface()) {
+      markInterfaceAsInstantiated(clazz, witness);
+    } else {
+      worklist.enqueueMarkInstantiatedAction(clazz, null, InstantiationReason.KEEP_RULE, witness);
+      if (clazz.hasDefaultInitializer()) {
+        ProgramMethod defaultInitializer = clazz.getProgramDefaultInitializer();
+        worklist.enqueueMarkReachableDirectAction(
+            defaultInitializer.getReference(),
+            defaultInitializer,
+            graphReporter.reportCompatKeepDefaultInitializer(defaultInitializer));
+        applyMinimumKeepInfoWhenLiveOrTargeted(
+            defaultInitializer, KeepMethodInfo.newEmptyJoiner().disallowOptimization());
+      }
+    }
+  }
+
+  private boolean addCompatInstantiatedClass(DexProgramClass clazz) {
+    assert forceProguardCompatibility;
+
+    // During the first round of tree shaking, we compat-instantiate all classes referenced from
+    // check-cast, const-class, and instance-of instructions.
+    if (mode.isInitialTreeShaking()) {
+      proguardCompatibilityActionsBuilder.addCompatInstantiatedType(clazz);
+      return true;
+    }
+
+    assert proguardCompatibilityActionsBuilder == null;
+
+    // Otherwise, we only compat-instantiate classes referenced from check-cast, const-class, and
+    // instance-of instructions that were also compat-instantiated during the first round of tree
+    // shaking.
+    return appView.hasProguardCompatibilityActions()
+        && appView.getProguardCompatibilityActions().isCompatInstantiated(clazz);
+  }
+
+  private void markMethodAsLiveWithCompatRule(ProgramMethod method) {
+    worklist.enqueueMarkMethodLiveAction(
+        method, method, graphReporter.reportCompatKeepMethod(method));
+  }
+
+  private static class SetWithReportedReason<T extends DexDefinition> {
+
+    private final Map<DexReference, T> items = new IdentityHashMap<>();
+    private final Map<T, List<Action>> deferredActions = new IdentityHashMap<>();
+
+    boolean add(T item, KeepReasonWitness witness) {
+      assert witness != null;
+      T existing = items.put(item.getReference(), item);
+      if (existing == null) {
+        deferredActions.getOrDefault(item, Collections.emptyList()).forEach(Action::execute);
+        return true;
+      }
+      return false;
+    }
+
+    boolean contains(DexReference reference) {
+      return items.containsKey(reference);
+    }
+
+    boolean contains(T item) {
+      return contains(item.getReference());
+    }
+
+    boolean registerDeferredAction(T item, Action action) {
+      if (!contains(item)) {
+        deferredActions.computeIfAbsent(item, ignore -> new ArrayList<>()).add(action);
+        return true;
+      }
+      return false;
+    }
+
+    Collection<T> getItems() {
+      return CollectionUtils.unmodifiableForTesting(items.values());
+    }
+  }
+
+  private class LiveFieldsSet {
+
+    private final Set<DexEncodedField> fields = Sets.newIdentityHashSet();
+
+    private final BiConsumer<DexEncodedField, KeepReason> register;
+
+    LiveFieldsSet(BiConsumer<DexEncodedField, KeepReason> register) {
+      this.register = register;
+    }
+
+    boolean add(ProgramField field, KeepReason reason) {
+      DexEncodedField definition = field.getDefinition();
+      register.accept(definition, reason);
+      transitionUnusedInterfaceToLive(field.getHolder());
+      return fields.add(definition);
+    }
+
+    boolean contains(DexEncodedField field) {
+      return fields.contains(field);
+    }
+
+    boolean contains(ProgramField field) {
+      return contains(field.getDefinition());
+    }
+  }
+
+  private class LiveMethodsSet {
+
+    private final Set<DexEncodedMethod> items = Sets.newIdentityHashSet();
+
+    private final BiConsumer<DexEncodedMethod, KeepReason> register;
+
+    LiveMethodsSet(BiConsumer<DexEncodedMethod, KeepReason> register) {
+      this.register = register;
+    }
+
+    boolean add(ProgramMethod method, KeepReason reason) {
+      DexEncodedMethod definition = method.getDefinition();
+      register.accept(definition, reason);
+      transitionUnusedInterfaceToLive(method.getHolder());
+      return items.add(definition);
+    }
+
+    boolean contains(DexEncodedMethod method) {
+      return items.contains(method);
+    }
+
+    boolean contains(ProgramMethod method) {
+      return contains(method.getDefinition());
+    }
+
+    Set<DexEncodedMethod> getItems() {
+      return SetUtils.unmodifiableForTesting(items);
+    }
+  }
+
+  private class AnnotationReferenceMarker implements IndexedItemCollection {
+
+    private final DexAnnotation annotation;
+    private final ProgramDefinition context;
+
+    private AnnotationReferenceMarker(DexAnnotation annotation, ProgramDefinition context) {
+      this.annotation = annotation;
+      this.context = context;
+    }
+
+    @Override
+    public boolean addField(DexField field) {
+      worklist.enqueueTraceFieldAccessFromAnnotationAction(field, annotation, context);
+      return false;
+    }
+
+    @Override
+    public boolean addMethod(DexMethod method) {
+      worklist.enqueueTraceMethodAccessFromAnnotationAction(method, annotation, context);
+      return false;
+    }
+
+    @Override
+    public boolean addType(DexType type) {
+      DexType baseType = type.getBaseType();
+      if (!baseType.isClassType()) {
+        return false;
+      }
+      if (!graphReporter.hasConsumer() && liveTypes.contains(baseType)) {
+        return false;
+      }
+      worklist.enqueueTraceTypeAccessFromAnnotationAction(baseType, annotation, context);
+      return false;
+    }
+
+    @Override
+    public boolean addClass(DexProgramClass dexProgramClass) {
+      return false;
+    }
+
+    @Override
+    public boolean addString(DexString string) {
+      return false;
+    }
+
+    @Override
+    public boolean addProto(DexProto proto) {
+      return false;
+    }
+
+    @Override
+    public boolean addCallSite(DexCallSite callSite) {
+      return false;
+    }
+
+    @Override
+    public boolean addMethodHandle(DexMethodHandle methodHandle) {
+      return false;
+    }
+  }
+
+  public static class EnqueuerDefinitionSupplier {
+
+    private final Enqueuer enqueuer;
+
+    EnqueuerDefinitionSupplier(Enqueuer enqueuer) {
+      this.enqueuer = enqueuer;
+    }
+
+    public DexClass definitionFor(DexType type, ProgramDefinition context) {
+      return enqueuer.definitionFor(
+          type, context, enqueuer::recordNonProgramClass, enqueuer::ignoreMissingClass);
+    }
+  }
+
+  public static class ResolutionSearchKey {
+
+    private final DexMethod method;
+    private final boolean isInterface;
+
+    private MethodResolutionResult cachedResolution;
+
+    private ResolutionSearchKey(DexMethod method, boolean isInterface) {
+      this.method = method;
+      this.isInterface = isInterface;
+    }
+
+    public MethodResolutionResult resolve(AppInfoWithClassHierarchy appInfo) {
+      if (cachedResolution == null) {
+        cachedResolution = appInfo.resolveMethodLegacy(method, isInterface);
+      }
+      return cachedResolution;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof ResolutionSearchKey)) {
+        return false;
+      }
+      ResolutionSearchKey that = (ResolutionSearchKey) o;
+      return method.isIdenticalTo(that.method) && isInterface == that.isInterface;
+    }
+
+    @Override
+    public int hashCode() {
+      return (method.hashCode() << 1) | BooleanUtils.intValue(isInterface);
+    }
+  }
+}

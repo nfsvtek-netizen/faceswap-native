@@ -1,0 +1,267 @@
+// Copyright (c) 2022, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.desugar.desugaredlibrary.jdk11;
+
+import static com.android.tools.r8.desugar.desugaredlibrary.test.CompilationSpecification.DEFAULT_SPECIFICATIONS;
+import static com.android.tools.r8.desugar.desugaredlibrary.test.LibraryDesugaringSpecification.JDK11_PATH;
+
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.ToolHelper.DexVm.Version;
+import com.android.tools.r8.desugar.desugaredlibrary.DesugaredLibraryTestBase;
+import com.android.tools.r8.desugar.desugaredlibrary.test.CompilationSpecification;
+import com.android.tools.r8.desugar.desugaredlibrary.test.LibraryDesugaringSpecification;
+import com.android.tools.r8.utils.internal.StringUtils;
+import com.google.common.collect.ImmutableList;
+import java.io.FileDescriptor;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.SeekableByteChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.OpenOption;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
+
+@RunWith(Parameterized.class)
+public class FileChannelTest extends DesugaredLibraryTestBase {
+
+  private static final String EXPECTED_RESULT =
+      StringUtils.lines(
+          "true",
+          "true",
+          "true",
+          "true",
+          "Hello World! ",
+          "Hello World! ",
+          "Bye bye. ",
+          "Hello World! ",
+          "Bye bye. ",
+          "Hello World! ",
+          "The monkey eats...",
+          "Bananas!",
+          "Bananas!",
+          "Bananas!");
+
+  private final TestParameters parameters;
+  private final LibraryDesugaringSpecification libraryDesugaringSpecification;
+  private final CompilationSpecification compilationSpecification;
+
+  @Parameters(name = "{0}, spec: {1}, {2}")
+  public static List<Object[]> data() {
+    return buildParameters(
+        // Skip Android 4.4.4 due to missing libjavacrypto.
+        getTestParameters()
+            .withDexRuntime(Version.V4_0_4)
+            // TODO(b/507731439): Test on ART 17.
+            .withDexRuntimesRangeIncluding(Version.V5_1_1, Version.V16_0_0)
+            .withAllApiLevels()
+            .build(),
+        ImmutableList.of(JDK11_PATH),
+        DEFAULT_SPECIFICATIONS);
+  }
+
+  public FileChannelTest(
+      TestParameters parameters,
+      LibraryDesugaringSpecification libraryDesugaringSpecification,
+      CompilationSpecification compilationSpecification) {
+    this.parameters = parameters;
+    this.libraryDesugaringSpecification = libraryDesugaringSpecification;
+    this.compilationSpecification = compilationSpecification;
+  }
+
+  @Test
+  public void test() throws Throwable {
+    testForDesugaredLibrary(parameters, libraryDesugaringSpecification, compilationSpecification)
+        .addInnerClasses(getClass())
+        .addKeepMainRule(TestClass.class)
+        .compile()
+        .withArt6Plus64BitsLib()
+        .run(parameters.getRuntime(), TestClass.class)
+        .assertSuccessWithOutput(EXPECTED_RESULT);
+  }
+
+  public static class TestClass {
+
+    public static void main(String[] args) throws IOException {
+      instanceTest();
+      fisTest();
+      fosTest();
+      fileChannelOpen();
+    }
+
+    /**
+     * These check look obvious but they are not on low Api level due to the interface injection.
+     */
+    @SuppressWarnings("all")
+    private static void instanceTest() throws IOException {
+      Path tmp = Files.createTempFile("r8-tmp", ".txt");
+      try {
+        System.out.println(
+            new FileInputStream(tmp.toFile()).getChannel() instanceof SeekableByteChannel);
+        System.out.println(
+            new FileOutputStream(tmp.toFile()).getChannel() instanceof SeekableByteChannel);
+        System.out.println(
+            new RandomAccessFile(tmp.toFile(), "rw").getChannel() instanceof SeekableByteChannel);
+        System.out.println(
+            Files.newByteChannel(tmp, StandardOpenOption.READ) instanceof SeekableByteChannel);
+      } finally {
+        Files.deleteIfExists(tmp);
+      }
+    }
+
+    private static void fosTest() throws IOException {
+      String toWrite = "The monkey eats...";
+      Path tmp = Files.createTempFile("r8-fos", ".txt");
+      try {
+        ByteBuffer byteBuffer = ByteBuffer.wrap(toWrite.getBytes(StandardCharsets.UTF_8));
+        FileOutputStream fos = new FileOutputStream(tmp.toFile());
+        FileChannel channel = fos.getChannel();
+        channel.write(byteBuffer);
+        fos.close();
+
+        List<String> lines = Files.readAllLines(tmp);
+        System.out.println(lines.get(0));
+      } finally {
+        Files.deleteIfExists(tmp);
+      }
+    }
+
+    private static void fileChannelOpen() throws IOException {
+      fileChannelOpenTest();
+      fileChannelOpenSetTest();
+      fileChannelOpenLockTest();
+    }
+
+    private static void fileChannelOpenLockTest() throws IOException {
+      Path tmp = Files.createTempFile("r8-lock", ".txt");
+      try {
+        String contents = "Bananas!";
+        Files.write(tmp, contents.getBytes(StandardCharsets.UTF_8));
+        FileChannel fc = FileChannel.open(tmp, StandardOpenOption.READ);
+        ByteBuffer byteBuffer = ByteBuffer.allocate(contents.length());
+        fc.read(byteBuffer);
+        System.out.println(new String(byteBuffer.array()));
+        fc.close();
+      } finally {
+        Files.deleteIfExists(tmp);
+      }
+    }
+
+    private static void fileChannelOpenTest() throws IOException {
+      Path tmp = Files.createTempFile("r8-a", ".txt");
+      try {
+        String contents = "Bananas!";
+        Files.write(tmp, contents.getBytes(StandardCharsets.UTF_8));
+        FileChannel fc = FileChannel.open(tmp, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        ByteBuffer byteBuffer = ByteBuffer.allocate(contents.length());
+        // Extra indirection through the lock.
+        fc.lock().channel().read(byteBuffer);
+        System.out.println(new String(byteBuffer.array()));
+        fc.close();
+      } finally {
+        Files.deleteIfExists(tmp);
+      }
+    }
+
+    private static void fileChannelOpenSetTest() throws IOException {
+      Path tmp = Files.createTempFile("r8-b", ".txt");
+      try {
+        String contents = "Bananas!";
+        Files.write(tmp, contents.getBytes(StandardCharsets.UTF_8));
+        Set<OpenOption> options = new HashSet<>();
+        options.add(StandardOpenOption.READ);
+        FileChannel fc = FileChannel.open(tmp, options);
+        ByteBuffer byteBuffer = ByteBuffer.allocate(contents.length());
+        fc.read(byteBuffer);
+        System.out.println(new String(byteBuffer.array()));
+        fc.close();
+      } finally {
+        Files.deleteIfExists(tmp);
+      }
+    }
+
+    private static void fisTest() throws IOException {
+      fisOwner();
+      fisNotOwner(true);
+      fisNotOwner(false);
+      fisOwnerTryResources();
+    }
+
+    private static void fisNotOwner(boolean closeFirst) throws IOException {
+      String toWrite = "Hello World! ";
+      String toWriteFIS = "Bye bye. ";
+      Path tmp = Files.createTempFile("r8-tmp", ".txt");
+      try {
+        Files.write(tmp, (toWrite + toWriteFIS).getBytes(StandardCharsets.UTF_8));
+
+        ByteBuffer byteBuffer = ByteBuffer.allocate(toWrite.length());
+        ByteBuffer byteBufferFIS = ByteBuffer.allocate(toWriteFIS.length());
+        FileInputStream fileInputStream = new FileInputStream(tmp.toFile());
+        FileDescriptor fd = fileInputStream.getFD();
+        FileInputStream fis2 = new FileInputStream(fd);
+        fileInputStream.getChannel().read(byteBuffer);
+        fis2.getChannel().read(byteBufferFIS);
+
+        if (closeFirst) {
+          fileInputStream.close();
+          fis2.close();
+        } else {
+          fis2.close();
+          fileInputStream.close();
+        }
+
+        System.out.println(new String(byteBuffer.array()));
+        System.out.println(new String(byteBufferFIS.array()));
+      } finally {
+        Files.deleteIfExists(tmp);
+      }
+    }
+
+    private static void fisOwner() throws IOException {
+      String toWrite = "Hello World! ";
+      Path tmp = Files.createTempFile("r8-tmp", ".txt");
+      try {
+        Files.write(tmp, toWrite.getBytes(StandardCharsets.UTF_8));
+
+        ByteBuffer byteBuffer = ByteBuffer.allocate(toWrite.length());
+        FileInputStream fileInputStream = new FileInputStream(tmp.toFile());
+        fileInputStream.getChannel().read(byteBuffer);
+        fileInputStream.close();
+
+        System.out.println(new String(byteBuffer.array()));
+      } finally {
+        Files.deleteIfExists(tmp);
+      }
+    }
+
+    private static void fisOwnerTryResources() throws IOException {
+      String toWrite = "Hello World! ";
+      Path tmp = Files.createTempFile("r8-tmp", ".txt");
+      try {
+        Files.write(tmp, toWrite.getBytes(StandardCharsets.UTF_8));
+
+        ByteBuffer byteBuffer = ByteBuffer.allocate(toWrite.length());
+        try (FileInputStream fileInputStream = new FileInputStream(tmp.toFile())) {
+          fileInputStream.getChannel().read(byteBuffer);
+        }
+
+        System.out.println(new String(byteBuffer.array()));
+      } finally {
+        Files.deleteIfExists(tmp);
+      }
+    }
+  }
+}

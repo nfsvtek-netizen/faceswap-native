@@ -1,0 +1,219 @@
+// Copyright (c) 2017, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.ir.synthetic;
+
+import com.android.tools.r8.graph.DebugLocalInfo;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.code.CatchHandlers;
+import com.android.tools.r8.ir.code.Position;
+import com.android.tools.r8.ir.code.ValueType;
+import com.android.tools.r8.ir.conversion.DexSourceCode;
+import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.conversion.SourceCode;
+import com.android.tools.r8.utils.internal.ArrayUtils;
+import com.android.tools.r8.utils.internal.exceptions.Unreachable;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+
+@Deprecated
+public abstract class SyntheticSourceCode implements SourceCode {
+
+  protected final static Predicate<IRBuilder> doesNotEndBlock = x -> false;
+  protected final static Predicate<IRBuilder> endsBlock = x -> true;
+
+  // The next free register, note that we always
+  // assign each value a new (next available) register.
+  private int nextRegister = 0;
+
+  // Registers for receiver and parameters
+  private final int receiverRegister;
+  private int[] paramRegisters;
+
+  // Instruction constructors
+  private List<Consumer<IRBuilder>> constructors = new ArrayList<>();
+  private List<Predicate<IRBuilder>> traceEvents = new ArrayList<>();
+
+  private final Position position;
+
+  protected SyntheticSourceCode(ProgramMethod method, Position position) {
+    this.position = position;
+
+    // Initialize register values for receiver and arguments
+    this.receiverRegister = nextRegister(ValueType.OBJECT);
+    this.paramRegisters =
+        ArrayUtils.initialize(
+            new int[method.getParameters().size()],
+            i -> nextRegister(ValueType.fromDexType(method.getParameter(i))));
+  }
+
+  protected final void add(Consumer<IRBuilder> constructor) {
+    add(constructor, doesNotEndBlock);
+  }
+
+  protected final void add(Consumer<IRBuilder> constructor, Predicate<IRBuilder> traceEvent) {
+    constructors.add(constructor);
+    traceEvents.add(traceEvent);
+  }
+
+  protected final int nextRegister(ValueType type) {
+    int value = nextRegister;
+    nextRegister += type.requiredRegisters();
+    return value;
+  }
+
+  protected final int getReceiverRegister() {
+    assert receiverRegister >= 0;
+    return receiverRegister;
+  }
+
+  protected final int getParamRegister(int paramIndex) {
+    assert paramIndex >= 0;
+    assert paramIndex < paramRegisters.length;
+    return paramRegisters[paramIndex];
+  }
+
+  protected abstract void prepareInstructions();
+
+  @Override
+  public final int instructionCount() {
+    return constructors.size();
+  }
+
+  protected final int lastInstructionIndex() {
+    return constructors.size() - 1;
+  }
+
+  protected final int nextInstructionIndex() {
+    return constructors.size();
+  }
+
+  @Override
+  public final int instructionIndex(int instructionOffset) {
+    return instructionOffset;
+  }
+
+  @Override
+  public final int instructionOffset(int instructionIndex) {
+    return instructionIndex;
+  }
+
+  @Override
+  public DebugLocalInfo getIncomingLocalAtBlock(int register, int blockOffset) {
+    return null;
+  }
+
+  @Override
+  public DebugLocalInfo getIncomingLocal(int register) {
+    return null;
+  }
+
+  @Override
+  public DebugLocalInfo getOutgoingLocal(int register) {
+    return null;
+  }
+
+  @Override
+  public final int traceInstruction(int instructionIndex, IRBuilder builder) {
+    return (traceEvents.get(instructionIndex).test(builder) ||
+        (instructionIndex == constructors.size() - 1)) ? instructionIndex : -1;
+  }
+
+  @Override
+  public final void setUp() {
+    assert constructors.isEmpty();
+    prepareInstructions();
+    assert !constructors.isEmpty();
+  }
+
+  @Override
+  public final void clear() {
+    constructors = null;
+    traceEvents = null;
+    paramRegisters = null;
+  }
+
+  @Override
+  public final void buildPrelude(IRBuilder builder) {
+    builder.buildArgumentsWithRewrittenPrototypeChanges(
+        0, builder.getMethod(), DexSourceCode::doNothingWriteConsumer);
+  }
+
+  @Override
+  public final void buildPostlude(IRBuilder builder) {
+    // Intentionally left empty.
+  }
+
+  @Override
+  public final void buildInstruction(
+      IRBuilder builder, int instructionIndex, boolean firstBlockInstruction) {
+    constructors.get(instructionIndex).accept(builder);
+  }
+
+  @Override
+  public void buildBlockTransfer(
+      IRBuilder builder, int predecessorOffset, int successorOffset, boolean isExceptional) {
+    // Intentionally empty as synthetic code does not contain locals information.
+  }
+
+  @Override
+  public final void resolveAndBuildSwitch(
+      int value, int fallthroughOffset, int payloadOffset, IRBuilder builder) {
+    throw new Unreachable("Unexpected call to resolveAndBuildSwitch");
+  }
+
+  @Override
+  public final void resolveAndBuildNewArrayFilledData(
+      int arrayRef, int payloadOffset, IRBuilder builder) {
+    throw new Unreachable("Unexpected call to resolveAndBuildNewArrayFilledData");
+  }
+
+  @Override
+  public final CatchHandlers<Integer> getCurrentCatchHandlers(IRBuilder builder) {
+    return null;
+  }
+
+  @Override
+  public int getMoveExceptionRegister(int instructionIndex) {
+    throw new Unreachable();
+  }
+
+  @Override
+  public Position getCanonicalDebugPositionAtOffset(int offset) {
+    return Position.syntheticNone();
+  }
+
+  @Override
+  public Position getCurrentPosition() {
+    return position;
+  }
+
+  @Override
+  public final boolean verifyCurrentInstructionCanThrow() {
+    return true;
+  }
+
+  @Override
+  public boolean verifyLocalInScope(DebugLocalInfo local) {
+    return true;
+  }
+
+  @Override
+  public final boolean verifyRegister(int register) {
+    return true;
+  }
+
+  // To be used as a tracing event for switch instruction.,
+  protected boolean endsSwitch(
+      IRBuilder builder, int switchIndex, int fallthrough, int[] offsets) {
+    // ensure successors of switch instruction
+    for (int offset : offsets) {
+      builder.ensureNormalSuccessorBlock(switchIndex, offset);
+    }
+    builder.ensureNormalSuccessorBlock(switchIndex, fallthrough);
+    return true;
+  }
+}

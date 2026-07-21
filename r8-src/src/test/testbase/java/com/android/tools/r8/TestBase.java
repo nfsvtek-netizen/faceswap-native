@@ -1,0 +1,2373 @@
+// Copyright (c) 2017, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8;
+
+import static com.android.tools.r8.TestBuilder.getTestingAnnotations;
+import static com.android.tools.r8.ToolHelper.R8_TEST_BUCKET;
+import static com.android.tools.r8.utils.CfUtils.extractClassDescriptor;
+import static com.android.tools.r8.utils.InternalOptions.ASM_VERSION;
+import static com.google.common.collect.Lists.cartesianProduct;
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+import static org.junit.Assume.assumeTrue;
+
+import com.android.tools.r8.ClassFileConsumer.ArchiveConsumer;
+import com.android.tools.r8.DataResourceProvider.Visitor;
+import com.android.tools.r8.KotlinCompilerTool.KotlinCompiler;
+import com.android.tools.r8.KotlinCompilerTool.KotlinLambdaGeneration;
+import com.android.tools.r8.KotlinCompilerTool.KotlinTargetVersion;
+import com.android.tools.r8.TestRuntime.CfRuntime;
+import com.android.tools.r8.TestRuntime.CfVm;
+import com.android.tools.r8.ToolHelper.ArtCommandBuilder;
+import com.android.tools.r8.ToolHelper.DexVm;
+import com.android.tools.r8.ToolHelper.ProcessResult;
+import com.android.tools.r8.cf.CfVersion;
+import com.android.tools.r8.dex.ApplicationReader;
+import com.android.tools.r8.dex.code.DexInstruction;
+import com.android.tools.r8.features.ClassToFeatureSplitMap;
+import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppServices;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexCode;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProto;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.GenericSignature;
+import com.android.tools.r8.graph.GenericSignature.ClassSignature;
+import com.android.tools.r8.graph.ImmediateAppSubtypingInfo;
+import com.android.tools.r8.graph.LazyLoadedDexApplication;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.SmaliWriter;
+import com.android.tools.r8.jasmin.JasminBuilder;
+import com.android.tools.r8.libanalyzer.LibraryAnalyzerTestBuilder;
+import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.origin.PathOrigin;
+import com.android.tools.r8.partial.R8PartialCompilationConfiguration;
+import com.android.tools.r8.profile.rewriting.ProfileCollectionAdditions;
+import com.android.tools.r8.references.ClassReference;
+import com.android.tools.r8.references.FieldReference;
+import com.android.tools.r8.references.MethodReference;
+import com.android.tools.r8.references.Reference;
+import com.android.tools.r8.references.TypeReference;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.shaking.EnqueuerFactory;
+import com.android.tools.r8.shaking.EnqueuerResult;
+import com.android.tools.r8.shaking.MainDexInfo;
+import com.android.tools.r8.shaking.NoHorizontalClassMergingRule;
+import com.android.tools.r8.shaking.NoVerticalClassMergingRule;
+import com.android.tools.r8.shaking.ProguardClassNameList;
+import com.android.tools.r8.shaking.ProguardClassType;
+import com.android.tools.r8.shaking.ProguardConfiguration;
+import com.android.tools.r8.shaking.ProguardConfigurationRule;
+import com.android.tools.r8.shaking.ProguardKeepAttributes;
+import com.android.tools.r8.shaking.ProguardKeepRule;
+import com.android.tools.r8.shaking.ProguardKeepRule.Builder;
+import com.android.tools.r8.shaking.ProguardKeepRuleType;
+import com.android.tools.r8.shaking.ProguardMemberRule;
+import com.android.tools.r8.shaking.ProguardMemberType;
+import com.android.tools.r8.shaking.ProguardTypeMatcher;
+import com.android.tools.r8.shaking.rootset.RootSet;
+import com.android.tools.r8.synthesis.SyntheticItems.GlobalSyntheticsStrategy;
+import com.android.tools.r8.transformers.ClassFileTransformer;
+import com.android.tools.r8.utils.AndroidApiLevel;
+import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.AndroidAppConsumers;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.PreloadedClassFileProvider;
+import com.android.tools.r8.utils.Reporter;
+import com.android.tools.r8.utils.TestDescriptionWatcher;
+import com.android.tools.r8.utils.ZipUtils.ZipBuilder;
+import com.android.tools.r8.utils.codeinspector.ClassSubject;
+import com.android.tools.r8.utils.codeinspector.CodeInspector;
+import com.android.tools.r8.utils.codeinspector.FoundClassSubject;
+import com.android.tools.r8.utils.codeinspector.FoundMethodSubject;
+import com.android.tools.r8.utils.codeinspector.MethodSubject;
+import com.android.tools.r8.utils.internal.ListUtils;
+import com.android.tools.r8.utils.internal.StringUtils;
+import com.android.tools.r8.utils.internal.collections.Pair;
+import com.android.tools.r8.utils.internal.exceptions.Unreachable;
+import com.android.tools.r8.utils.timing.Timing;
+import com.google.common.base.Predicates;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+import com.google.common.collect.Sets.SetView;
+import com.google.common.io.ByteStreams;
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
+import org.junit.AfterClass;
+import org.junit.Assert;
+import org.junit.BeforeClass;
+import org.junit.Rule;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.rules.ExpectedException;
+import org.junit.rules.TemporaryFolder;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+
+public class TestBase {
+
+  public static Iterable<?> allRuntimesAndApiLevelsSource() {
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
+  }
+
+  public static Iterable<?> allCfRuntimes() {
+    return getTestParameters().withCfRuntimes().build();
+  }
+
+  @BeforeEach
+  public void setupTempJUnit5() throws IOException {
+    if (tempDirJUnit5 != null) {
+      try {
+        temp.create();
+      } catch (IllegalStateException e) {
+        // Ignore
+      }
+    }
+  }
+
+  @AfterEach
+  public void tearDownTempJUnit5() {
+    if (tempDirJUnit5 != null) {
+      temp.delete();
+    }
+  }
+
+  public enum Backend {
+    CF,
+    DEX;
+
+    public boolean isCf() {
+      return this == CF;
+    }
+
+    public boolean isDex() {
+      return this == DEX;
+    }
+
+    public static Backend fromConsumer(ProgramConsumer consumer) {
+      return consumer instanceof ClassFileConsumer ? CF : DEX;
+    }
+  }
+
+  public static LibraryAnalyzerTestBuilder testForLibraryAnalyzer(TemporaryFolder temp) {
+    return LibraryAnalyzerTestBuilder.create(temp);
+  }
+
+  public static R8FullTestBuilder testForR8(TemporaryFolder temp, Backend backend) {
+    return R8FullTestBuilder.create(new TestState(temp), backend);
+  }
+
+  public static R8PartialTestBuilder testForR8Partial(TemporaryFolder temp) {
+    return R8PartialTestBuilder.create(new TestState(temp));
+  }
+
+  public static R8CompatTestBuilder testForR8Compat(
+      TemporaryFolder temp, Backend backend, boolean forceProguardCompatibility) {
+    return R8CompatTestBuilder.create(new TestState(temp), backend, forceProguardCompatibility);
+  }
+
+  public static ExternalR8TestBuilder testForExternalR8(
+      TemporaryFolder temp, Backend backend, TestRuntime runtime) {
+    return ExternalR8TestBuilder.create(new TestState(temp), backend, runtime);
+  }
+
+  public static ExternalR8TestBuilder testForExternalR8(TemporaryFolder temp, Backend backend) {
+    return ExternalR8TestBuilder.create(
+        new TestState(temp), backend, TestRuntime.getSystemRuntime());
+  }
+
+  public static D8TestBuilder testForD8(TemporaryFolder temp, Backend backend) {
+    return D8TestBuilder.create(new TestState(temp), backend);
+  }
+
+  public static D8TestBuilder testForD8(TemporaryFolder temp) {
+    return D8TestBuilder.create(new TestState(temp), Backend.DEX);
+  }
+
+  public static JvmTestBuilder testForJvm(TemporaryFolder temp) {
+    return JvmTestBuilder.create(new TestState(temp));
+  }
+
+  public static ProguardTestBuilder testForProguard(ProguardVersion version, TemporaryFolder temp) {
+    return ProguardTestBuilder.create(new TestState(temp), version);
+  }
+
+  public static GenerateMainDexListTestBuilder testForMainDexListGenerator(TemporaryFolder temp) {
+    return GenerateMainDexListTestBuilder.create(new TestState(temp));
+  }
+
+  public LibraryAnalyzerTestBuilder testForLibraryAnalyzer() {
+    return testForLibraryAnalyzer(temp);
+  }
+
+  public R8FullTestBuilder testForR8(Backend backend) {
+    assert verifyNoPartialCompilationTestParameters(backend);
+    return testForR8(temp, backend);
+  }
+
+  private boolean verifyNoPartialCompilationTestParameters(Backend backend) {
+    if (backend.isCf()) {
+      return true;
+    }
+    try {
+      Class<?> testClass = getClass();
+      for (Field field : testClass.getDeclaredFields()) {
+        if (field.getType() == TestParameters.class) {
+          field.setAccessible(true);
+          TestParameters parameters = (TestParameters) field.get(this);
+          assertTrue(parameters.getPartialCompilationTestParameters().isNone());
+        }
+      }
+    } catch (IllegalAccessException t) {
+      throw new RuntimeException(t);
+    }
+    return true;
+  }
+
+  public R8TestBuilder<? extends R8TestCompileResultBase<?>, R8TestRunResult, ?> testForR8(
+      TestParameters parameters) {
+    return testForR8(parameters.getBackend(), parameters.getPartialCompilationTestParameters())
+        .applyIf(parameters.hasApiLevel(), b -> b.setMinApi(parameters));
+  }
+
+  public R8TestBuilder<? extends R8TestCompileResultBase<?>, R8TestRunResult, ?> testForR8(
+      Backend backend, TestParameters parameters) {
+    assert parameters.getRuntime().isNone();
+    return testForR8(backend, parameters.getPartialCompilationTestParameters());
+  }
+
+  public R8TestBuilder<? extends R8TestCompileResultBase<?>, R8TestRunResult, ?> testForR8(
+      Backend backend, PartialCompilationTestParameters parameters) {
+    if (parameters.isNone()) {
+      return testForR8(backend);
+    }
+    assumeTrue(parameters.isIncludeAll() || parameters.isRandom());
+    return testForR8Partial(backend)
+        .setR8PartialConfiguration(
+            builder -> {
+              if (parameters.isIncludeAll()) {
+                builder.includeAll();
+              } else {
+                assert parameters.isRandom();
+                builder.randomizeForTesting(true);
+              }
+            })
+        .applyIf(parameters.isRandom(), R8PartialTestBuilder::allowUnusedDontWarnPatterns);
+  }
+
+  public R8PartialTestBuilder testForR8Partial(TestParameters parameters) {
+    parameters.assumeCanUseR8Partial();
+    return testForR8Partial(parameters.getBackend()).setMinApi(parameters);
+  }
+
+  public R8PartialTestBuilder testForR8Partial(Backend backend) {
+    assert backend.isDex();
+    return testForR8Partial(temp);
+  }
+
+  public R8CompatTestBuilder testForR8Compat(Backend backend) {
+    return testForR8Compat(backend, true);
+  }
+
+  public R8CompatTestBuilder testForR8Compat(Backend backend, boolean forceProguardCompatibility) {
+    return testForR8Compat(temp, backend, forceProguardCompatibility);
+  }
+
+  public ExternalR8TestBuilder testForExternalR8(Backend backend, TestRuntime runtime) {
+    return testForExternalR8(temp, backend, runtime);
+  }
+
+  public ExternalR8TestBuilder testForExternalR8(Backend backend) {
+    return testForExternalR8(temp, backend, TestRuntime.getSystemRuntime());
+  }
+
+  public D8TestBuilder testForD8() {
+    return testForD8(Backend.DEX);
+  }
+
+  public D8TestBuilder testForD8(Backend backend) {
+    assert verifyNoPartialCompilationTestParameters(backend);
+    return testForD8(temp, backend);
+  }
+
+  public TestCompilerBuilder<?, ?, ?, ? extends SingleTestRunResult<?>, ?> testForD8(
+      TestParameters parameters) {
+    return testForD8(parameters.getBackend(), parameters.getPartialCompilationTestParameters())
+        .applyIf(parameters.hasApiLevel(), b -> b.setMinApi(parameters));
+  }
+
+  public TestCompilerBuilder<?, ?, ?, ? extends SingleTestRunResult<?>, ?> testForD8(
+      Backend backend, PartialCompilationTestParameters partialCompilationTestParameters) {
+    if (partialCompilationTestParameters.isNone()) {
+      return testForD8(temp, backend);
+    }
+    assumeTrue(partialCompilationTestParameters.isExcludeAll());
+    return testForR8Partial(backend)
+        .allowDiagnosticMessages()
+        .setR8PartialConfiguration(R8PartialCompilationConfiguration.Builder::excludeAll);
+  }
+
+  public TestCompilerBuilder<?, ?, ?, ?, ?> testForD8(Backend backend, TestParameters parameters) {
+    assert parameters.getRuntime().isNone();
+    return testForD8(backend, parameters.getPartialCompilationTestParameters());
+  }
+
+  public AssistantTestBuilder testForAssistant() {
+    return AssistantTestBuilder.create(new TestState(temp));
+  }
+
+  public RelocatorTestBuilder testForRelocator(boolean external) {
+    return RelocatorTestBuilder.create(new TestState(temp), external);
+  }
+
+  public JvmTestBuilder testForJvm(TestParameters parameters) {
+    parameters.assertCfRuntime();
+    parameters.assertIsRepresentativeApiLevelForRuntime();
+    return testForJvm(temp);
+  }
+
+  public TestBuilder<? extends SingleTestRunResult<?>, ?> testForRuntime(
+      TestRuntime runtime, Consumer<D8TestBuilder> d8TestBuilderConsumer) {
+    if (runtime.isCf()) {
+      return testForJvm(temp);
+    } else {
+      assert runtime.isDex();
+      D8TestBuilder d8TestBuilder = testForD8();
+      d8TestBuilderConsumer.accept(d8TestBuilder);
+      return d8TestBuilder;
+    }
+  }
+
+  public TestBuilder<? extends SingleTestRunResult<?>, ?> testForRuntime(
+      TestRuntime runtime, AndroidApiLevel apiLevel) {
+    return testForRuntime(runtime, d8TestBuilder -> d8TestBuilder.setMinApi(apiLevel));
+  }
+
+  public TestBuilder<? extends SingleTestRunResult<?>, ?> testForRuntime(
+      TestParameters parameters) {
+    return testForRuntime(parameters.getRuntime(), parameters.getApiLevel());
+  }
+
+  public DesugarTestBuilder testForDesugaring(TestParameters parameters) {
+    return testForDesugaring(parameters, null);
+  }
+
+  public DesugarTestBuilder testForDesugaring(
+      TestParameters parameters, Consumer<InternalOptions> optionsModification) {
+    return internalTestForDesugaring(parameters, optionsModification, Predicates.alwaysTrue());
+  }
+
+  @Deprecated
+  // This is not supposed to be used for tests. It is here for debugging where filtering to run
+  // only some (typically one) test configuration is helpful.
+  public DesugarTestBuilder testForDesugaring(
+      TestParameters parameters,
+      Consumer<InternalOptions> optionsModification,
+      Predicate<DesugarTestConfiguration> filter) {
+    return internalTestForDesugaring(parameters, optionsModification, filter);
+  }
+
+  private DesugarTestBuilder internalTestForDesugaring(
+      TestParameters parameters,
+      Consumer<InternalOptions> optionsModification,
+      Predicate<DesugarTestConfiguration> filter) {
+    assert parameters.hasApiLevel()
+        : "No API level. Add .withAllApiLevelsAlsoForCf() to test parameters?";
+    ImmutableList.Builder<
+            Pair<DesugarTestConfiguration, TestBuilder<? extends SingleTestRunResult<?>, ?>>>
+        builders = ImmutableList.builder();
+    if (parameters.isCfRuntime()) {
+      assumeTrue(parameters.getPartialCompilationTestParameters().isNone());
+      if (filter.test(DesugarTestConfiguration.JAVAC)) {
+        builders.add(
+            new Pair<>(DesugarTestConfiguration.JAVAC, JvmTestBuilder.create(new TestState(temp))));
+      }
+      if (filter.test(DesugarTestConfiguration.D8_CF)) {
+        builders.add(
+            new Pair<>(
+                DesugarTestConfiguration.D8_CF,
+                D8TestBuilder.create(new TestState(temp), Backend.CF)
+                    .setMinApi(parameters)
+                    .addOptionsModification(optionsModification)));
+      }
+    } else {
+      assert parameters.isDexRuntime();
+      assumeTrue(
+          parameters.getPartialCompilationTestParameters().isNone()
+              || parameters.getPartialCompilationTestParameters().isExcludeAll());
+      if (parameters.getPartialCompilationTestParameters().isNone()) {
+        if (filter.test(DesugarTestConfiguration.D8_DEX)) {
+          builders.add(
+              new Pair<>(
+                  DesugarTestConfiguration.D8_DEX,
+                  D8TestBuilder.create(new TestState(temp), Backend.DEX)
+                      .setMinApi(parameters)
+                      .addOptionsModification(optionsModification)));
+        }
+        if (filter.test(DesugarTestConfiguration.D8_CF_D8_DEX)) {
+          builders.add(
+              new Pair<>(
+                  DesugarTestConfiguration.D8_CF_D8_DEX,
+                  IntermediateCfD8TestBuilder.create(new TestState(temp), parameters.getApiLevel())
+                      .addOptionsModification(optionsModification)));
+        }
+      } else {
+        assert parameters.getPartialCompilationTestParameters().isExcludeAll();
+        if (filter.test(DesugarTestConfiguration.R8_PARTIAL_EXCLUDE_DEX)) {
+          assert optionsModification == null;
+          builders.add(
+              new Pair<>(
+                  DesugarTestConfiguration.R8_PARTIAL_EXCLUDE_DEX,
+                  R8PartialTestBuilder.create(new TestState(temp)).setMinApi(parameters)));
+        }
+      }
+    }
+    return DesugarTestBuilder.create(null, builders.build());
+  }
+
+  /** @deprecated use {@link #testForProguard(ProguardVersion)} instead. */
+  @Deprecated
+  public ProguardTestBuilder testForProguard() {
+    return testForProguard(ProguardVersion.V7_0_0);
+  }
+
+  public ProguardTestBuilder testForProguard(ProguardVersion version) {
+    return testForProguard(version, temp);
+  }
+
+  public GenerateMainDexListTestBuilder testForMainDexListGenerator() {
+    return testForMainDexListGenerator(temp);
+  }
+
+  public TraceReferencesTestBuilder testForTraceReferences() {
+    return testForTraceReferences(temp);
+  }
+
+  public static TraceReferencesTestBuilder testForTraceReferences(TemporaryFolder temp) {
+    return new TraceReferencesTestBuilder(new TestState(temp));
+  }
+
+  public JavaCompilerTool javac(CfRuntime jdk) {
+    return JavaCompilerTool.create(jdk, temp);
+  }
+
+  public static JavaCompilerTool javac(CfRuntime jdk, TemporaryFolder temp) {
+    return JavaCompilerTool.create(jdk, temp);
+  }
+
+  public static KotlinCompilerTool kotlinc(
+      CfRuntime jdk,
+      TemporaryFolder temp,
+      KotlinCompiler kotlinCompiler,
+      KotlinTargetVersion kotlinTargetVersion,
+      KotlinLambdaGeneration lambdaGeneration) {
+    // TODO(b/227161720): Kotlinc fails to run on JDK17.
+    if (jdk.isNewerThanOrEqual(CfVm.JDK17)) {
+      jdk = TestRuntime.getCheckedInJdk9();
+    }
+    return KotlinCompilerTool.create(
+        jdk, temp, kotlinCompiler, kotlinTargetVersion, lambdaGeneration);
+  }
+
+  public static KotlinCompilerTool kotlinc(
+      CfRuntime jdk,
+      KotlinCompiler kotlinCompiler,
+      KotlinTargetVersion kotlinTargetVersion,
+      KotlinLambdaGeneration lambdaGeneration) {
+    // TODO(b/227161720): Kotlinc fails to run on JDK17.
+    if (jdk.isNewerThanOrEqual(CfVm.JDK17)) {
+      jdk = TestRuntime.getCheckedInJdk9();
+    }
+    return KotlinCompilerTool.create(
+        jdk, staticTemp, kotlinCompiler, kotlinTargetVersion, lambdaGeneration);
+  }
+
+  public static KotlinCompilerTool kotlinc(
+      KotlinCompiler kotlinCompiler,
+      KotlinTargetVersion kotlinTargetVersion,
+      KotlinLambdaGeneration kotlinLambdaGeneration) {
+    return kotlinc(
+        TestRuntime.getCheckedInJdk9(),
+        staticTemp,
+        kotlinCompiler,
+        kotlinTargetVersion,
+        kotlinLambdaGeneration);
+  }
+
+  public KotlinCompilerTool kotlinc(CfRuntime jdk, KotlinTestParameters testParameters) {
+    // TODO(b/227161720): Kotlinc fails to run on JDK17.
+    if (jdk.isNewerThanOrEqual(CfVm.JDK17)) {
+      jdk = TestRuntime.getCheckedInJdk9();
+    }
+    return kotlinc(
+        jdk,
+        temp,
+        testParameters.getCompiler(),
+        testParameters.getTargetVersion(),
+        testParameters.getLambdaGeneration());
+  }
+
+  public static ClassFileTransformer transformer(Class<?> clazz) {
+    return ClassFileTransformer.create(clazz);
+  }
+
+  public static ClassFileTransformer transformer(Path path, ClassReference classReference)
+      throws IOException {
+    return ClassFileTransformer.create(Files.readAllBytes(path), classReference);
+  }
+
+  public static ClassFileTransformer transformer(byte[] bytes, ClassReference classReference) {
+    return ClassFileTransformer.create(bytes, classReference);
+  }
+
+  // Actually running Proguard should only be during development.
+  private static final boolean RUN_PROGUARD = System.getProperty("run_proguard") != null;
+
+  @Rule public ExpectedException thrown = ExpectedException.none();
+
+  @Rule
+  public TemporaryFolder temp = ToolHelper.getTemporaryFolderForTest();
+
+  @TempDir public Path tempDirJUnit5;
+
+  public Path getTempFolder() {
+    if (tempDirJUnit5 != null) {
+      return tempDirJUnit5;
+    }
+    return temp.getRoot().toPath();
+  }
+
+  public File getNewTempFile(String prefix, String suffix) throws IOException {
+    if (tempDirJUnit5 != null) {
+      return Files.createTempFile(tempDirJUnit5, prefix, suffix).toFile();
+    }
+    return File.createTempFile(prefix, suffix, temp.getRoot());
+  }
+
+  @Rule
+  public TestDescriptionWatcher watcher = new TestDescriptionWatcher();
+
+  private static TemporaryFolder staticTemp = null;
+
+  @BeforeClass
+  @BeforeAll
+  public static void testBaseBeforeClassSetup() throws IOException {
+    assert staticTemp == null;
+    staticTemp = ToolHelper.getTemporaryFolderForTest();
+    staticTemp.create();
+  }
+
+  @AfterClass
+  @AfterAll
+  public static void testBaseBeforeClassTearDown() {
+    assert staticTemp != null;
+    staticTemp.delete();
+    staticTemp = null;
+  }
+
+  public static TemporaryFolder getStaticTemp() {
+    return staticTemp;
+  }
+
+  public static TestParametersBuilder getTestParameters() {
+    return TestParameters.builder();
+  }
+
+  public static KotlinTestParameters.Builder getKotlinTestParameters() {
+    return KotlinTestParameters.builder();
+  }
+
+  public static <S, T, E extends Throwable> Function<S, T> memoizeFunction(
+      ThrowingFunction<S, T, E> fn) {
+    return CacheBuilder.newBuilder()
+        .build(
+            CacheLoader.from(
+                b -> {
+                  try {
+                    return fn.applyWithRuntimeException(b);
+                  } catch (Throwable e) {
+                    throw new RuntimeException(e);
+                  }
+                }));
+  }
+
+  public static <S, T, U, E extends Throwable> BiFunction<S, T, U> memoizeBiFunction(
+      ThrowingBiFunction<S, T, U, E> fn) {
+    class Pair {
+      final S first;
+      final T second;
+
+      public Pair(S first, T second) {
+        this.first = first;
+        this.second = second;
+      }
+
+      @Override
+      public boolean equals(Object obj) {
+        if (!(obj instanceof Pair)) {
+          return false;
+        }
+        Pair other = (Pair) obj;
+        return Objects.equals(first, other.first) && Objects.equals(second, other.second);
+      }
+
+      @Override
+      public int hashCode() {
+        return Objects.hash(first, second);
+      }
+    }
+    final Function<Pair, U> memoizedFn = memoizeFunction(pair -> fn.apply(pair.first, pair.second));
+    return (a, b) -> memoizedFn.apply(new Pair(a, b));
+  }
+
+  /**
+   * Check if tests should also run Proguard when applicable.
+   */
+  protected boolean isRunProguard() {
+    return RUN_PROGUARD;
+  }
+
+  /**
+   * Write lines of text to a temporary file.
+   *
+   * The file will include a line separator after the last line.
+   */
+  protected Path writeTextToTempFile(String... lines) throws IOException {
+    return writeTextToTempFile(System.lineSeparator(), Arrays.asList(lines));
+  }
+
+  /**
+   * Write lines of text to a temporary file, along with the specified line separator.
+   *
+   * The file will include a line separator after the last line.
+   */
+  protected Path writeTextToTempFile(String lineSeparator, List<String> lines)
+      throws IOException {
+    return writeTextToTempFile(lineSeparator, lines, true);
+  }
+
+  /**
+   * Write lines of text to a temporary file, along with the specified line separator.
+   *
+   * The argument <code>includeTerminatingLineSeparator</code> control if the file will include
+   * a line separator after the last line.
+   */
+  protected Path writeTextToTempFile(
+      String lineSeparator, List<String> lines, boolean includeTerminatingLineSeparator)
+      throws IOException {
+    Path file = getNewTempFile("junit", ".tmp").toPath();
+    writeTextToTempFile(file, lineSeparator, lines, includeTerminatingLineSeparator);
+    return file;
+  }
+
+  protected void writeTextToTempFile(
+      Path file,
+      String lineSeparator,
+      List<String> lines,
+      boolean includeTerminatingLineSeparator)
+      throws IOException {
+    String contents = String.join(lineSeparator, lines);
+    if (includeTerminatingLineSeparator) {
+      contents += lineSeparator;
+    }
+    Files.write(file, contents.getBytes(StandardCharsets.UTF_8));
+  }
+
+  /** Build an AndroidApp with the specified test classes as byte array. */
+  @Deprecated
+  protected AndroidApp buildAndroidApp(byte[]... classes) {
+    return buildAndroidApp(Arrays.asList(classes));
+  }
+
+  /** Build an AndroidApp with the specified test classes as byte array. */
+  @Deprecated
+  protected AndroidApp buildAndroidApp(List<byte[]> classes) {
+    AndroidApp.Builder builder = AndroidApp.builder();
+    for (byte[] clazz : classes) {
+      builder.addClassProgramData(clazz, Origin.unknown());
+    }
+    builder.addLibraryFiles(ToolHelper.getAndroidJar(AndroidApiLevel.N.getLevel()));
+    return builder.build();
+  }
+
+  /**
+   * Build an AndroidApp with the specified jar.
+   */
+  protected AndroidApp readJar(Path jar) {
+    return AndroidApp.builder()
+        .addProgramResourceProvider(ArchiveProgramResourceProvider.fromArchive(jar))
+        .build();
+  }
+
+  @Deprecated
+  protected List<String> classNamesFromDexFile(Path dexFile) throws IOException {
+    return new CodeInspector(dexFile)
+        .allClasses().stream().map(FoundClassSubject::toString).collect(Collectors.toList());
+  }
+
+  /** Build an AndroidApp with the specified test classes. */
+  @Deprecated
+  protected static AndroidApp readClasses(Class... classes) throws IOException {
+    return readClasses(Arrays.asList(classes));
+  }
+
+  /** Build an AndroidApp with the specified test classes. */
+  @Deprecated
+  protected static AndroidApp readClasses(List<Class<?>> classes) throws IOException {
+    return readClasses(classes, Collections.emptyList());
+  }
+
+  /** Build an AndroidApp with the specified test classes. */
+  @Deprecated
+  protected static AndroidApp readClasses(
+      List<Class<?>> programClasses, List<Class<?>> libraryClasses) throws IOException {
+    return buildClasses(programClasses, libraryClasses).build();
+  }
+
+  @Deprecated
+  protected static AndroidApp readClasses(
+      List<Class<?>> programClasses, List<Class<?>> classpathClasses, List<Class<?>> libraryClasses)
+      throws IOException {
+    return buildClasses(programClasses, classpathClasses, libraryClasses).build();
+  }
+
+  @Deprecated
+  protected static AndroidApp.Builder buildClasses(Class<?>... programClasses) throws IOException {
+    return buildClasses(Arrays.asList(programClasses));
+  }
+
+  @Deprecated
+  protected static AndroidApp.Builder buildClasses(Collection<Class<?>> programClasses)
+      throws IOException {
+    return buildClasses(programClasses, Collections.emptyList());
+  }
+
+  @Deprecated
+  protected static AndroidApp.Builder buildClassesWithTestingAnnotations(Class<?>... programClasses)
+      throws IOException {
+    return buildClassesWithTestingAnnotations(Arrays.asList(programClasses));
+  }
+
+  @Deprecated
+  protected static AndroidApp.Builder buildClassesWithTestingAnnotations(
+      Collection<Class<?>> programClasses) throws IOException {
+    AndroidApp.Builder builder = buildClasses(programClasses, Collections.emptyList());
+    for (Class<?> testingAnnotation : getTestingAnnotations()) {
+      builder.addProgramFile(ToolHelper.getClassFileForTestClass(testingAnnotation));
+    }
+    return builder;
+  }
+
+  @Deprecated
+  protected static AndroidApp.Builder buildClasses(
+      Collection<Class<?>> programClasses, Collection<Class<?>> libraryClasses) throws IOException {
+    return buildClasses(programClasses, Collections.emptyList(), libraryClasses);
+  }
+
+  @Deprecated
+  protected static AndroidApp.Builder buildClasses(
+      Collection<Class<?>> programClasses,
+      Collection<Class<?>> classpathClasses,
+      Collection<Class<?>> libraryClasses)
+      throws IOException {
+    AndroidApp.Builder builder = AndroidApp.builder();
+    for (Class<?> clazz : programClasses) {
+      builder.addProgramFiles(ToolHelper.getClassFileForTestClass(clazz));
+    }
+    if (!classpathClasses.isEmpty()) {
+      builder.addClasspathResourceProvider(getClassFileProvider(classpathClasses));
+    }
+    if (!libraryClasses.isEmpty()) {
+      builder.addLibraryResourceProvider(getClassFileProvider(libraryClasses));
+    }
+    return builder;
+  }
+
+  private static PreloadedClassFileProvider getClassFileProvider(Collection<Class<?>> classes)
+      throws IOException {
+    PreloadedClassFileProvider.Builder providerBuilder = PreloadedClassFileProvider.builder();
+    for (Class<?> clazz : classes) {
+      Path file = ToolHelper.getClassFileForTestClass(clazz);
+      providerBuilder.addResource(
+          DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName()), Files.readAllBytes(file));
+    }
+    return providerBuilder.build();
+  }
+
+  protected static AndroidApp.Builder buildInnerClasses(Class<?> clazz) throws IOException {
+    AndroidApp.Builder builder = AndroidApp.builder();
+    builder.addProgramFiles(ToolHelper.getClassFilesForInnerClasses(clazz));
+    return builder;
+  }
+
+  protected static AndroidApp readClassesAndRuntimeJar(
+      List<Class<?>> programClasses, Backend backend) {
+    AndroidApp.Builder builder = AndroidApp.builder();
+    for (Class<?> clazz : programClasses) {
+      builder.addProgramFiles(ToolHelper.getClassFileForTestClass(clazz));
+    }
+    if (backend == Backend.DEX) {
+      AndroidApiLevel androidLibrary = ToolHelper.getMinApiLevelForDexVm();
+      builder.addLibraryFiles(ToolHelper.getAndroidJar(androidLibrary));
+    } else {
+      assert backend == Backend.CF;
+      builder.addLibraryFiles(ToolHelper.getJava8RuntimeJar());
+    }
+    return builder.build();
+  }
+
+  /** Build an AndroidApp from the specified program files. */
+  @Deprecated
+  protected AndroidApp readProgramFiles(Path... programFiles) {
+    return AndroidApp.builder().addProgramFiles(programFiles).build();
+  }
+
+  /**
+   * Copy test classes to the specified directory.
+   */
+  protected void copyTestClasses(Path dest, Class... classes) throws IOException {
+    for (Class<?> clazz : classes) {
+      Path path = dest.resolve(clazz.getCanonicalName().replace('.', '/') + ".class");
+      Files.createDirectories(path.getParent());
+      Files.copy(ToolHelper.getClassFileForTestClass(clazz), path);
+    }
+  }
+
+  /** Create a temporary JAR file containing the specified test classes. */
+  protected Path jarTestClasses(Class<?>... classes) throws IOException {
+    return jarTestClasses(Arrays.asList(classes), null);
+  }
+
+  /** Create a temporary JAR file containing the specified test classes and data resources. */
+  protected Path jarTestClasses(Iterable<Class<?>> classes, List<DataResource> dataResources)
+      throws IOException {
+    Path jar = getNewTempFile("junit", ".jar").toPath();
+    try (ZipOutputStream out = new ZipOutputStream(new FileOutputStream(jar.toFile()))) {
+      addTestClassesToZip(out, classes);
+      if (dataResources != null) {
+        addDataResourcesToJar(out, dataResources);
+      }
+    }
+    return jar;
+  }
+
+  /** Create a temporary JAR file containing the specified test classes. */
+  protected void addTestClassesToZip(ZipOutputStream out, Iterable<Class<?>> classes)
+      throws IOException {
+    for (Class<?> clazz : classes) {
+      try (FileInputStream in =
+          new FileInputStream(ToolHelper.getClassFileForTestClass(clazz).toFile())) {
+        out.putNextEntry(new ZipEntry(ToolHelper.getJarEntryForTestClass(clazz)));
+        ByteStreams.copy(in, out);
+        out.closeEntry();
+      }
+    }
+  }
+
+  /** Create a temporary JAR file containing the specified data resources. */
+  protected void addDataResourcesToJar(
+      ZipOutputStream out, List<? extends DataResource> dataResources) throws IOException {
+    try {
+      for (DataResource dataResource : dataResources) {
+        String name = dataResource.getName();
+        boolean isDirectory = dataResource instanceof DataDirectoryResource;
+        if (isDirectory && !name.endsWith("/")) {
+          // Directory entries must end with a slash. Otherwise they will be empty files.
+          name += "/";
+        }
+        out.putNextEntry(new ZipEntry(name));
+        if (!isDirectory) {
+          ByteStreams.copy(((DataEntryResource) dataResource).getByteStream(), out);
+        }
+        out.closeEntry();
+      }
+    } catch (ResourceException e) {
+      throw new IOException("Resource error", e);
+    }
+  }
+
+  private static LazyLoadedDexApplication readApplicationForDexOutput(
+      AndroidApp app, InternalOptions options) throws Exception {
+    assert options.programConsumer == null;
+    options.programConsumer = DexIndexedConsumer.emptyConsumer();
+    return new ApplicationReader(app, options, Timing.empty()).read();
+  }
+
+  protected static AppView<AppInfo> computeAppView(AndroidApp app) throws Exception {
+    return computeAppView(app, new InternalOptions());
+  }
+
+  protected static AppView<AppInfo> computeAppView(AndroidApp app, InternalOptions options)
+      throws Exception {
+    AppInfo appInfo =
+        AppInfo.createInitialAppInfo(
+            readApplicationForDexOutput(app, options),
+            GlobalSyntheticsStrategy.forNonSynthesizing());
+    return AppView.createForD8(appInfo);
+  }
+
+  protected static AppInfoWithClassHierarchy computeAppInfoWithClassHierarchy(AndroidApp app)
+      throws Exception {
+    return AppInfoWithClassHierarchy.createInitialAppInfoWithClassHierarchy(
+        readApplicationForDexOutput(app, new InternalOptions()),
+        ClassToFeatureSplitMap.createEmptyClassToFeatureSplitMap(),
+        MainDexInfo.none(),
+        GlobalSyntheticsStrategy.forSingleOutputMode());
+  }
+
+  protected static AppView<AppInfoWithClassHierarchy> computeAppViewWithClassHierarchy(
+      AndroidApp app, Timing timing) throws Exception {
+    return computeAppViewWithClassHierarchy(app, timing, null);
+  }
+
+  protected static AppView<AppInfoWithClassHierarchy> computeAppViewWithClassHierarchy(
+      AndroidApp app, Timing timing, Function<DexItemFactory, ProguardConfiguration> keepConfig)
+      throws Exception {
+    return computeAppViewWithClassHierarchy(app, timing, keepConfig, null);
+  }
+
+  protected static AppView<AppInfoWithClassHierarchy> computeAppViewWithClassHierarchy(
+      AndroidApp app,
+      Timing timing,
+      Function<DexItemFactory, ProguardConfiguration> keepConfig,
+      Consumer<InternalOptions> optionsConsumer)
+      throws Exception {
+    DexItemFactory dexItemFactory = new DexItemFactory();
+    if (keepConfig == null) {
+      keepConfig =
+          factory -> {
+            ProguardConfiguration.Builder builder =
+                ProguardConfiguration.builder(factory, new Reporter());
+            builder.addRule(ProguardKeepRule.defaultKeepAllRule(unused -> {}), null, null);
+            return builder
+                .addKeepAttributePatterns(ImmutableList.of(ProguardKeepAttributes.SIGNATURE))
+                .buildForTesting();
+          };
+    }
+    InternalOptions options =
+        new InternalOptions(
+            CompilationMode.RELEASE, keepConfig.apply(dexItemFactory), new Reporter());
+    if (optionsConsumer != null) {
+      optionsConsumer.accept(options);
+    }
+    LazyLoadedDexApplication dexApplication = readApplicationForDexOutput(app, options);
+    AppView<AppInfoWithClassHierarchy> appView =
+        AppView.createForR8(dexApplication.toDirectSingleThreadedForTesting(timing));
+    appView.setAppServices(AppServices.builder(appView).build());
+    return appView;
+  }
+
+  protected static AppView<AppInfoWithLiveness> computeAppViewWithLiveness(
+      AndroidApp app, Timing timing) throws Exception {
+    return TestAppViewBuilder.builder()
+        .addAndroidApp(app)
+        .addKeepAllRule()
+        .buildWithLiveness(timing);
+  }
+
+  protected static AppView<AppInfoWithLiveness> computeAppViewWithLiveness(
+      AndroidApp app, Timing timing, Class<?> mainClass) throws Exception {
+    return TestAppViewBuilder.builder()
+        .addAndroidApp(app)
+        .addKeepMainRule(mainClass)
+        .buildWithLiveness(timing);
+  }
+
+  // We should try to get rid of this usage of keep rule building which is very internal.
+  protected static AppView<AppInfoWithLiveness> computeAppViewWithLiveness(
+      AndroidApp app, Timing timing, Function<DexItemFactory, ProguardConfiguration> keepConfig)
+      throws Exception {
+    return computeAppViewWithLiveness(app, timing, keepConfig, null);
+  }
+
+  protected static AppView<AppInfoWithLiveness> computeAppViewWithLiveness(
+      AndroidApp app,
+      Timing timing,
+      Function<DexItemFactory, ProguardConfiguration> keepConfig,
+      Consumer<InternalOptions> optionsConsumer)
+      throws Exception {
+    AppView<AppInfoWithClassHierarchy> appView =
+        computeAppViewWithClassHierarchy(app, timing, keepConfig, optionsConsumer);
+    // Run the tree shaker to compute an instance of AppInfoWithLiveness.
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    ProfileCollectionAdditions profileCollectionAdditions = ProfileCollectionAdditions.nop();
+    RootSet rootSet =
+        RootSet.builder(
+                appView,
+                ImmediateAppSubtypingInfo.create(appView),
+                appView.options().getProguardConfiguration().getRules())
+            .evaluateRulesAndBuild(executor, Timing.empty());
+    appView.setRootSet(rootSet);
+    appView.rebuildAppInfo(Timing.empty());
+    EnqueuerResult enqueuerResult =
+        EnqueuerFactory.createForInitialTreeShaking(
+                appView,
+                profileCollectionAdditions,
+                executor,
+                ImmediateAppSubtypingInfo.create(appView))
+            .traceApplication(rootSet, executor, Timing.empty());
+    executor.shutdown();
+    // We do not run the tree pruner to ensure that the hierarchy is as designed and not modified
+    // due to liveness.
+    return appView.setAppInfo(enqueuerResult.getAppInfo());
+  }
+
+  protected static DexType buildType(Class<?> clazz, DexItemFactory factory) {
+    return buildType(Reference.classFromClass(clazz), factory);
+  }
+
+  protected static DexType buildType(TypeReference type, DexItemFactory factory) {
+    return factory.createType(type.getDescriptor());
+  }
+
+  protected static DexField buildField(FieldReference field, DexItemFactory factory) {
+    return factory.createField(
+        buildType(field.getHolderClass(), factory),
+        buildType(field.getFieldType(), factory),
+        field.getFieldName());
+  }
+
+  protected static DexMethod buildMethod(Method method, DexItemFactory factory) {
+    return buildMethod(Reference.methodFromMethod(method), factory);
+  }
+
+  protected static DexMethod buildMethod(MethodReference method, DexItemFactory factory) {
+    return factory.createMethod(
+        buildType(method.getHolderClass(), factory),
+        buildProto(method.getReturnType(), method.getFormalTypes(), factory),
+        method.getMethodName());
+  }
+
+  protected static DexMethod buildNullaryVoidMethod(
+      Class<?> clazz, String name, DexItemFactory factory) {
+    return buildMethod(
+        Reference.method(Reference.classFromClass(clazz), name, Collections.emptyList(), null),
+        factory);
+  }
+
+  protected static DexProto buildProto(
+      TypeReference returnType, List<TypeReference> formalTypes, DexItemFactory factory) {
+    return factory.createProto(
+        returnType == null ? factory.voidType : buildType(returnType, factory),
+        ListUtils.map(formalTypes, type -> buildType(type, factory)));
+  }
+
+  protected static List<ProguardConfigurationRule> buildKeepRuleForClass(
+      Class<?> clazz, DexItemFactory factory) {
+    Builder keepRuleBuilder = ProguardKeepRule.builder();
+    keepRuleBuilder.setSource("buildKeepRuleForClass " + clazz.getTypeName());
+    keepRuleBuilder.setType(ProguardKeepRuleType.KEEP);
+    keepRuleBuilder.setClassType(ProguardClassType.CLASS);
+    keepRuleBuilder.setClassNames(
+        ProguardClassNameList.singletonList(
+            ProguardTypeMatcher.create(
+                factory.createType(DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName())))));
+    return Collections.singletonList(keepRuleBuilder.build());
+  }
+
+  protected static List<ProguardConfigurationRule> buildKeepRuleForClassAndMethods(
+      Class<?> clazz, DexItemFactory factory) {
+    Builder keepRuleBuilder = ProguardKeepRule.builder();
+    keepRuleBuilder.setSource("buildKeepRuleForClassAndMethods " + clazz.getTypeName());
+    keepRuleBuilder.setType(ProguardKeepRuleType.KEEP);
+    keepRuleBuilder.setClassType(ProguardClassType.CLASS);
+    keepRuleBuilder.setClassNames(
+        ProguardClassNameList.singletonList(
+            ProguardTypeMatcher.create(
+                factory.createType(DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName())))));
+    keepRuleBuilder.setMemberRules(
+        Lists.newArrayList(
+            ProguardMemberRule.builder().setRuleType(ProguardMemberType.ALL_METHODS).build()));
+    return Collections.singletonList(keepRuleBuilder.build());
+  }
+
+  protected static ProguardConfiguration buildConfigForRules(
+      DexItemFactory factory, Collection<ProguardConfigurationRule> rules) {
+    return buildConfigForRules(factory, new Reporter(), rules);
+  }
+
+  protected static ProguardConfiguration buildConfigForRules(
+      DexItemFactory factory, Reporter reporter, Collection<ProguardConfigurationRule> rules) {
+    ProguardConfiguration.Builder builder = ProguardConfiguration.builder(factory, reporter);
+    rules.forEach(rule -> builder.addRule(rule, null, null));
+    return builder.buildForTesting();
+  }
+
+  public static List<DataEntryResource> getDataResources(DataResourceProvider dataResourceProvider)
+      throws ResourceException {
+    List<DataEntryResource> dataResources = new ArrayList<>();
+    if (dataResourceProvider != null) {
+      dataResourceProvider.accept(
+          new Visitor() {
+            @Override
+            public void visit(DataDirectoryResource directory) {}
+
+            @Override
+            public void visit(DataEntryResource file) {
+              dataResources.add(file);
+            }
+          });
+    }
+    return dataResources;
+  }
+
+  @Deprecated
+  protected static Path getFileInTest(String folder, String fileName) {
+    return Paths.get(ToolHelper.TESTS_DIR, "java", folder, fileName);
+  }
+
+  /** Create a temporary JAR file containing the specified test classes. */
+  protected Path jarTestClasses(List<Class<?>> classes) throws IOException {
+    return jarTestClasses(classes.toArray(new Class<?>[]{}));
+  }
+
+  protected static List<Object[]> buildParameters(Object... arraysOrIterables) {
+    assertTrue(arraysOrIterables.length > 1);
+    Function<Object, List<Object>> arrayOrIterableToList =
+        arrayOrIterable -> {
+          if (arrayOrIterable.getClass().isArray()) {
+            Object[] array = (Object[]) arrayOrIterable;
+            return Arrays.asList(array);
+          } else {
+            assert arrayOrIterable instanceof Iterable<?>;
+            Iterable<?> iterable = (Iterable) arrayOrIterable;
+            return ImmutableList.builder().addAll(iterable).build();
+          }
+        };
+    List<List<Object>> lists =
+        Arrays.stream(arraysOrIterables).map(arrayOrIterableToList).collect(Collectors.toList());
+    return cartesianProduct(lists).stream().map(List::toArray).collect(Collectors.toList());
+  }
+
+  /** Compile an application with D8. */
+  @Deprecated
+  protected AndroidApp compileWithD8(AndroidApp app) throws CompilationFailedException {
+    D8Command.Builder builder = ToolHelper.prepareD8CommandBuilder(app);
+    AndroidAppConsumers appSink = new AndroidAppConsumers(builder);
+    D8.run(builder.build());
+    return appSink.build();
+  }
+
+  /** Compile an application with D8. */
+  @Deprecated
+  protected AndroidApp compileWithD8(AndroidApp app, Consumer<InternalOptions> optionsConsumer)
+      throws CompilationFailedException {
+    return ToolHelper.runD8(app, optionsConsumer);
+  }
+
+  /** Compile an application with R8. */
+  @Deprecated
+  protected AndroidApp compileWithR8(Class... classes)
+      throws IOException, CompilationFailedException {
+    return ToolHelper.runR8(readClasses(classes));
+  }
+
+  /** Compile an application with R8. */
+  @Deprecated
+  protected AndroidApp compileWithR8(List<Class<?>> classes)
+      throws IOException, CompilationFailedException {
+    R8Command command = ToolHelper.prepareR8CommandBuilder(readClasses(classes)).build();
+    return ToolHelper.runR8(command);
+  }
+
+  /** Compile an application with R8. */
+  @Deprecated
+  protected AndroidApp compileWithR8(
+      List<Class<?>> classes, Consumer<InternalOptions> optionsConsumer)
+      throws IOException, CompilationFailedException {
+    R8Command command = ToolHelper.prepareR8CommandBuilder(readClasses(classes)).build();
+    return ToolHelper.runR8(command, optionsConsumer);
+  }
+
+  /** Compile an application with R8. */
+  @Deprecated
+  protected AndroidApp compileWithR8(AndroidApp app) throws CompilationFailedException {
+    R8Command command = ToolHelper.prepareR8CommandBuilder(app).build();
+    return ToolHelper.runR8(command);
+  }
+
+  /** Compile an application with R8. */
+  @Deprecated
+  protected AndroidApp compileWithR8(AndroidApp app, Consumer<InternalOptions> optionsConsumer)
+      throws CompilationFailedException {
+    R8Command command = ToolHelper.prepareR8CommandBuilder(app)
+        .setDisableTreeShaking(true)
+        .setDisableMinification(true)
+        .addProguardConfiguration(ImmutableList.of("-keepattributes *"), Origin.unknown())
+        .build();
+
+    return ToolHelper.runR8(command, optionsConsumer);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration. */
+  @Deprecated
+  protected AndroidApp compileWithR8(List<Class<?>> classes, String proguardConfig)
+      throws IOException, CompilationFailedException {
+    return compileWithR8(readClasses(classes), proguardConfig);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration. */
+  @Deprecated
+  protected AndroidApp compileWithR8(
+      List<Class<?>> classes, String proguardConfig, Consumer<InternalOptions> optionsConsumer)
+      throws IOException, CompilationFailedException {
+    return compileWithR8(readClasses(classes), proguardConfig, optionsConsumer);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration. */
+  @Deprecated
+  protected AndroidApp compileWithR8(List<Class<?>> classes, Path proguardConfig)
+      throws IOException, CompilationFailedException {
+    return compileWithR8(readClasses(classes), proguardConfig);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration. */
+  @Deprecated
+  protected AndroidApp compileWithR8(AndroidApp app, Path proguardConfig)
+      throws CompilationFailedException {
+    R8Command command =
+        ToolHelper.prepareR8CommandBuilder(app)
+            .addProguardConfigurationFiles(proguardConfig)
+            .build();
+    return ToolHelper.runR8(command);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration. */
+  @Deprecated
+  protected AndroidApp compileWithR8(AndroidApp app, String proguardConfig)
+      throws CompilationFailedException {
+    return compileWithR8(app, proguardConfig, null, Backend.DEX);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration. */
+  @Deprecated
+  protected AndroidApp compileWithR8(AndroidApp app, String proguardConfig, Backend backend)
+      throws CompilationFailedException {
+    return compileWithR8(app, proguardConfig, null, backend);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration. */
+  @Deprecated
+  protected AndroidApp compileWithR8(
+      AndroidApp app, String proguardConfig, Consumer<InternalOptions> optionsConsumer)
+      throws CompilationFailedException {
+    return compileWithR8(app, proguardConfig, optionsConsumer, Backend.DEX);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration and backend. */
+  @Deprecated
+  protected AndroidApp compileWithR8(
+      AndroidApp app,
+      String proguardConfig,
+      Consumer<InternalOptions> optionsConsumer,
+      Backend backend)
+      throws CompilationFailedException {
+    R8Command command =
+        ToolHelper.prepareR8CommandBuilder(app, emptyConsumer(backend))
+            .addProguardConfiguration(ImmutableList.of(proguardConfig), Origin.unknown())
+            .addLibraryFiles(runtimeJar(backend))
+            .build();
+    return ToolHelper.runR8(command, optionsConsumer);
+  }
+
+  /** Compile an application with R8 using the supplied proguard configuration. */
+  @Deprecated
+  protected AndroidApp compileWithR8(
+      AndroidApp app, Path proguardConfig, Consumer<InternalOptions> optionsConsumer)
+      throws CompilationFailedException {
+    R8Command command =
+        ToolHelper.prepareR8CommandBuilder(app)
+            .addProguardConfigurationFiles(proguardConfig)
+            .build();
+    return ToolHelper.runR8(command, optionsConsumer);
+  }
+
+  /**
+   * Generate a Proguard configuration for keeping the "static void main(String[])" method of the
+   * specified class.
+   */
+  @Deprecated
+  public static String keepMainProguardConfiguration(Class<?> clazz) {
+    return keepMainProguardConfiguration(clazz.getTypeName());
+  }
+
+  /**
+   * Generate a Proguard configuration for keeping the "static void main(String[])" method of the
+   * specified class.
+   */
+  @Deprecated
+  public static String keepMainProguardConfiguration(Class<?> clazz, List<String> additionalLines) {
+    return keepMainProguardConfiguration(clazz.getTypeName()) + StringUtils.lines(additionalLines);
+  }
+
+  /**
+   * Generate a Proguard configuration for keeping the "public static void main(String[])" method of
+   * the specified class.
+   *
+   * <p>The class is assumed to be public.
+   */
+  @Deprecated
+  public static String keepMainProguardConfiguration(String clazz) {
+    return StringUtils.lines(
+        "-keep class " + clazz + " {", "  public static void main(java.lang.String[]);", "}");
+  }
+
+  @Deprecated
+  public static String noShrinkingNoMinificationProguardConfiguration() {
+    return StringUtils.lines("-dontshrink", "-dontobfuscate");
+  }
+
+  /**
+   * Generate a Proguard configuration for keeping the "static void main(String[])" method of the
+   * specified class and specify if -allowaccessmodification and -dontobfuscate are added as well.
+   */
+  @Deprecated
+  public static String keepMainProguardConfiguration(
+      Class<?> clazz, boolean allowaccessmodification, boolean obfuscate) {
+    return keepMainProguardConfiguration(clazz)
+        + (allowaccessmodification ? "-allowaccessmodification\n" : "")
+        + (obfuscate ? "-printmapping\n" : "-dontobfuscate\n");
+  }
+
+  @Deprecated
+  public static String keepMainProguardConfiguration(
+      String clazz, boolean allowaccessmodification, boolean obfuscate) {
+    return keepMainProguardConfiguration(clazz)
+        + (allowaccessmodification ? "-allowaccessmodification\n" : "")
+        + (obfuscate ? "-printmapping\n" : "-dontobfuscate\n");
+  }
+
+  @Deprecated
+  private static String matchInterfaceRule(String name, Class matchInterface) {
+    return "-" + name + " @" + matchInterface.getTypeName() + " class *";
+  }
+
+  @Deprecated
+  public static String noVerticalClassMergingRule() {
+    return matchInterfaceRule(NoVerticalClassMergingRule.RULE_NAME, NoVerticalClassMerging.class);
+  }
+
+  @Deprecated
+  public static String noHorizontalClassMerging() {
+    return matchInterfaceRule(
+        NoHorizontalClassMergingRule.RULE_NAME, NoHorizontalClassMerging.class);
+  }
+
+  /** Run application on the specified version of Art with the specified main class. */
+  @Deprecated
+  protected ProcessResult runOnArtRaw(
+      AndroidApp app, String mainClass, Consumer<ArtCommandBuilder> cmdBuilder, DexVm version)
+      throws IOException {
+    Path out = getNewTempFile("junit", ".zip").toPath();
+    app.writeToZipForTesting(out, OutputMode.DexIndexed);
+    return ToolHelper.runArtRaw(
+        ImmutableList.of(out.toString()), mainClass, cmdBuilder, version, false);
+  }
+
+  /** Run application on Art with the specified main class. */
+  @Deprecated
+  protected ProcessResult runOnArtRaw(AndroidApp app, String mainClass) throws IOException {
+    return runOnArtRaw(app, mainClass, null, null);
+  }
+
+  /** Run application on Art with the specified main class. */
+  @Deprecated
+  protected ProcessResult runOnArtRaw(AndroidApp app, Class mainClass) throws IOException {
+    return runOnArtRaw(app, mainClass.getTypeName());
+  }
+
+  /** Run application on Art with the specified main class and provided arguments. */
+  @Deprecated
+  protected String runOnArt(AndroidApp app, Class mainClass, String... args) throws IOException {
+    return runOnArt(app, mainClass, Arrays.asList(args));
+  }
+
+  /**
+   * Run application on Art with the specified main class, provided arguments, and specified VM
+   * version.
+   */
+  @Deprecated
+  protected String runOnArt(AndroidApp app, String mainClass, List<String> args, DexVm dexVm)
+      throws IOException {
+    Path out = getNewTempFile("junit", ".zip").toPath();
+    app.writeToZipForTesting(out, OutputMode.DexIndexed);
+    return ToolHelper.runArtNoVerificationErrors(
+        ImmutableList.of(out.toString()), mainClass,
+        builder -> {
+          builder.appendArtOption("-ea");
+          for (String arg : args) {
+            builder.appendProgramArgument(arg);
+          }
+        },
+        dexVm);
+  }
+
+  /** Run application on Art with the specified main class and provided arguments. */
+  @Deprecated
+  protected String runOnArt(AndroidApp app, Class mainClass, List<String> args) throws IOException {
+    return runOnArt(app, mainClass.getCanonicalName(), args, null);
+  }
+
+  /** Run application on Art with the specified main class and provided arguments. */
+  @Deprecated
+  protected String runOnArt(AndroidApp app, String mainClass, String... args) throws IOException {
+    return runOnArt(app, mainClass, Arrays.asList(args), null);
+  }
+
+  /** Run a single class application on Java. */
+  @Deprecated
+  protected String runOnJava(Class mainClass) throws Exception {
+    ProcessResult result = ToolHelper.runJava(mainClass);
+    ToolHelper.failOnProcessFailure(result);
+    ToolHelper.failOnVerificationErrors(result);
+    return result.stdout;
+  }
+
+  /** Run application on Java with the specified main class and provided arguments. */
+  @Deprecated
+  protected String runOnJava(AndroidApp app, Class mainClass, String... args) throws IOException {
+    return runOnJava(app, mainClass, Arrays.asList(args));
+  }
+
+  /** Run application on Java with the specified main class and provided arguments. */
+  @Deprecated
+  protected String runOnJava(AndroidApp app, Class mainClass, List<String> args)
+      throws IOException {
+    return runOnJava(app, mainClass.getCanonicalName(), args);
+  }
+
+  /** Run application on Java with the specified main class and provided arguments. */
+  @Deprecated
+  protected String runOnJava(AndroidApp app, String mainClass, String... args) throws IOException {
+    return runOnJava(app, mainClass, Arrays.asList(args));
+  }
+
+  /** Run application on Java with the specified main class and provided arguments. */
+  @Deprecated
+  protected String runOnJava(AndroidApp app, String mainClass, List<String> args)
+      throws IOException {
+    ProcessResult result = runOnJavaRaw(app, mainClass, args);
+    ToolHelper.failOnProcessFailure(result);
+    ToolHelper.failOnVerificationErrors(result);
+    return result.stdout;
+  }
+
+  @Deprecated
+  protected ProcessResult runOnJavaRawNoVerify(String main, byte[]... classes) throws IOException {
+    return runOnJavaRawNoVerify(main, Arrays.asList(classes), Collections.emptyList());
+  }
+
+  @Deprecated
+  protected ProcessResult runOnJavaRawNoVerify(String main, List<byte[]> classes, List<String> args)
+      throws IOException {
+    return ToolHelper.runJavaNoVerify(Collections.singletonList(writeToJar(classes)), main, args);
+  }
+
+  @Deprecated
+  protected ProcessResult runOnJavaRaw(String main, byte[]... classes) throws IOException {
+    return runOnJavaRaw(main, Arrays.asList(classes), Collections.emptyList());
+  }
+
+  @Deprecated
+  protected ProcessResult runOnJavaRaw(String main, List<byte[]> classes, List<String> args)
+      throws IOException {
+    List<String> mainAndArgs = new ArrayList<>();
+    mainAndArgs.add(main);
+    mainAndArgs.addAll(args);
+    return ToolHelper.runJava(
+        Collections.singletonList(writeToJar(classes)),
+        mainAndArgs.toArray(StringUtils.EMPTY_ARRAY));
+  }
+
+  @Deprecated
+  protected ProcessResult runOnJavaRaw(AndroidApp app, String mainClass, List<String> args)
+      throws IOException {
+    Path out = getNewTempFile("junit", ".zip").toPath();
+    app.writeToZipForTesting(out, OutputMode.ClassFile);
+    List<String> mainAndArgs = new ArrayList<>();
+    mainAndArgs.add(mainClass);
+    mainAndArgs.addAll(args);
+    return ToolHelper.runJava(out, mainAndArgs.toArray(StringUtils.EMPTY_ARRAY));
+  }
+
+  /** Run application on Art or Java with the specified main class. */
+  @Deprecated
+  protected String runOnVM(AndroidApp app, String mainClass, Backend backend) throws IOException {
+    switch (backend) {
+      case CF:
+        return runOnJava(app, mainClass);
+      case DEX:
+        return runOnArt(app, mainClass);
+      default:
+        throw new Unreachable("Unexpected backend: " + backend);
+    }
+  }
+
+  protected static void writeClassesToJar(Path output, Collection<Class<?>> classes)
+      throws IOException {
+    ClassFileConsumer consumer = new ArchiveConsumer(output);
+    for (Class<?> clazz : classes) {
+      consumer.accept(
+          ByteDataView.of(Files.readAllBytes(ToolHelper.getClassFileForTestClass(clazz))),
+          DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName()),
+          null);
+    }
+    consumer.finished(null);
+  }
+
+
+  protected static Path writeClassesToJar(Class<?>... classes) throws IOException {
+    List<Class<?>> classesCollection = Arrays.asList(classes);
+    return writeClassesToJar(classesCollection);
+  }
+
+  protected static Path writeClassesToJar(List<Class<?>> classesCollection) throws IOException {
+    Path jar = staticTemp.newFolder().toPath().resolve("classes.jar");
+    writeClassesToJar(jar, classesCollection);
+    return jar;
+  }
+
+  protected static void writeClassFileDataToJar(Path output, Collection<byte[]> classes) {
+    ClassFileConsumer consumer = new ArchiveConsumer(output);
+    for (byte[] clazz : classes) {
+      consumer.accept(ByteDataView.of(clazz), extractClassDescriptor(clazz), null);
+    }
+    consumer.finished(null);
+  }
+
+  protected static void writeClassFilesToJar(Path output, Collection<Path> classes)
+      throws IOException {
+    List<byte[]> bytes = new LinkedList<>();
+    for (Path classPath : classes) {
+      byte[] classBytes = Files.readAllBytes(Paths.get(classPath.toString()));
+      bytes.add(classBytes);
+    }
+    writeClassFileDataToJar(output, bytes);
+  }
+
+  protected Path writeToJar(List<byte[]> classes) throws IOException {
+    Path result = getNewTempFile("junit", ".jar").toPath();
+    writeClassFileDataToJar(result, classes);
+    return result;
+  }
+
+  protected Path writeToJar(JasminBuilder jasminBuilder) throws Exception {
+    return writeToJar(jasminBuilder.buildClasses());
+  }
+
+  /**
+   * Disassemble the content of an application. Only works for an application with only dex code.
+   */
+  protected void disassemble(AndroidApp app) {
+    InternalOptions options = new InternalOptions();
+    System.out.println(SmaliWriter.smali(app, options));
+  }
+
+  protected MethodSubject getMethodSubject(
+      CodeInspector inspector,
+      String className,
+      String returnType,
+      String methodName,
+      List<String> parameters) {
+    ClassSubject clazz = inspector.clazz(className);
+    assertTrue(clazz.isPresent());
+    MethodSubject method = clazz.method(returnType, methodName, parameters);
+    assertTrue(method.isPresent());
+    return method;
+  }
+
+  protected MethodSubject getMethodSubject(
+      AndroidApp application,
+      String className,
+      String returnType,
+      String methodName,
+      List<String> parameters) {
+    try {
+      CodeInspector inspector = new CodeInspector(application);
+      return getMethodSubject(inspector, className, returnType, methodName, parameters);
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  protected DexEncodedMethod getMethod(
+      AndroidApp application,
+      String className,
+      String returnType,
+      String methodName,
+      List<String> parameters) {
+    return getMethodSubject(application, className, returnType, methodName, parameters).getMethod();
+  }
+
+  protected ProgramMethod getMethod(
+      CodeInspector inspector,
+      String className,
+      String returnType,
+      String methodName,
+      List<String> parameters) {
+    return getMethodSubject(inspector, className, returnType, methodName, parameters)
+        .getProgramMethod();
+  }
+
+  protected static void checkInstructions(
+      DexCode code, List<Class<? extends DexInstruction>> instructions) {
+    assertEquals(instructions.size(), code.instructions.length);
+    for (int i = 0; i < instructions.size(); ++i) {
+      assertEquals("Unexpected instruction at index " + i,
+          instructions.get(i), code.instructions[i].getClass());
+    }
+  }
+
+  protected Stream<DexInstruction> filterInstructionKind(
+      DexCode dexCode, Class<? extends DexInstruction>... kinds) {
+    return Arrays.stream(dexCode.instructions)
+        .filter(
+            instruction ->
+                Arrays.asList(kinds).stream().anyMatch(kind -> kind.isInstance(instruction)));
+  }
+
+  protected long countCall(MethodSubject method, String className, String methodName) {
+    return method
+        .streamInstructions()
+        .filter(
+            instructionSubject -> {
+              if (instructionSubject.isInvoke() && !instructionSubject.isInvokeDynamic()) {
+                DexMethod invokedMethod = instructionSubject.getMethod();
+                return invokedMethod.holder.toString().contains(className)
+                    && invokedMethod.name.toString().contains(methodName);
+              }
+              return false;
+            })
+        .count();
+  }
+
+  protected long countCall(MethodSubject method, String methodName) {
+    return method.streamInstructions().filter(instructionSubject -> {
+      if (instructionSubject.isInvoke()) {
+        DexMethod invokedMethod = instructionSubject.getMethod();
+        return invokedMethod.name.toString().contains(methodName);
+      }
+      return false;
+    }).count();
+  }
+
+  public enum MinifyMode {
+    NONE,
+    JAVA;
+
+    public boolean isMinify() {
+      return this != NONE;
+    }
+
+    public static MinifyMode[] withoutNone() {
+      return new MinifyMode[] {JAVA};
+    }
+  }
+
+  public static ProgramConsumer emptyConsumer(Backend backend) {
+    if (backend == Backend.DEX) {
+      return DexIndexedConsumer.emptyConsumer();
+    } else {
+      assert backend == Backend.CF;
+      return ClassFileConsumer.emptyConsumer();
+    }
+  }
+
+  public static OutputMode outputMode(Backend backend) {
+    if (backend == Backend.DEX) {
+      return OutputMode.DexIndexed;
+    } else {
+      assert backend == Backend.CF;
+      return OutputMode.ClassFile;
+    }
+  }
+
+  @Deprecated
+  public static Path runtimeJar(TestParameters parameters) {
+    if (parameters.isDexRuntime()) {
+      return ToolHelper.getAndroidJar(parameters.getRuntime().asDex().getMinApiLevel());
+    } else {
+      assert parameters.isCfRuntime();
+      return ToolHelper.getJava8RuntimeJar();
+    }
+  }
+
+  @Deprecated
+  public static Path runtimeJar(Backend backend) {
+    if (backend == Backend.DEX) {
+      return ToolHelper.getDefaultAndroidJar();
+    } else {
+      assert backend == Backend.CF;
+      return ToolHelper.getJava8RuntimeJar();
+    }
+  }
+
+  public static class JarBuilder {
+    final Path jar;
+    final ZipOutputStream stream;
+
+    private JarBuilder(TemporaryFolder temp) throws IOException {
+      jar = temp.newFolder().toPath().resolve("a.jar");
+      stream = new ZipOutputStream(Files.newOutputStream(jar));
+    }
+
+    public static JarBuilder builder(TemporaryFolder temp) throws IOException {
+      return new JarBuilder(temp);
+    }
+
+    public JarBuilder addClass(Class<?> clazz) throws IOException {
+      stream.putNextEntry(new ZipEntry(DescriptorUtils.getPathFromJavaType(clazz)));
+      stream.write(Files.readAllBytes(ToolHelper.getClassFileForTestClass(clazz)));
+      stream.closeEntry();
+      return this;
+    }
+
+    public JarBuilder addResource(String path, String content) throws IOException {
+      stream.putNextEntry(new ZipEntry(path));
+      stream.write(content.getBytes(StandardCharsets.UTF_8));
+      stream.closeEntry();
+      return this;
+    }
+
+    public Path build() throws IOException {
+      stream.close();
+      return jar;
+    }
+  }
+
+  public List<Path> buildOnDexRuntime(TestParameters parameters, List<Path> paths)
+      throws CompilationFailedException, IOException {
+    if (parameters.isCfRuntime()) {
+      return paths;
+    }
+    return Collections.singletonList(
+        testForD8().addProgramFiles(paths).setMinApi(parameters).compile().writeToZip());
+  }
+
+  public List<Path> buildOnDexRuntime(TestParameters parameters, Path... paths)
+      throws IOException, CompilationFailedException {
+    return buildOnDexRuntime(parameters, Arrays.asList(paths));
+  }
+
+  public Path buildOnDexRuntime(TestParameters parameters, Class<?>... classes)
+      throws IOException, CompilationFailedException {
+    if (parameters.isDexRuntime()) {
+      return testForD8().addProgramClasses(classes).setMinApi(parameters).compile().writeToZip();
+    }
+    Path path = temp.newFolder().toPath().resolve("classes.jar");
+    ArchiveConsumer consumer = new ArchiveConsumer(path);
+    for (Class<?> clazz : classes) {
+      consumer.accept(
+          ByteDataView.of(ToolHelper.getClassAsBytes(clazz)),
+          DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName()),
+          null);
+    }
+    consumer.finished(null);
+    return path;
+  }
+
+  public Path buildOnDexRuntime(TestParameters parameters, byte[]... classes)
+      throws IOException, CompilationFailedException {
+    if (parameters.isDexRuntime()) {
+      return testForD8(Backend.DEX, PartialCompilationTestParameters.NONE)
+          .addProgramClassFileData(classes)
+          .setMinApi(parameters)
+          .compile()
+          .writeToZip();
+    }
+    Path path = temp.newFolder().toPath().resolve("classes.jar");
+    ArchiveConsumer consumer = new ArchiveConsumer(path);
+    for (byte[] clazz : classes) {
+      consumer.accept(ByteDataView.of(clazz), extractClassDescriptor(clazz), null);
+    }
+    consumer.finished(null);
+    return path;
+  }
+
+  public static DexType toDexType(Class<?> clazz, DexItemFactory dexItemFactory) {
+    return dexItemFactory.createType(descriptor(clazz));
+  }
+
+  public static DexType toDexType(ClassReference classReference, DexItemFactory dexItemFactory) {
+    return dexItemFactory.createType(classReference.getDescriptor());
+  }
+
+  public static String binaryName(Class<?> clazz) {
+    return DescriptorUtils.getBinaryNameFromJavaType(typeName(clazz));
+  }
+
+  public static String descriptor(Class<?> clazz) {
+    return DescriptorUtils.javaTypeToDescriptor(typeName(clazz));
+  }
+
+  public static PathOrigin getOrigin(Class<?> clazz) {
+    return new PathOrigin(ToolHelper.getClassFileForTestClass(clazz));
+  }
+
+  public static String typeName(Class<?> clazz) {
+    return clazz.getTypeName();
+  }
+
+  public static AndroidApiLevel apiLevelWithDefaultInterfaceMethodsSupport() {
+    return AndroidApiLevel.N;
+  }
+
+  public static boolean runtimeWithRecordsSupport(TestRuntime runtime) {
+    return (runtime.isCf() && runtime.asCf().hasRecordsSupport())
+        || (runtime.isDex() && runtime.asDex().hasRecordsSupport());
+  }
+
+  public static AndroidApiLevel apiLevelWithStaticInterfaceMethodsSupport() {
+    return AndroidApiLevel.N;
+  }
+
+  public static AndroidApiLevel apiLevelWithInvokeCustomSupport() {
+    return AndroidApiLevel.O;
+  }
+
+  public static AndroidApiLevel apiLevelWithInvokePolymorphicSupport() {
+    return AndroidApiLevel.O;
+  }
+
+  public static AndroidApiLevel apiLevelWithConstMethodHandleSupport() {
+    return AndroidApiLevel.P;
+  }
+
+  public static AndroidApiLevel apiLevelWithNativeMultiDexSupport() {
+    return AndroidApiLevel.L;
+  }
+
+  public static AndroidApiLevel apiLevelWithTwrCloseResourceSupport() {
+    return AndroidApiLevel.K;
+  }
+
+  public static AndroidApiLevel apiLevelWithSuppressedExceptionsSupport() {
+    return AndroidApiLevel.K;
+  }
+
+  public static AndroidApiLevel apiLevelWithPcAsLineNumberSupport() {
+    return AndroidApiLevel.O;
+  }
+
+  public static AndroidApiLevel apiLevelWithDiscardResidualDebugInfoSupport() {
+    return AndroidApiLevel.CINNAMON_BUN;
+  }
+
+  public static boolean canDiscardResidualDebugInfo(TestParameters parameters) {
+    return parameters.getApiLevel() != null
+        && parameters
+            .getApiLevel()
+            .isGreaterThanOrEqualTo(apiLevelWithDiscardResidualDebugInfoSupport());
+  }
+
+  public static AndroidApiLevel apiLevelWithMethodParametersSupport() {
+    return AndroidApiLevel.O;
+  }
+
+  public static AndroidApiLevel apiLevelWithRecordSupport() {
+    // TODO(b/293591931): Return something when records are stable in Platform (expecting Android
+    // V).
+    throw new Unreachable();
+  }
+
+  public static AndroidApiLevel apiLevelWithSealedClassesSupport() {
+    return AndroidApiLevel.U;
+  }
+
+  public static boolean isRecordsFullyDesugaredForD8(TestParameters parameters) {
+    assert parameters.getApiLevel() != null;
+    return parameters.getApiLevel().isLessThan(AndroidApiLevel.V);
+  }
+
+  public static boolean isRecordsFullyDesugaredForR8(TestParameters parameters) {
+    assert parameters.getApiLevel() != null;
+    return !parameters.getRuntime().isCf() && isRecordsFullyDesugaredForD8(parameters);
+  }
+
+  public static boolean canUseJavaUtilObjects(TestParameters parameters) {
+    return (parameters.isCfRuntime() && parameters.getApiLevel() == null)
+        || parameters.getApiLevel().isGreaterThanOrEqualTo(AndroidApiLevel.K);
+  }
+
+  public static boolean canUseJavaUtilObjectsIsNull(TestParameters parameters) {
+    return parameters.isDexRuntime()
+        && parameters.getApiLevel().isGreaterThanOrEqualTo(AndroidApiLevel.N);
+  }
+
+  public static AndroidApiLevel apiLevelWithJavaTime() {
+    return AndroidApiLevel.O;
+  }
+
+  public static boolean apiLevelWithJavaTime(TestParameters parameters) {
+    return parameters.getApiLevel().isGreaterThanOrEqualTo(apiLevelWithJavaTime());
+  }
+
+  public static boolean runtimeWithJavaTime(TestParameters parameters) {
+    return parameters.isCfRuntime()
+        || parameters.isDexRuntimeVersionNewerThanOrEqual(
+            ToolHelper.getDexVersionForApiLevel(apiLevelWithJavaTime()));
+  }
+
+  public boolean canUseFilledNewArrayOfInteger(TestParameters parameters) {
+    return parameters.isDexRuntime();
+  }
+
+  public boolean canUseFilledNewArrayOfStringObjects(TestParameters parameters) {
+    return parameters.isDexRuntime()
+        && parameters.getApiLevel().isGreaterThanOrEqualTo(AndroidApiLevel.K);
+  }
+
+  public boolean canUseFilledNewArrayOfNonStringObjects(TestParameters parameters) {
+    return parameters.isDexRuntime()
+        && parameters.getApiLevel().isGreaterThanOrEqualTo(AndroidApiLevel.N);
+  }
+
+  // TODO(b/131130038): Do not allow accessmodification when kept.
+  public boolean isForceAccessModifyingPackagePrivateAndProtectedMethods() {
+    return true;
+  }
+
+  public Path compileToZip(
+      TestParameters parameters, Collection<Class<?>> classPath, Class<?>... compilationUnit)
+      throws Exception {
+    return compileToZip(parameters, classPath, Arrays.asList(compilationUnit));
+  }
+
+  public Path compileToZip(
+      TestParameters parameters,
+      Collection<Class<?>> classpath,
+      Collection<Class<?>> compilationUnit)
+      throws Exception {
+    if (parameters.isCfRuntime()) {
+      Path out = temp.newFolder().toPath().resolve("out.jar");
+      writeClassesToJar(out, compilationUnit);
+      return out;
+    }
+    return testForD8()
+        .setMinApi(parameters)
+        .addProgramClasses(compilationUnit)
+        .addClasspathClasses(classpath)
+        .compile()
+        .writeToZip();
+  }
+
+  protected static CfVersion extractClassFileVersion(byte[] classFileBytes) {
+    class ClassFileVersionExtractor extends ClassVisitor {
+      private int version;
+
+      private ClassFileVersionExtractor() {
+        super(ASM_VERSION);
+      }
+
+      @Override
+      public void visit(
+          int version,
+          int access,
+          String name,
+          String signature,
+          String superName,
+          String[] interfaces) {
+        this.version = version;
+      }
+
+      CfVersion getClassFileVersion() {
+        return CfVersion.fromRaw(version);
+      }
+    }
+
+    ClassReader reader = new ClassReader(classFileBytes);
+    ClassFileVersionExtractor extractor = new ClassFileVersionExtractor();
+    reader.accept(
+        extractor, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+    return extractor.getClassFileVersion();
+  }
+
+  protected static String extractSourceFile(byte[] classFileBytes) {
+    class SourceFileExtractor extends ClassVisitor {
+      private String source;
+
+      private SourceFileExtractor() {
+        super(ASM_VERSION);
+      }
+
+      @Override
+      public void visitSource(String source, String debug) {
+        this.source = source;
+      }
+
+      String getSourceFile() {
+        return source;
+      }
+    }
+
+    ClassReader reader = new ClassReader(classFileBytes);
+    SourceFileExtractor extractor = new SourceFileExtractor();
+    reader.accept(extractor, ClassReader.SKIP_CODE | ClassReader.SKIP_FRAMES);
+    return extractor.getSourceFile();
+  }
+
+  public static void verifyAllInfoFromGenericSignatureTypeParameterValidation(
+      TestCompileResult<?, ?> compileResult) {
+    compileResult.assertAtLeastOneInfoMessage();
+    compileResult.assertAllInfoMessagesMatch(containsString("A type variable is not in scope"));
+  }
+
+  public static void verifyExpectedInfoFromGenericSignatureSuperTypeValidation(
+      TestCompileResult<?, ?> compileResult) {
+    compileResult.assertAtLeastOneInfoMessage();
+    compileResult.assertAllInfoMessagesMatch(
+        containsString("The generic super type is not the same as the class super type"));
+  }
+
+  public static boolean uploadJarsToCloudStorageIfTestFails(
+      ThrowingBiFunction<Path, Path, Boolean, Exception> test, Path expected, Path actual)
+      throws Exception {
+    boolean filesAreEqual = false;
+    Throwable error = null;
+    try {
+      filesAreEqual = test.apply(expected, actual);
+    } catch (AssertionError | Exception assertionError) {
+      error = assertionError;
+    }
+    if (filesAreEqual) {
+      return true;
+    }
+    uploadFilesToGoogleCloudStorage(expected, actual);
+    if (error != null) {
+      if (error instanceof Exception) {
+        throw (Exception) error;
+      }
+      throw new RuntimeException(error);
+    }
+    return false;
+  }
+
+  private static void uploadFilesToGoogleCloudStorage(Path expected, Path actual) {
+    // Only upload files if we are running on the bots.
+    System.out.println("DIFFERENCE IN FILES DETECTED");
+    if (ToolHelper.isBot()) {
+      try {
+        System.out.println(
+            "***********************************************************************");
+        String expectedSha = ToolHelper.uploadFileToGoogleCloudStorage(R8_TEST_BUCKET, expected);
+        System.out.println("EXPECTED FILE SHA1: " + expectedSha);
+        System.out.println(
+            String.format(
+                "DOWNLOAD BY: `download_from_google_storage.py --bucket %s %s -o %s`",
+                R8_TEST_BUCKET, expectedSha, expected.getFileName()));
+        String actualSha = ToolHelper.uploadFileToGoogleCloudStorage(R8_TEST_BUCKET, actual);
+        System.out.println("ACTUAL FILE SHA1: " + actualSha);
+        System.out.println(
+            String.format(
+                "DOWNLOAD BY: `download_from_google_storage.py --bucket %s %s -o %s`",
+                R8_TEST_BUCKET, expectedSha, actual.getFileName()));
+        System.out.println(
+            "***********************************************************************");
+      } catch (Throwable e) {
+        e.printStackTrace();
+      }
+    } else {
+      System.out.println("Not running on bot, so not uploading files to Google Cloud Storage");
+      System.out.println("The files are:");
+      System.out.println("Expected: " + expected);
+      System.out.println("Actual: " + actual);
+      Path expectedCopy = Paths.get("/tmp", expected.toString().replace("/", "_"));
+      Path actualCopy = Paths.get("/tmp", actual.toString().replace("/", "_"));
+      System.out.println("Copied to: " + expectedCopy + " and " + actualCopy);
+      try {
+        Files.copy(expected, expectedCopy, StandardCopyOption.REPLACE_EXISTING);
+        Files.copy(actual, actualCopy, StandardCopyOption.REPLACE_EXISTING);
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
+    }
+  }
+
+  public static boolean assertProgramsEqual(Path expectedJar, Path actualJar) throws IOException {
+    return assertProgramsEqual("", expectedJar, actualJar);
+  }
+
+  public static boolean assertProgramsEqual(String message, Path expectedJar, Path actualJar)
+      throws IOException {
+    if (filesAreEqual(expectedJar, actualJar)) {
+      return true;
+    }
+    // Attempt to upload files to Google Cloud Storage before checking with inspectors, as the
+    // files are different.
+    try {
+      uploadFilesToGoogleCloudStorage(expectedJar, actualJar);
+    } catch (Throwable ee) {
+      // Ignore.
+    }
+    assertIdenticalInspectors(new CodeInspector(expectedJar), new CodeInspector(actualJar));
+    // The above may not fail but the programs are not equal so force fail in any case.
+    fail(message);
+    return false;
+  }
+
+  public static void assertIdenticalInspectors(CodeInspector inspector1, CodeInspector inspector2) {
+    Set<String> classes1Set =
+        inspector1.allClasses().stream()
+            .map(c -> c.getDexProgramClass().getType().toString())
+            .collect(Collectors.toSet());
+    Set<String> classes2Set =
+        inspector2.allClasses().stream()
+            .map(c -> c.getDexProgramClass().getType().toString())
+            .collect(Collectors.toSet());
+    SetView<String> classUnion = Sets.union(classes1Set, classes2Set);
+    Assert.assertEquals(
+        "Inspector 1 contains more classes",
+        Collections.emptySet(),
+        Sets.difference(classUnion, classes1Set));
+    Assert.assertEquals(
+        "Inspector 2 contains more classes",
+        Collections.emptySet(),
+        Sets.difference(classUnion, classes2Set));
+    Map<DexEncodedMethod, DexEncodedMethod> diffs = new IdentityHashMap<>();
+    for (FoundClassSubject clazz1 : inspector1.allClasses()) {
+      ClassSubject clazz = inspector2.clazz(clazz1.getOriginalTypeName());
+      assertTrue(clazz.isPresent());
+      FoundClassSubject clazz2 = clazz.asFoundClassSubject();
+      Set<String> methods1 =
+          clazz1.allMethods().stream()
+              .map(FoundMethodSubject::toString)
+              .collect(Collectors.toSet());
+      Set<String> methods2 =
+          clazz2.allMethods().stream()
+              .map(FoundMethodSubject::toString)
+              .collect(Collectors.toSet());
+      SetView<String> union = Sets.union(methods1, methods2);
+      Assert.assertEquals(
+          "Inspector 1 contains more methods",
+          Collections.emptySet(),
+          Sets.difference(union, methods1));
+      Assert.assertEquals(
+          "Inspector 2 contains more methods",
+          Collections.emptySet(),
+          Sets.difference(union, methods2));
+      Assert.assertEquals(clazz1.allMethods().size(), clazz2.allMethods().size());
+      for (FoundMethodSubject method1 : clazz1.allMethods()) {
+        MethodSubject method = clazz2.method(method1.asMethodReference());
+        assertTrue(method.isPresent());
+        FoundMethodSubject method2 = method.asFoundMethodSubject();
+        if (method1.hasCode()) {
+          assertTrue(method2.hasCode());
+          if (!(method1
+              .getMethod()
+              .getCode()
+              .toString()
+              .equals(method2.getMethod().getCode().toString()))) {
+            diffs.put(method1.getMethod(), method2.getMethod());
+          }
+        }
+      }
+    }
+    assertTrue(printDiffs(diffs), diffs.isEmpty());
+  }
+
+  private static String printDiffs(Map<DexEncodedMethod, DexEncodedMethod> diffs) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("The following methods had differences from one dex file to the other (")
+        .append(diffs.size())
+        .append("):\n");
+    diffs.forEach(
+        (m1, m2) -> {
+          sb.append(m1.toSourceString()).append("\n");
+          String[] lines1 = m1.getCode().toString().split("\n");
+          String[] lines2 = m2.getCode().toString().split("\n");
+          if (lines1.length != lines2.length) {
+            sb.append("Different number of lines: ")
+                .append(lines1.length)
+                .append(" and ")
+                .append(lines2.length)
+                .append(".")
+                .append("\n");
+            printDiffForDifferentLineNumber(sb, lines1, lines2);
+          } else {
+            for (int i = 0; i < lines1.length; i++) {
+              if (!lines1[i].equals(lines2[i])) {
+                sb.append(lines1[i]);
+                sb.append("\n");
+                sb.append(lines2[i]);
+                sb.append("\n");
+                return;
+              }
+            }
+          }
+        });
+    return sb.toString();
+  }
+
+  // Identify the initial common lines and print the first 7 lines after the first difference.
+  private static void printDiffForDifferentLineNumber(
+      StringBuilder sb, String[] lines1, String[] lines2) {
+    int maxPrint = 7;
+    int i;
+    for (i = 0; i < lines1.length && i < lines2.length; i++) {
+      if (!lines1[i].equals(lines2[i])) {
+        break;
+      }
+    }
+    sb.append("Method 1:").append("\n");
+    printExtraLines(i, lines1, maxPrint, sb);
+    sb.append("Method 2:").append("\n");
+    printExtraLines(i, lines2, maxPrint, sb);
+  }
+
+  private static void printExtraLines(int i, String[] lines1, int maxPrint, StringBuilder sb) {
+    if (i < lines1.length) {
+      int j;
+      for (j = i; j < lines1.length && j < (i + maxPrint); j++) {
+        sb.append(lines1[j]);
+        sb.append("\n");
+      }
+      if (j != lines1.length) {
+        sb.append("...");
+        sb.append("\n");
+      }
+    } else {
+      sb.append("No difference in method.").append("\n");
+    }
+  }
+
+  public static boolean filesAreEqual(Path file1, Path file2) throws IOException {
+    long size = Files.size(file1);
+    long sizeOther = Files.size(file2);
+    if (size != sizeOther) {
+      return false;
+    }
+    if (size < 4096) {
+      return Arrays.equals(Files.readAllBytes(file1), Files.readAllBytes(file2));
+    }
+    int byteRead1 = 0;
+    int byteRead2 = 0;
+    try (FileInputStream fs1 = new FileInputStream(file1.toString());
+        FileInputStream fs2 = new FileInputStream(file2.toString())) {
+      BufferedInputStream bs1 = new BufferedInputStream(fs1);
+      BufferedInputStream bs2 = new BufferedInputStream(fs2);
+      while (byteRead1 == byteRead2 && byteRead1 != -1) {
+        byteRead1 = bs1.read();
+        byteRead2 = bs2.read();
+      }
+    }
+    return byteRead1 == byteRead2;
+  }
+
+  protected void assertListsAreEqual(List<String> expected, List<String> actual) {
+    assertEquals("List sizes differ: ", expected.size(), actual.size());
+    for (int i = 0; i < expected.size(); i++) {
+      assertEquals("Index: " + i, expected.get(i), actual.get(i));
+    }
+  }
+
+  public void runGlobalSyntheticsGenerator(
+      GlobalSyntheticsGeneratorCommand command, Consumer<InternalOptions> internalOptionsConsumer)
+      throws CompilationFailedException {
+    InternalOptions internalOptions = command.getInternalOptions();
+    internalOptionsConsumer.accept(internalOptions);
+    GlobalSyntheticsGenerator.runForTesting(command.getInputApp(), internalOptions);
+  }
+
+  public static void testParseSignaturesInJar(Path jar) throws Exception {
+    GenericSignatureReader genericSignatureReader = new GenericSignatureReader();
+    ZipInputStream inputStream = new ZipInputStream(Files.newInputStream(jar));
+    ZipEntry next = inputStream.getNextEntry();
+    while (next != null) {
+      if (next.getName().endsWith(".class")) {
+        ClassReader classReader = new ClassReader(inputStream);
+        classReader.accept(genericSignatureReader, 0);
+      }
+      next = inputStream.getNextEntry();
+    }
+  }
+
+  protected static Path zipWithTestClasses(Path zipFile, Class<?>... classes) throws IOException {
+    return zipWithTestClasses(zipFile, Arrays.asList(classes));
+  }
+
+  protected static Path zipWithTestClasses(Path zipFile, List<Class<?>> classes)
+      throws IOException {
+    return ZipBuilder.builder(zipFile)
+        .addFilesRelative(
+            ToolHelper.getClassPathForTests(),
+            classes.stream().map(ToolHelper::getClassFileForTestClass).collect(Collectors.toList()))
+        .build();
+  }
+
+  private static class GenericSignatureReader extends ClassVisitor {
+
+    public final Set<String> signatures = new HashSet<>();
+    private final DexItemFactory factory = new DexItemFactory();
+
+    private GenericSignatureReader() {
+      super(ASM_VERSION);
+    }
+
+    @Override
+    public void visit(
+        int version,
+        int access,
+        String name,
+        String signature,
+        String superName,
+        String[] interfaces) {
+      if (signature == null) {
+        return;
+      }
+      TestDiagnosticMessagesImpl testDiagnosticMessages = new TestDiagnosticMessagesImpl();
+      ClassSignature classSignature =
+          GenericSignature.parseClassSignature(
+              name, signature, Origin.unknown(), factory, new Reporter(testDiagnosticMessages));
+      assertEquals(signature, classSignature.toString());
+      testDiagnosticMessages.assertNoMessages();
+    }
+  }
+}

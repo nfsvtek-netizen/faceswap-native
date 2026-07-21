@@ -1,0 +1,121 @@
+// Copyright (c) 2022, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.shaking;
+
+import static com.android.tools.r8.utils.SystemPropertyUtils.parseSystemPropertyOrDefault;
+
+public class ProguardConfigurationParserOptions {
+
+  private final boolean enableLegacyFullModeForKeepRules;
+  private final boolean enableLegacyFullModeForKeepRulesWarnings;
+  private final boolean canMatchRuntimeInvisibleAnnotationsWithWildcards;
+  private final boolean enableTestingOptions;
+  private final boolean forceProguardCompatibility;
+
+  ProguardConfigurationParserOptions(
+      boolean canMatchRuntimeInvisibleAnnotationsWithWildcards,
+      boolean enableLegacyFullModeForKeepRules,
+      boolean enableLegacyFullModeForKeepRulesWarnings,
+      boolean enableTestingOptions,
+      boolean forceProguardCompatibility) {
+    this.canMatchRuntimeInvisibleAnnotationsWithWildcards =
+        canMatchRuntimeInvisibleAnnotationsWithWildcards;
+    this.enableTestingOptions = enableTestingOptions;
+    this.enableLegacyFullModeForKeepRules = enableLegacyFullModeForKeepRules;
+    this.enableLegacyFullModeForKeepRulesWarnings = enableLegacyFullModeForKeepRulesWarnings;
+    this.forceProguardCompatibility = forceProguardCompatibility;
+  }
+
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  public boolean canMatchRuntimeInvisibleAnnotationsWithWildcards() {
+    return canMatchRuntimeInvisibleAnnotationsWithWildcards;
+  }
+
+  public boolean isLegacyFullModeForKeepRulesEnabled() {
+    // TODO(b/356344563): Disable in full mode in the next major version.
+    return forceProguardCompatibility || enableLegacyFullModeForKeepRules;
+  }
+
+  public boolean isLegacyFullModeForKeepRulesWarningsEnabled() {
+    assert isLegacyFullModeForKeepRulesEnabled();
+    return !forceProguardCompatibility && enableLegacyFullModeForKeepRulesWarnings;
+  }
+
+  public boolean isTestingOptionsEnabled() {
+    return enableTestingOptions;
+  }
+
+  public static class Builder {
+
+    private boolean enableLegacyFullModeForKeepRules = true;
+    private boolean enableLegacyFullModeForKeepRulesWarnings = false;
+    private boolean canMatchRuntimeInvisibleAnnotationsWithWildcards = true;
+    private boolean enableTestingOptions;
+    private boolean forceProguardCompatibility = false;
+
+    public Builder readEnvironment() {
+      canMatchRuntimeInvisibleAnnotationsWithWildcards =
+          parseSystemPropertyOrDefault(
+              "com.android.tools.r8.canMatchRuntimeInvisibleAnnotationsWithWildcards", true);
+      enableLegacyFullModeForKeepRules =
+          parseSystemPropertyOrDefault(
+              "com.android.tools.r8.enableLegacyFullModeForKeepRules", true);
+      enableLegacyFullModeForKeepRulesWarnings =
+          parseSystemPropertyOrDefault(
+              "com.android.tools.r8.enableLegacyFullModeForKeepRulesWarnings", false);
+      enableTestingOptions =
+          parseSystemPropertyOrDefault("com.android.tools.r8.allowTestProguardOptions", false);
+      return this;
+    }
+
+    public boolean hasExplicitCanMatchRuntimeInvisibleAnnotationsWithWildcards() {
+      return System.getProperty(
+              "com.android.tools.r8.canMatchRuntimeInvisibleAnnotationsWithWildcards")
+          != null;
+    }
+
+    public Builder setCanMatchRuntimeInvisibleAnnotationsWithWildcards(
+        boolean canMatchRuntimeInvisibleAnnotationsWithWildcards) {
+      if (!hasExplicitCanMatchRuntimeInvisibleAnnotationsWithWildcards()) {
+        this.canMatchRuntimeInvisibleAnnotationsWithWildcards =
+            canMatchRuntimeInvisibleAnnotationsWithWildcards;
+      }
+      return this;
+    }
+
+    public Builder setEnableLegacyFullModeForKeepRules(boolean enableLegacyFullModeForKeepRules) {
+      this.enableLegacyFullModeForKeepRules = enableLegacyFullModeForKeepRules;
+      return this;
+    }
+
+    public Builder setEnableLegacyFullModeForKeepRulesWarnings(
+        boolean enableLegacyFullModeForKeepRulesWarnings) {
+      this.enableLegacyFullModeForKeepRulesWarnings = enableLegacyFullModeForKeepRulesWarnings;
+      return this;
+    }
+
+    public Builder setEnableTestingOptions(boolean enableTestingOptions) {
+      this.enableTestingOptions = enableTestingOptions;
+      return this;
+    }
+
+    public Builder setForceProguardCompatibility(boolean forceProguardCompatibility) {
+      this.forceProguardCompatibility = forceProguardCompatibility;
+      return this;
+    }
+
+    public ProguardConfigurationParserOptions build() {
+      return new ProguardConfigurationParserOptions(
+          canMatchRuntimeInvisibleAnnotationsWithWildcards,
+          enableLegacyFullModeForKeepRules,
+          enableLegacyFullModeForKeepRulesWarnings,
+          enableTestingOptions,
+          forceProguardCompatibility);
+    }
+  }
+}

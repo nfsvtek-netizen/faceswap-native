@@ -1,0 +1,917 @@
+// Copyright (c) 2023, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.androidresources;
+
+import static com.android.tools.r8.TestBase.javac;
+import static com.android.tools.r8.TestBase.transformer;
+
+import com.android.aapt.Resources;
+import com.android.aapt.Resources.ConfigValue;
+import com.android.aapt.Resources.Item;
+import com.android.aapt.Resources.Package;
+import com.android.aapt.Resources.ResourceTable;
+import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestBase.Backend;
+import com.android.tools.r8.TestRuntime.CfRuntime;
+import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.ToolHelper.ProcessResult;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.transformers.ClassFileTransformer;
+import com.android.tools.r8.transformers.ClassTransformer;
+import com.android.tools.r8.transformers.MethodTransformer;
+import com.android.tools.r8.utils.AndroidApiLevel;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.ZipUtils;
+import com.android.tools.r8.utils.internal.FileUtils;
+import com.android.tools.r8.utils.internal.StreamUtils;
+import com.android.tools.r8.utils.internal.StringUtils;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
+import com.google.common.collect.MoreCollectors;
+import com.google.protobuf.InvalidProtocolBufferException;
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+import org.junit.Assert;
+import org.junit.rules.TemporaryFolder;
+import org.objectweb.asm.FieldVisitor;
+import org.objectweb.asm.Opcodes;
+
+public class AndroidResourceTestingUtils {
+  private static final String RESOURCES_DESCRIPTOR =
+      TestBase.descriptor(com.android.tools.r8.androidresources.Resources.class);
+
+  enum RClassType {
+    STRING,
+    DRAWABLE,
+    STYLEABLE,
+    XML,
+    ID,
+    FRACTION,
+    COLOR;
+
+    public static RClassType fromClass(Class clazz) {
+      String type = rClassWithoutNamespaceAndOuter(clazz).substring(2);
+      return RClassType.valueOf(type.toUpperCase());
+    }
+  }
+
+  public static Path resourcesClassAsDex(TemporaryFolder temp) throws Exception {
+    return TestBase.testForD8(temp, Backend.DEX)
+        .addProgramClassFileData(resouresClassAsJavaClass())
+        .compile()
+        .writeToZip();
+  }
+
+  public static byte[] resouresClassAsJavaClass() throws IOException {
+    return transformer(com.android.tools.r8.androidresources.Resources.class)
+        .setClassDescriptor(DexItemFactory.androidResourcesDescriptorString)
+        .replaceClassDescriptorInMethodInstructions(
+            RESOURCES_DESCRIPTOR, DexItemFactory.androidResourcesDescriptorString)
+        .replaceClassDescriptorInMembers(
+            RESOURCES_DESCRIPTOR, DexItemFactory.androidResourcesDescriptorString)
+        .transform();
+  }
+
+  public static byte[] transformResourcesReferences(Class clazz) throws IOException {
+    return transformer(clazz)
+        .replaceClassDescriptorInMethodInstructions(
+            RESOURCES_DESCRIPTOR, DexItemFactory.androidResourcesDescriptorString)
+        .replaceClassDescriptorInMembers(
+            RESOURCES_DESCRIPTOR, DexItemFactory.androidResourcesDescriptorString)
+        .transform();
+  }
+
+  private static String rClassWithoutNamespaceAndOuter(Class clazz) {
+    return rClassWithoutNamespaceAndOuter(clazz.getName());
+  }
+
+  private static String rClassWithoutNamespaceAndOuter(String name) {
+    assert isInnerRClass(name);
+    int dollarIndex = name.lastIndexOf("$");
+    String specificRClass = name.substring(dollarIndex - 1);
+    return specificRClass;
+  }
+
+  private static boolean isInnerRClass(String name) {
+    int dollarIndex = name.lastIndexOf("$");
+    return dollarIndex > 0 && name.charAt(dollarIndex - 1) == 'R';
+  }
+
+  public static void writePrecompiledManifestAndResourcePB(Path resourceOutput) {
+    try (ZipOutputStream out =
+        new ZipOutputStream(
+            Files.newOutputStream(
+                resourceOutput, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING))) {
+      ZipUtils.writeToZipStream(
+          out, "AndroidManifest.xml", CompiledProto.SIMPLE_MANIFEST, ZipEntry.STORED);
+      ZipUtils.writeToZipStream(
+          out, "resources.pb", CompiledProto.SIMPLE_RESOURCE_TABLE, ZipEntry.STORED);
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  public static String SIMPLE_MANIFEST_WITH_APP_NAME =
+      "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+          + "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n"
+          + "          package=\"com.android.tools.r8\">\n"
+          + "    <application android:label=\"@string/app_name\">\n"
+          + "    </application>\n"
+          + "</manifest>\n"
+          + "\n";
+
+  public static String XML_FILE_WITH_COLOR_AND_STRING_REFERENCE =
+      "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+          + "<TextView xmlns:android=\"http://schemas.android.com/apk/res/android\"\n"
+          + "    android:layout_height=\"wrap_content\"\n"
+          + "    android:layout_width=\"wrap_content\"\n"
+          + "    android:text=\"%s\"\n"
+          + "    android:textColor=\"%s\"\n"
+          + "    android:textSize=\"22sp\"\n"
+          + "    android:padding=\"16dp\""
+          + "/>";
+
+  public static String XML_FILE_WITH_ID =
+      "<menu xmlns:android=\"http://schemas.android.com/apk/res/android\"\n"
+          + "    xmlns:app=\"http://schemas.android.com/apk/res-auto\"\n"
+          + "    xmlns:tools=\"http://schemas.android.com/tools\">\n"
+          + "    <item android:id=\"@+id/%s\"/>\n"
+          + "</menu>";
+
+  public static String KEEP_XML =
+      "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+          + "<resources xmlns:tools=\"http://schemas.android.com/tools\"\n"
+          + "    tools:keep=\"%s\"\n"
+          + "/>";
+
+  public static class AndroidTestRClass {
+    // The original aapt2 generated R.java class
+    private final Path javaFilePath;
+    // The compiled class files, with the class names rewritten to the names used in passed
+    // in R class from the test.
+    private final Map<String, byte[]> classFileData;
+
+    AndroidTestRClass(Path javaFilePath, Map<String, byte[]> classFileData) throws IOException {
+      this.javaFilePath = javaFilePath;
+      this.classFileData = classFileData;
+    }
+    public Path getJavaFilePath() {
+      return javaFilePath;
+    }
+
+    public Map<String, byte[]> getClassFileData() {
+      return classFileData;
+    }
+
+    public void transformClassFileData(ClassTransformer transformer) {
+      transformClassFileData(transformer, s -> true);
+    }
+
+    public void transformClassFileData(ClassTransformer transformer, Predicate<String> include) {
+      Map<String, byte[]> changed = new HashMap<>();
+      for (Entry<String, byte[]> entry : classFileData.entrySet()) {
+        if (include.test(entry.getKey())) {
+          byte[] transform =
+              ClassFileTransformer.transform(
+                  entry.getValue(), ImmutableList.of(transformer), Collections.EMPTY_LIST, 0);
+          changed.put(entry.getKey(), transform);
+        }
+      }
+      classFileData.putAll(changed);
+    }
+  }
+
+  public static class AndroidTestResource {
+    private final AndroidTestRClass rClass;
+    private Path resourceZip;
+    private final List<String> additionalKeepRuleFiles;
+
+    AndroidTestResource(
+        AndroidTestRClass rClass, Path resourceZip, List<String> additionalRawXmlFiles) {
+      this.rClass = rClass;
+      this.resourceZip = resourceZip;
+      this.additionalKeepRuleFiles = additionalRawXmlFiles;
+    }
+
+    public AndroidTestResource mangleResourceTable(Function<ResourceTable, ResourceTable> mapper)
+        throws IOException {
+      Path newName = Paths.get(resourceZip.toString() + ".mangled.ap_");
+      ZipUtils.map(
+          resourceZip,
+          newName,
+          (zipEntry, bytes) -> {
+            if (zipEntry.getName().equals("resources.pb")) {
+              try {
+                ResourceTable resourceTable = ResourceTable.parseFrom(bytes);
+                ResourceTable converted = mapper.apply(resourceTable);
+                return converted.toByteArray();
+              } catch (InvalidProtocolBufferException e) {
+                throw new RuntimeException(e);
+              }
+            }
+            return bytes;
+          });
+      resourceZip = newName;
+      return this;
+    }
+
+    public TestResourceTable getTestResourceTable() throws IOException {
+      return new TestResourceTable(
+          ResourceTable.parseFrom(ZipUtils.readSingleEntry(resourceZip, "resources.pb")));
+    }
+
+    public AndroidTestRClass getRClass() {
+      return rClass;
+    }
+
+    public Path getResourceZip() {
+      return resourceZip;
+    }
+
+    public List<String> getAdditionalKeepRuleFiles() {
+      return additionalKeepRuleFiles;
+    }
+  }
+
+  // Easy traversable resource table.
+  public static class TestResourceTable {
+    private Map<String, ResourceNameToValueMapping> valueMapping = new HashMap<>();
+    private Map<String, ResourceNameToIdMapping> idMapping = new HashMap<>();
+
+    private TestResourceTable(ResourceTable resourceTable) {
+      // For now, we don't have any test that use multiple packages.
+      assert resourceTable.getPackageCount() == 1;
+      Package aPackage = resourceTable.getPackage(0);
+      for (Resources.Type type : aPackage.getTypeList()) {
+        String typeName = type.getName();
+        valueMapping.put(typeName, new ResourceNameToValueMapping(type));
+        idMapping.put(typeName, new ResourceNameToIdMapping(type, aPackage));
+      }
+    }
+
+    public static TestResourceTable parseFrom(byte[] bytes) throws InvalidProtocolBufferException {
+      return new TestResourceTable(ResourceTable.parseFrom(bytes));
+    }
+
+    public boolean containsValueFor(String type, String name) {
+      return valueMapping.containsKey(type) && valueMapping.get(type).containsValueFor(name);
+    }
+
+    public int idFor(String type, String name) {
+      return idMapping.get(type).getIdFor(name);
+    }
+
+    public Collection<String> entriesForType(String type) {
+      return valueMapping.get(type).mapping.keySet();
+    }
+
+    public static class ResourceNameToIdMapping {
+      private final Map<String, Integer> mapping = new HashMap<>();
+
+      public ResourceNameToIdMapping(Resources.Type type, Package aPackage) {
+        for (Resources.Entry entry : type.getEntryList()) {
+          int id =
+              aPackage.getPackageId().getId() << 24
+                  | type.getTypeId().getId() << 16
+                  | entry.getEntryId().getId();
+          mapping.put(entry.getName(), id);
+        }
+      }
+
+      public int getIdFor(String name) {
+        return mapping.get(name);
+      }
+    }
+
+    public static class ResourceNameToValueMapping {
+      private final Map<String, List<ResourceValue>> mapping = new HashMap<>();
+
+      public ResourceNameToValueMapping(Resources.Type type) {
+        for (Resources.Entry entry : type.getEntryList()) {
+          String name = entry.getName();
+          List<ResourceValue> entries = new ArrayList<>();
+          for (ConfigValue configValue : entry.getConfigValueList()) {
+            Item item = configValue.getValue().getItem();
+            // Currently supporting files and strings, we just flatten this to strings for easy
+            // testing.
+            if (item.hasFile()) {
+              entries.add(
+                  new ResourceValue(item.getFile().getPath(), configValue.getConfig().toString()));
+            } else if (item.hasStr()) {
+              entries.add(
+                  new ResourceValue(item.getStr().getValue(), configValue.getConfig().toString()));
+            } else if (item.hasPrim()) {
+              entries.add(
+                  new ResourceValue(item.getPrim().toString(), configValue.getConfig().toString()));
+            }
+            mapping.put(name, entries);
+          }
+        }
+      }
+
+      public boolean containsValueFor(String name) {
+        return mapping.containsKey(name);
+      }
+
+      public static class ResourceValue {
+
+        private final String value;
+        private final String config;
+
+        public ResourceValue(String value, String config) {
+          this.value = value;
+          this.config = config;
+        }
+
+        public String getValue() {
+          return value;
+        }
+
+        public String getConfig() {
+          return config;
+        }
+      }
+    }
+  }
+
+  public static class ResourceTableInspector {
+
+    private final TestResourceTable testResourceTable;
+
+    public ResourceTableInspector(byte[] bytes) throws InvalidProtocolBufferException {
+      testResourceTable = TestResourceTable.parseFrom(bytes);
+    }
+
+    public void assertContainsResourceWithName(String type, String name) {
+      Assert.assertTrue(
+          StringUtils.join(",", entries(type)), testResourceTable.containsValueFor(type, name));
+    }
+
+    public void assertDoesNotContainResourceWithName(String type, String name) {
+      Assert.assertFalse(
+          StringUtils.join(",", entries(type)), testResourceTable.containsValueFor(type, name));
+    }
+
+    public Collection<String> entries(String type) {
+      return testResourceTable.entriesForType(type);
+    }
+  }
+
+  public static class AndroidTestResourceBuilder {
+    private String manifest;
+    private final Map<String, String> stringValues = new TreeMap<>();
+    private final Set<String> idValues = new TreeSet<>();
+    private final Map<String, String> fractionValues = new TreeMap<>();
+    private final Set<String> stringValuesWithExtraLanguage = new TreeSet<>();
+    private final Map<String, String> overlayableValues = new TreeMap<>();
+    private final Map<String, Integer> styleables = new TreeMap<>();
+    private final Map<String, byte[]> drawables = new TreeMap<>();
+    private final Map<String, String> xmlFiles = new TreeMap<>();
+    // Used for xml files that we hard code to -v24
+    private final Map<String, String> apiSpecificXmlFiles = new TreeMap<>();
+    private final Map<String, String> rawXmlFiles = new TreeMap<>();
+    private final List<String> keepRuleFiles = new ArrayList<>();
+    private final List<Class<?>> classesToRemap = new ArrayList<>();
+    private int packageId = 0x7f;
+    private String packageName;
+    private boolean useStaticValueForNonFinalFields = false;
+    private Map<String, String> colorValues = new TreeMap<>();
+    private Set<String> colorsWithExtraConfigs = new TreeSet<>();
+    private boolean aaptBinaryRoundtrip = false;
+
+    // Create the android resources from the passed in R classes
+    // All values will be generated based on the fields in the class.
+    // This takes the actual inner classes (e.g., R$String)
+    // These R classes will be used to rewrite the namespace and class names on the aapt2
+    // generated names.
+    public AndroidTestResourceBuilder addRClassInitializeWithDefaultValues(Class<?>... rClasses) {
+      return addRClassInitializeWithDefaultValues(true, rClasses);
+    }
+
+    public AndroidTestResourceBuilder addRClassInitializeWithDefaultValues(
+        boolean addRClass, Class<?>... rClasses) {
+      for (Class<?> rClass : rClasses) {
+        if (addRClass) {
+          classesToRemap.add(rClass);
+        }
+        RClassType rClassType = RClassType.fromClass(rClass);
+        for (Field declaredField : rClass.getDeclaredFields()) {
+          String name = declaredField.getName();
+          if (rClassType == RClassType.STRING) {
+            addStringValue(name, name);
+          }
+          if (rClassType == RClassType.COLOR) {
+            addColor(name, "#FCFCFC");
+          }
+          if (rClassType == RClassType.FRACTION) {
+            addFractionValue(name, "10%");
+          }
+          if (rClassType == RClassType.DRAWABLE) {
+            addDrawable(name + ".png", TINY_PNG);
+          }
+          if (rClassType == RClassType.STYLEABLE) {
+            // Add 4 different values, i.e., the array will be 4 integers.
+            addStyleable(name, 4);
+          }
+          if (rClassType == RClassType.ID) {
+            addIdValue(name);
+          }
+        }
+      }
+      return this;
+    }
+
+    AndroidTestResourceBuilder addColor(String name, String value) {
+      colorValues.put(name, value);
+      return this;
+    }
+
+    // When set, use final ids for the AAPT resource generation, but remove the final bit in the
+    // ASM pass. This will emulate the R classes that AGP generates, where the static fields are
+    // set with a static value instead of through <clinit>.
+    AndroidTestResourceBuilder useStaticValueForNonFinalFields() {
+      this.useStaticValueForNonFinalFields = true;
+      return this;
+    }
+
+    AndroidTestResourceBuilder withManifest(String manifest) {
+      this.manifest = manifest;
+      return this;
+    }
+
+    AndroidTestResourceBuilder addXmlWithStringAndColorReference(
+        String xmlName, String stringValue, String colorValue) {
+      xmlFiles.put(
+          xmlName,
+          String.format(XML_FILE_WITH_COLOR_AND_STRING_REFERENCE, stringValue, colorValue));
+      return this;
+    }
+
+    AndroidTestResourceBuilder addXmlWithStringReference(
+        String xmlName, String nameOfReferencedString) {
+      return addXmlWithStringAndColorReference(
+          xmlName, "@string/" + nameOfReferencedString, "#FF0A0B0C");
+    }
+
+    AndroidTestResourceBuilder addXmlWithColorReference(String xmlName, String nameOfColor) {
+      return addXmlWithStringAndColorReference(
+          xmlName, "This is a string", "@color/" + nameOfColor);
+    }
+
+    public AndroidTestResourceBuilder withSimpleManifestAndAppNameString() {
+      this.manifest = SIMPLE_MANIFEST_WITH_APP_NAME;
+      addStringValue("app_name", "Most important app ever.");
+      return this;
+    }
+
+    AndroidTestResourceBuilder addStyleable(String name, int numberOfValues) {
+      styleables.put(name, numberOfValues);
+      return this;
+    }
+
+    AndroidTestResourceBuilder addStringValue(String name, String value) {
+      stringValues.put(name, value);
+      return this;
+    }
+
+    AndroidTestResourceBuilder addFractionValue(String name, String value) {
+      fractionValues.put(name, value);
+      return this;
+    }
+
+    AndroidTestResourceBuilder addIdValue(String name) {
+      xmlFiles.put("file_" + name + ".xml", String.format(XML_FILE_WITH_ID, name));
+      return this;
+    }
+
+    public AndroidTestResourceBuilder addXml(String name, String content) {
+      xmlFiles.put(name, content);
+      return this;
+    }
+
+    public AndroidTestResourceBuilder addApiSpecificXml(String name, String content) {
+      apiSpecificXmlFiles.put(name, content);
+      return this;
+    }
+
+    public AndroidTestResourceBuilder addKeepXmlFor(String... resourceReferences) {
+      addRawXml("keep.xml", getKeepXmlContent(resourceReferences));
+      return this;
+    }
+
+    private static String getKeepXmlContent(String[] resourceReferences) {
+      return String.format(KEEP_XML, String.join(",", resourceReferences));
+    }
+
+    public AndroidTestResourceBuilder addExplicitKeepRuleFileFor(String... resourceReferences) {
+      keepRuleFiles.add(getKeepXmlContent(resourceReferences));
+      return this;
+    }
+
+    public AndroidTestResourceBuilder addRawXml(String name, String content) {
+      assert !rawXmlFiles.containsKey(name);
+      rawXmlFiles.put(name, content);
+      return this;
+    }
+
+    AndroidTestResourceBuilder addExtraLanguageString(String name) {
+      stringValuesWithExtraLanguage.add(name);
+      return this;
+    }
+
+    AndroidTestResourceBuilder setOverlayableFor(String type, String name) {
+      overlayableValues.put(type, name);
+      return this;
+    }
+
+    public AndroidTestResourceBuilder setPackageId(int packageId) {
+      this.packageId = packageId;
+      return this;
+    }
+
+    AndroidTestResourceBuilder addDrawable(String name, byte[] value) {
+      drawables.put(name, value);
+      return this;
+    }
+
+    public AndroidTestResourceBuilder setPackageName(String packageName) {
+      this.packageName = packageName;
+      return this;
+    }
+
+    public AndroidTestResource build(TemporaryFolder temp) throws IOException {
+      Path manifestPath =
+          FileUtils.writeTextFile(temp.newFile("AndroidManifest.xml").toPath(), this.manifest);
+      Path resFolder = temp.newFolder("res").toPath();
+      Path valuesFolder = temp.newFolder("res", "values").toPath();
+      if (stringValues.size() > 0) {
+        FileUtils.writeTextFile(
+            valuesFolder.resolve("strings.xml"), createStringResourceXml(false));
+        if (stringValuesWithExtraLanguage.size() > 0) {
+          Path languageValues = temp.newFolder("res", "values-da").toPath();
+          FileUtils.writeTextFile(
+              languageValues.resolve("strings.xml"), createStringResourceXml(true));
+        }
+      }
+      if (colorValues.size() > 0) {
+        FileUtils.writeTextFile(valuesFolder.resolve("colors.xml"), createColorXml(false));
+        if (colorsWithExtraConfigs.size() > 0) {
+          Path alternativeValues = temp.newFolder("res", "values-night").toPath();
+          FileUtils.writeTextFile(alternativeValues.resolve("colors.xml"), createColorXml(true));
+        }
+      }
+      if (fractionValues.size() > 0) {
+        FileUtils.writeTextFile(valuesFolder.resolve("fractions.xml"), createFractionResourceXml());
+      }
+      if (overlayableValues.size() > 0) {
+        FileUtils.writeTextFile(valuesFolder.resolve("overlayable.xml"), createOverlayableXml());
+      }
+      if (styleables.size() > 0) {
+        FileUtils.writeTextFile(
+            valuesFolder.resolve("styleables.xml"), createStyleableResourceXml());
+      }
+      if (drawables.size() > 0) {
+        File drawableFolder = temp.newFolder("res", "drawable");
+        for (Entry<String, byte[]> entry : drawables.entrySet()) {
+          FileUtils.writeToFile(
+              drawableFolder.toPath().resolve(entry.getKey()), null, entry.getValue());
+        }
+      }
+      if (xmlFiles.size() > 0) {
+        File xmlFolder = temp.newFolder("res", "xml");
+        for (Entry<String, String> entry : xmlFiles.entrySet()) {
+          FileUtils.writeTextFile(xmlFolder.toPath().resolve(entry.getKey()), entry.getValue());
+        }
+      }
+
+      if (apiSpecificXmlFiles.size() > 0) {
+        File xmlFolder = temp.newFolder("res", "xml-v24");
+        for (Entry<String, String> entry : apiSpecificXmlFiles.entrySet()) {
+          FileUtils.writeTextFile(xmlFolder.toPath().resolve(entry.getKey()), entry.getValue());
+        }
+      }
+
+      if (rawXmlFiles.size() > 0) {
+        File rawXmlFolder = temp.newFolder("res", "raw");
+        for (Entry<String, String> entry : rawXmlFiles.entrySet()) {
+          FileUtils.writeTextFile(rawXmlFolder.toPath().resolve(entry.getKey()), entry.getValue());
+        }
+      }
+
+      Path output = temp.newFile("resources.zip").toPath();
+      Path rClassOutputDir = temp.newFolder("aapt_R_class").toPath();
+      String aaptPackageName =
+          packageName != null ? packageName : "thepackage" + packageId + ".foobar";
+      compileWithAapt2(
+          resFolder,
+          manifestPath,
+          rClassOutputDir,
+          output,
+          temp,
+          packageId,
+          aaptPackageName,
+          !useStaticValueForNonFinalFields,
+          aaptBinaryRoundtrip);
+      Path rClassJavaFile =
+          Files.walk(rClassOutputDir)
+              .filter(path -> path.endsWith("R.java"))
+              .collect(MoreCollectors.onlyElement());
+      Path rClassClassFileOutput =
+          javac(CfRuntime.getDefaultCfRuntime(), temp).addSourceFiles(rClassJavaFile).compile();
+      Map<String, String> noNamespaceToProgramMap =
+          classesToRemap.stream()
+              .collect(
+                  Collectors.toMap(
+                      AndroidResourceTestingUtils::rClassWithoutNamespaceAndOuter,
+                      DescriptorUtils::getClassBinaryName));
+      Map<String, byte[]> rewrittenRClassFiles = new HashMap<>();
+      ZipUtils.iter(
+          rClassClassFileOutput,
+          (entry, input) -> {
+            if (ZipUtils.isClassFile(entry.getName()) && !entry.getName().endsWith("R.class")) {
+              rewrittenRClassFiles.put(
+                  entry.getName(),
+                  transformer(StreamUtils.streamToByteArrayClose(input), null)
+                      .addClassTransformer(
+                          new ClassTransformer() {
+                            @Override
+                            public void visit(
+                                int version,
+                                int access,
+                                String name,
+                                String signature,
+                                String superName,
+                                String[] interfaces) {
+                              String maybeTransformedName =
+                                  isInnerRClass(name)
+                                      ? noNamespaceToProgramMap.getOrDefault(
+                                          rClassWithoutNamespaceAndOuter(name), name)
+                                      : name;
+                              super.visit(
+                                  version,
+                                  access,
+                                  maybeTransformedName,
+                                  signature,
+                                  superName,
+                                  interfaces);
+                            }
+
+                            @Override
+                            public void visitNestHost(String nestHost) {
+                              // Don't make nest host relationsships
+                            }
+
+                            @Override
+                            public void visitOuterClass(
+                                String owner, String name, String descriptor) {
+                              // Don't make the inner<>outer class connection
+                            }
+
+                            @Override
+                            public FieldVisitor visitField(
+                                int access,
+                                String name,
+                                String descriptor,
+                                String signature,
+                                Object value) {
+                              if (useStaticValueForNonFinalFields) {
+                                access &= ~Opcodes.ACC_FINAL;
+                              }
+                              return super.visitField(access, name, descriptor, signature, value);
+                            }
+
+                            @Override
+                            public void visitInnerClass(
+                                String name, String outerName, String innerName, int access) {
+                              // Don't make the inner<>outer class connection
+                            }
+                          })
+                      .addMethodTransformer(
+                          new MethodTransformer() {
+                            @Override
+                            public void visitFieldInsn(
+                                int opcode, String owner, String name, String descriptor) {
+                              String maybeTransformedOwner =
+                                  isInnerRClass(owner)
+                                      ? noNamespaceToProgramMap.getOrDefault(
+                                          rClassWithoutNamespaceAndOuter(owner), owner)
+                                      : owner;
+                              super.visitFieldInsn(opcode, maybeTransformedOwner, name, descriptor);
+                            }
+                          })
+                      .transform());
+            }
+          });
+      return new AndroidTestResource(
+          new AndroidTestRClass(rClassJavaFile, rewrittenRClassFiles), output, keepRuleFiles);
+    }
+
+    private String createColorXml(boolean nonDefaultColor) {
+      StringBuilder stringBuilder = new StringBuilder("<resources>\n");
+      colorValues.forEach(
+          (name, color) -> {
+            if (!nonDefaultColor || colorsWithExtraConfigs.contains(name)) {
+              stringBuilder.append(
+                  "<color name=\""
+                      + name
+                      + "\">"
+                      + (!nonDefaultColor ? color : "#000000FF")
+                      + "</color>");
+            }
+          });
+      stringBuilder.append("</resources>");
+      return stringBuilder.toString();
+    }
+
+    private String createOverlayableXml() {
+      StringBuilder stringBuilder = new StringBuilder("<resources>\n");
+
+      stringBuilder.append("<overlayable name=\"OurOverlayables\">\n");
+      stringBuilder.append("<policy type=\"public\">\n");
+      overlayableValues.forEach(
+          (type, name) ->
+              stringBuilder.append("<item type=\"" + type + "\" name=\"" + name + "\" />\n"));
+      stringBuilder.append("</policy>\n");
+      stringBuilder.append("</overlayable>");
+      stringBuilder.append("</resources>");
+      return stringBuilder.toString();
+    }
+
+    private String createStringResourceXml(boolean nonDefaultLanguage) {
+      StringBuilder stringBuilder = new StringBuilder("<resources>\n");
+      String languagePostFix = nonDefaultLanguage ? "_da" : "";
+      stringValues.forEach(
+          (name, value) -> {
+            if (!nonDefaultLanguage || stringValuesWithExtraLanguage.contains(name)) {
+              stringBuilder.append(
+                  "<string name=\"" + name + "\">" + value + languagePostFix + "</string>\n");
+            }
+          });
+      stringBuilder.append("</resources>");
+      return stringBuilder.toString();
+    }
+
+    private String createFractionResourceXml() {
+      StringBuilder stringBuilder = new StringBuilder("<resources>\n");
+      fractionValues.forEach(
+          (name, value) -> {
+            stringBuilder.append(
+                "<item type=\"fraction\" name=\"" + name + "\">" + value + "</item>\n");
+          });
+      stringBuilder.append("</resources>");
+      return stringBuilder.toString();
+    }
+
+    private String createStyleableResourceXml() {
+      StringBuilder stringBuilder = new StringBuilder("<resources>\n");
+      styleables.forEach(
+          (name, value) -> {
+            stringBuilder.append("<declare-styleable name=\"" + name + "\">\n");
+            // For every entry we add here we will have an additional array entry pointing
+            // at the boolean attr in the resource table. We will also get a name_attri R class
+            // entry to select into the generated array.
+            for (Integer i = 0; i < value; i++) {
+              stringBuilder.append("<attr name=\"attr_" + name + i + "\" format=\"boolean\" />\n");
+            }
+            stringBuilder.append("</declare-styleable>");
+          });
+      stringBuilder.append("</resources>");
+      return stringBuilder.toString();
+    }
+
+    public AndroidTestResourceBuilder addExtraColorConfig(String name) {
+      colorsWithExtraConfigs.add(name);
+      return this;
+    }
+
+    public AndroidTestResourceBuilder setAaptBinaryRoundtrip(boolean aaptBinaryRoundtrip) {
+      this.aaptBinaryRoundtrip = aaptBinaryRoundtrip;
+      return this;
+    }
+  }
+
+  public static ProcessResult dumpWithAapt2(Path path) throws IOException {
+    return ToolHelper.runAapt2("dump", "resources", path.toString());
+  }
+
+  public static void dumpWithAapt2ToStdout(Path path) throws IOException {
+    System.out.println(dumpWithAapt2(path));
+  }
+
+  public static void compileWithAapt2(
+      Path resFolder,
+      Path manifest,
+      Path rClassFolder,
+      Path resourceZip,
+      TemporaryFolder temp,
+      int packageId,
+      String packageName,
+      boolean nonFinalIds,
+      boolean aaptBinaryRoundtrip)
+      throws IOException {
+    Path compileOutput = temp.newFile("compiled.zip").toPath();
+    Path tempBinary = temp.newFile("tempbinary.zip").toPath();
+    ProcessResult compileProcessResult =
+        ToolHelper.runAapt2(
+            "compile", "-o", compileOutput.toString(), "--dir", resFolder.toString());
+    failOnError(compileProcessResult);
+
+    List<String> args =
+        Lists.newArrayList(
+            "link",
+            "-I",
+            ToolHelper.getAndroidJar(AndroidApiLevel.S).toString(),
+            "--java",
+            rClassFolder.toString(),
+            "--manifest",
+            manifest.toString(),
+            "--package-id",
+            "" + packageId,
+            "--allow-reserved-package-id",
+            "--no-auto-version",
+            "--rename-resources-package",
+            packageName,
+            "--custom-package",
+            packageName,
+            compileOutput.toString());
+    if (!aaptBinaryRoundtrip) {
+      args.add("--proto-format");
+      args.add("-o");
+      args.add(resourceZip.toString());
+    } else {
+      args.add("-o");
+      args.add(tempBinary.toString());
+    }
+
+    if (nonFinalIds) {
+      args.add("--non-final-ids");
+    }
+
+    ProcessResult linkProcesResult = ToolHelper.runAapt2(args.toArray(new String[0]));
+    failOnError(linkProcesResult);
+
+    if (aaptBinaryRoundtrip) {
+      List<String> roundTripArgs =
+          Lists.newArrayList(
+              "convert",
+              "-o",
+              resourceZip.toString(),
+              "--output-format",
+              "proto",
+              tempBinary.toString());
+      ProcessResult roundTripResult = ToolHelper.runAapt2(roundTripArgs.toArray(new String[0]));
+      failOnError(roundTripResult);
+    }
+  }
+
+  private static void failOnError(ProcessResult processResult) {
+    if (processResult.exitCode != 0) {
+      throw new RuntimeException("Failed aapt2: \n" + processResult);
+    }
+  }
+
+  // The below byte arrays are lifted from the resource shrinkers DummyContent
+
+  // A 1x1 pixel PNG of type BufferedImage.TYPE_BYTE_GRAY
+  public static final byte[] TINY_PNG =
+      new byte[] {
+        (byte) -119, (byte) 80, (byte) 78, (byte) 71, (byte) 13, (byte) 10,
+        (byte) 26, (byte) 10, (byte) 0, (byte) 0, (byte) 0, (byte) 13,
+        (byte) 73, (byte) 72, (byte) 68, (byte) 82, (byte) 0, (byte) 0,
+        (byte) 0, (byte) 1, (byte) 0, (byte) 0, (byte) 0, (byte) 1,
+        (byte) 8, (byte) 0, (byte) 0, (byte) 0, (byte) 0, (byte) 58,
+        (byte) 126, (byte) -101, (byte) 85, (byte) 0, (byte) 0, (byte) 0,
+        (byte) 10, (byte) 73, (byte) 68, (byte) 65, (byte) 84, (byte) 120,
+        (byte) -38, (byte) 99, (byte) 96, (byte) 0, (byte) 0, (byte) 0,
+        (byte) 2, (byte) 0, (byte) 1, (byte) -27, (byte) 39, (byte) -34,
+        (byte) -4, (byte) 0, (byte) 0, (byte) 0, (byte) 0, (byte) 73,
+        (byte) 69, (byte) 78, (byte) 68, (byte) -82, (byte) 66, (byte) 96,
+        (byte) -126
+      };
+
+  // The XML document <x/> as a proto packed with AAPT2
+  public static final byte[] TINY_PROTO_XML =
+      new byte[] {0xa, 0x3, 0x1a, 0x1, 0x78, 0x1a, 0x2, 0x8, 0x1};
+
+}

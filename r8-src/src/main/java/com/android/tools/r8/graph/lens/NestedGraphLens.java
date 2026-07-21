@@ -1,0 +1,321 @@
+// Copyright (c) 2023, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.graph.lens;
+
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexClassAndField;
+import com.android.tools.r8.graph.DexDefinitionSupplier;
+import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.proto.RewrittenPrototypeDescription;
+import com.android.tools.r8.ir.code.InvokeType;
+import com.android.tools.r8.utils.internal.IterableUtils;
+import com.android.tools.r8.utils.internal.collections.BidirectionalManyToManyRepresentativeMap;
+import com.android.tools.r8.utils.internal.collections.BidirectionalManyToOneRepresentativeMap;
+import com.android.tools.r8.utils.internal.collections.EmptyBidirectionalOneToOneMap;
+import java.util.Map;
+import java.util.function.Function;
+
+/**
+ * GraphLens implementation with a parent lens where the mapping of types, methods and fields can be
+ * one-to-one, one-to-many, or many-to-one.
+ *
+ * <p>Subclasses can override the lookup methods.
+ *
+ * <p>For method mapping where invocation type can change just override {@link
+ * #mapInvocationType(DexMethod, DexMethod, DexMethod, InvokeType)} if the default name mapping
+ * applies, and only invocation type might need to change.
+ */
+public class NestedGraphLens extends DefaultNonIdentityGraphLens {
+
+  protected static final EmptyBidirectionalOneToOneMap<DexField, DexField> EMPTY_FIELD_MAP =
+      new EmptyBidirectionalOneToOneMap<>();
+  protected static final EmptyBidirectionalOneToOneMap<DexMethod, DexMethod> EMPTY_METHOD_MAP =
+      new EmptyBidirectionalOneToOneMap<>();
+  protected static final EmptyBidirectionalOneToOneMap<DexType, DexType> EMPTY_TYPE_MAP =
+      new EmptyBidirectionalOneToOneMap<>();
+
+  protected final BidirectionalManyToOneRepresentativeMap<DexField, DexField> fieldMap;
+  protected final Function<DexMethod, DexMethod> methodMap;
+  protected final BidirectionalManyToManyRepresentativeMap<DexType, DexType> typeMap;
+
+  // Map that stores the new signature of methods that have been affected by class merging, unused
+  // argument removal, repackaging, synthetic finalization, etc. This is needed to generate a
+  // correct mapping file in the end.
+  //
+  // The difference to `methodMap` is that `methodMap` specifies how invoke-method instructions
+  // should be rewritten, whereas this map specifies where methods have been moved. In most cases
+  // the two maps are the same, but in a few cases we move a method m1 to m2 and rewrite invokes to
+  // m1 to m3.
+  //
+  // The static type of this map is a many-to-many map to facilitate both one-to-many mappings and
+  // many-to-one mappings. Currently, the concrete map is always *either* a one-to-many or a
+  // many-to-one map, and not a many-to-many map.
+  //
+  // One-to-many mappings are generally found when methods are split into two. This could be due to
+  // the code object being moved elsewhere (e.g., interface desugaring).
+  //
+  // Many-to-one mappings are generally found when methods are shared, e.g., due to horizontal class
+  // merging of synthetic finalization.
+  protected BidirectionalManyToManyRepresentativeMap<DexMethod, DexMethod> newMethodSignatures;
+
+  // Overrides this if the sub type needs to be a nested lens while it doesn't have any mappings
+  // at all, e.g., publicizer lens that changes invocation type only.
+  protected boolean isLegitimateToHaveEmptyMappings() {
+    return false;
+  }
+
+  public NestedGraphLens(AppView<?> appView) {
+    this(
+        appView,
+        NestedGraphLens.EMPTY_FIELD_MAP,
+        NestedGraphLens.EMPTY_METHOD_MAP,
+        NestedGraphLens.EMPTY_TYPE_MAP);
+  }
+
+  public NestedGraphLens(
+      AppView<?> appView,
+      BidirectionalManyToOneRepresentativeMap<DexField, DexField> fieldMap,
+      BidirectionalManyToOneRepresentativeMap<DexMethod, DexMethod> methodMap,
+      BidirectionalManyToManyRepresentativeMap<DexType, DexType> typeMap) {
+    this(appView, fieldMap, methodMap.getForwardMap(), typeMap, methodMap);
+  }
+
+  public NestedGraphLens(
+      AppView<?> appView,
+      BidirectionalManyToOneRepresentativeMap<DexField, DexField> fieldMap,
+      Map<DexMethod, DexMethod> methodMap,
+      BidirectionalManyToManyRepresentativeMap<DexType, DexType> typeMap,
+      BidirectionalManyToManyRepresentativeMap<DexMethod, DexMethod> newMethodSignatures) {
+    this(appView, fieldMap, methodMap::get, typeMap, newMethodSignatures);
+    assert !typeMap.isEmpty()
+        || !methodMap.isEmpty()
+        || !fieldMap.isEmpty()
+        || isLegitimateToHaveEmptyMappings();
+  }
+
+  public NestedGraphLens(
+      AppView<?> appView,
+      BidirectionalManyToOneRepresentativeMap<DexField, DexField> fieldMap,
+      Function<DexMethod, DexMethod> methodMap,
+      BidirectionalManyToManyRepresentativeMap<DexType, DexType> typeMap,
+      BidirectionalManyToManyRepresentativeMap<DexMethod, DexMethod> newMethodSignatures) {
+    super(appView);
+    this.fieldMap = fieldMap;
+    this.methodMap = methodMap;
+    this.typeMap = typeMap;
+    this.newMethodSignatures = newMethodSignatures;
+  }
+
+  @Override
+  public DexType getPreviousClassType(DexType type) {
+    return typeMap.getRepresentativeKeyOrDefault(type, type);
+  }
+
+  @Override
+  public DexType getNextClassType(DexType type) {
+    return typeMap.getRepresentativeValueOrDefault(type, type);
+  }
+
+  protected Iterable<DexType> internalGetOriginalTypes(DexType type) {
+    return IterableUtils.singleton(getPreviousClassType(type));
+  }
+
+  @Override
+  public Iterable<DexType> getOriginalTypes(DexType type) {
+    return IterableUtils.flatMap(internalGetOriginalTypes(type), getPrevious()::getOriginalTypes);
+  }
+
+  @Override
+  @SuppressWarnings("ReferenceEquality")
+  protected FieldLookupResult internalDescribeLookupField(FieldLookupResult previous) {
+    if (previous.hasReboundReference()) {
+      // Rewrite the rebound reference and then "fixup" the non-rebound reference.
+      DexField rewrittenReboundReference = previous.getRewrittenReboundReference(fieldMap);
+      DexField rewrittenNonReboundReference;
+      if (previous.getReference().isIdenticalTo(previous.getReboundReference())) {
+        rewrittenNonReboundReference = rewrittenReboundReference;
+      } else {
+        // Compute the new holder by mapping the original symbolic holder through the lens.
+        DexType originalHolder = previous.getReference().getHolderType();
+        DexType rewrittenHolder = getNextClassType(originalHolder);
+        rewrittenNonReboundReference =
+            rewrittenReboundReference.withHolder(rewrittenHolder, dexItemFactory());
+        // When vertical class merging preserve non-rebound method references when we can hit a
+        // collision due to field shadowing (b/348202700).
+        if (isVerticalClassMergerLens() && rewrittenHolder.isNotIdenticalTo(originalHolder)) {
+          DexClassAndField collision = appView.definitionFor(rewrittenNonReboundReference);
+          if (collision != null) {
+            assert !asVerticalClassMergerLens().hasBeenMerged(collision.getHolder().getSuperType());
+            rewrittenNonReboundReference =
+                rewrittenReboundReference.withHolder(
+                    collision.getHolder().getSuperType(), dexItemFactory());
+          }
+        }
+      }
+      return FieldLookupResult.builder(this)
+          .setReboundReference(rewrittenReboundReference)
+          .setReference(rewrittenNonReboundReference)
+          .setReadCastType(previous.getRewrittenReadCastType(this::getNextClassType))
+          .setWriteCastType(previous.getRewrittenWriteCastType(this::getNextClassType))
+          .build();
+    } else {
+      // TODO(b/168282032): We should always have the rebound reference, so this should become
+      //  unreachable.
+      DexField rewrittenReference = previous.getRewrittenReference(fieldMap);
+      return FieldLookupResult.builder(this)
+          .setReference(rewrittenReference)
+          .setReadCastType(previous.getRewrittenReadCastType(this::getNextClassType))
+          .setWriteCastType(previous.getRewrittenWriteCastType(this::getNextClassType))
+          .build();
+    }
+  }
+
+  @Override
+  @SuppressWarnings("ReferenceEquality")
+  public MethodLookupResult internalDescribeLookupMethod(
+      MethodLookupResult previous, DexMethod context, GraphLens codeLens) {
+    if (previous.hasReboundReference()) {
+      // TODO(sgjesse): Should we always do interface to virtual mapping? Is it a performance win
+      //  that only subclasses which are known to need it actually do it?
+      DexMethod rewrittenReboundReference = previous.getRewrittenReboundReference(methodMap);
+      DexMethod rewrittenReference =
+          previous.getReference() == previous.getReboundReference()
+              ? rewrittenReboundReference
+              : // This assumes that the holder will always be moved in lock-step with the method!
+              rewrittenReboundReference.withHolder(
+                  getNextClassType(previous.getReference().getHolderType()), dexItemFactory());
+      return MethodLookupResult.builder(this, codeLens)
+          .setReference(rewrittenReference)
+          .setReboundReference(rewrittenReboundReference)
+          .setPrototypeChanges(
+              internalDescribePrototypeChanges(
+                  previous.getPrototypeChanges(),
+                  previous.getReboundReference(),
+                  rewrittenReboundReference))
+          .setType(
+              mapInvocationType(
+                  rewrittenReference,
+                  rewrittenReboundReference,
+                  previous.getReference(),
+                  previous.getType()))
+          .build();
+    } else {
+      // TODO(b/168282032): We should always have the rebound reference, so this should become
+      //  unreachable.
+      DexMethod newMethod = methodMap.apply(previous.getReference());
+      if (newMethod == null) {
+        newMethod = previous.getReference();
+      }
+      RewrittenPrototypeDescription newPrototypeChanges =
+          internalDescribePrototypeChanges(
+              previous.getPrototypeChanges(), previous.getReference(), newMethod);
+      if (newMethod == previous.getReference()
+          && newPrototypeChanges == previous.getPrototypeChanges()) {
+        return previous.verify(this, codeLens);
+      }
+      // TODO(sgjesse): Should we always do interface to virtual mapping? Is it a performance win
+      //  that only subclasses which are known to need it actually do it?
+      return MethodLookupResult.builder(this, codeLens)
+          .setReference(newMethod)
+          .setPrototypeChanges(newPrototypeChanges)
+          .setType(
+              mapInvocationType(newMethod, newMethod, previous.getReference(), previous.getType()))
+          .build();
+    }
+  }
+
+  @Override
+  public RewrittenPrototypeDescription lookupPrototypeChangesForMethodDefinition(
+      DexMethod method, GraphLens codeLens) {
+    if (this == codeLens) {
+      return getIdentityLens().lookupPrototypeChangesForMethodDefinition(method, codeLens);
+    }
+    DexMethod previous = getPreviousMethodSignature(method);
+    RewrittenPrototypeDescription lookup =
+        getPrevious().lookupPrototypeChangesForMethodDefinition(previous, codeLens);
+    return internalDescribePrototypeChanges(lookup, previous, method);
+  }
+
+  protected RewrittenPrototypeDescription internalDescribePrototypeChanges(
+      RewrittenPrototypeDescription prototypeChanges,
+      DexMethod previousMethod,
+      DexMethod newMethod) {
+    return prototypeChanges;
+  }
+
+  @Override
+  public DexField getPreviousFieldSignature(DexField field) {
+    return fieldMap.getRepresentativeKeyOrDefault(field, field);
+  }
+
+  @Override
+  public DexField getNextFieldSignature(DexField field) {
+    return fieldMap.getOrDefault(field, field);
+  }
+
+  @Override
+  public DexMethod getPreviousMethodSignature(DexMethod method) {
+    return newMethodSignatures.getRepresentativeKeyOrDefault(method, method);
+  }
+
+  @Override
+  public DexMethod getNextMethodSignature(DexMethod method) {
+    return newMethodSignatures.getRepresentativeValueOrDefault(method, method);
+  }
+
+  /**
+   * Default invocation type mapping.
+   *
+   * <p>This is an identity mapping. If a subclass need invocation type mapping either override this
+   * method or {@link #lookupMethod(DexMethod, DexMethod, InvokeType)}
+   */
+  protected InvokeType mapInvocationType(
+      DexMethod newMethod, DexMethod newReboundMethod, DexMethod originalMethod, InvokeType type) {
+    return type;
+  }
+
+  /**
+   * Standard mapping between interface and virtual invoke type.
+   *
+   * <p>Handle methods moved from interface to class or class to interface.
+   */
+  public static InvokeType mapVirtualInterfaceInvocationTypes(
+      DexDefinitionSupplier definitions,
+      DexMethod newMethod,
+      DexMethod originalMethod,
+      InvokeType type) {
+    if (type == InvokeType.VIRTUAL || type == InvokeType.INTERFACE) {
+      // Get the invoke type of the actual definition.
+      DexClass newTargetClass = definitions.definitionFor(newMethod.getHolderType());
+      if (newTargetClass == null) {
+        return type;
+      }
+      DexClass originalTargetClass = definitions.definitionFor(originalMethod.getHolderType());
+      if (originalTargetClass != null
+          && (originalTargetClass.isInterface() ^ (type == InvokeType.INTERFACE))) {
+        // The invoke was wrong to start with, so we keep it wrong. This is to ensure we get
+        // the IncompatibleClassChangeError the original invoke would have triggered.
+        return newTargetClass.accessFlags.isInterface() ? InvokeType.VIRTUAL : InvokeType.INTERFACE;
+      }
+      return newTargetClass.accessFlags.isInterface() ? InvokeType.INTERFACE : InvokeType.VIRTUAL;
+    }
+    return type;
+  }
+
+  @Override
+  public boolean verifyIsContextFreeForMethod(DexMethod method, GraphLens codeLens) {
+    assert codeLens == this
+        || getPrevious().verifyIsContextFreeForMethod(getPreviousMethodSignature(method), codeLens);
+    return true;
+  }
+
+  @Override
+  public String toString() {
+    return getClass().getName();
+  }
+}

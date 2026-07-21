@@ -1,0 +1,492 @@
+// Copyright (c) 2019, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.retrace;
+
+import static com.android.tools.r8.utils.ExceptionUtils.failWithFakeEntry;
+
+import com.android.tools.r8.Diagnostic;
+import com.android.tools.r8.DiagnosticsHandler;
+import com.android.tools.r8.ParseFlagInfo;
+import com.android.tools.r8.Version;
+import com.android.tools.r8.keepanno.annotations.KeepForApi;
+import com.android.tools.r8.retrace.internal.RetraceAbortException;
+import com.android.tools.r8.retrace.internal.RetraceBase;
+import com.android.tools.r8.retrace.internal.StackTraceElementStringProxy;
+import com.android.tools.r8.retrace.internal.StackTraceRegularExpressionParser;
+import com.android.tools.r8.utils.CliParserUtils;
+import com.android.tools.r8.utils.ExceptionDiagnostic;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.PartitionMapZipContainer;
+import com.android.tools.r8.utils.StringDiagnostic;
+import com.android.tools.r8.utils.internal.CliParser;
+import com.android.tools.r8.utils.timing.Timing;
+import com.google.common.base.Charsets;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintStream;
+import java.io.UnsupportedEncodingException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+
+/**
+ * A retrace tool for obfuscated stack traces.
+ *
+ * <p>This is the interface for getting de-obfuscating stack traces, similar to the proguard retrace
+ * tool.
+ */
+@KeepForApi
+public class Retrace<T, ST extends StackTraceElementProxy<T, ST>> extends RetraceBase<T, ST> {
+
+  public static List<ParseFlagInfo> getFlags() {
+    return CliParserUtils.getFlagInfos(createParser());
+  }
+
+  private static class ParserState {
+
+    final RetraceCommand.Builder builder;
+    final DiagnosticsHandler diagnosticsHandler;
+    boolean hasSetQuiet = false;
+    boolean hasSetStackTrace = false;
+    boolean hasSetProguardMap = false;
+    boolean printHelp = false;
+    boolean printVersion = false;
+
+    public ParserState(RetraceCommand.Builder builder, DiagnosticsHandler diagnosticsHandler) {
+      this.builder = builder;
+      this.diagnosticsHandler = diagnosticsHandler;
+    }
+  }
+
+  private static CliParser<ParserState> createParser() {
+    String header =
+        "Usage: retrace [options] <proguard-map> [stack-trace-file] "
+            + "where <proguard-map> is a generated mapping file and options are:";
+    var parser = new CliParser<ParserState>(header);
+    return parser
+        .withBaseParser(
+            baseParser ->
+                baseParser.option1(
+                    "--regex",
+                    "<regexp>",
+                    "Regular expression for parsing stack-trace-file as lines.",
+                    (b, arg) -> {
+                      if (arg.isEmpty()) {
+                        b.diagnosticsHandler.error(
+                            new StringDiagnostic("Empty argument for --regex"));
+                      } else {
+                        b.builder.setRegularExpression(arg);
+                      }
+                    },
+                    "--r"))
+        .option0("--verbose", "Get verbose retraced output.", b -> b.builder.setVerbose(true))
+        .option0(
+            "--info",
+            "Write information messages to stdout.",
+            b -> {
+              /* This is already set in the diagnostics handler. */
+            })
+        .option0(
+            "--quiet", "Silence ordinary messages printed to stdout.", b -> b.hasSetQuiet = true)
+        .option0(
+            "--verify-mapping-file-hash",
+            "Verify the mapping file hash.",
+            b -> {
+              b.builder.setVerifyMappingFileHash(true);
+              b.hasSetStackTrace = true;
+            })
+        .withBaseParser(
+            baseParser ->
+                baseParser.option1(
+                    "--partition-map",
+                    "<file>",
+                    "Partition map to use.",
+                    (b, arg) -> {
+                      if (arg.isEmpty()) {
+                        b.diagnosticsHandler.error(
+                            new StringDiagnostic("Empty argument for --partition-map"));
+                      } else {
+                        b.builder.setMappingSupplier(
+                            getPartitionMappingSupplier(arg, b.diagnosticsHandler));
+                        b.hasSetProguardMap = true;
+                      }
+                    },
+                    "--p"))
+        .option0("--help", "Print this message.", b -> b.printHelp = true, "-h")
+        .option0("--version", "Print the version.", b -> b.printVersion = true)
+        .positional(
+            (b, arg) -> {
+              if (!b.hasSetProguardMap) {
+                b.builder.setMappingSupplier(getMappingSupplier(arg, b.diagnosticsHandler));
+                b.hasSetProguardMap = true;
+              } else if (!b.hasSetStackTrace) {
+                b.builder.setStackTrace(getStackTraceFromFile(arg, b.diagnosticsHandler));
+                b.hasSetStackTrace = true;
+              } else {
+                b.diagnosticsHandler.error(
+                    new StringDiagnostic("Too many arguments specified for builder at " + arg));
+                b.diagnosticsHandler.error(new StringDiagnostic(getUsageMessage()));
+                throw new RetraceAbortException();
+              }
+            });
+  }
+
+  static String getUsageMessage() {
+    return CliParserUtils.getUsageMessage(createParser());
+  }
+
+  private static ParserState parseArguments(String[] args, DiagnosticsHandler diagnosticsHandler) {
+    RetraceCommand.Builder builder = RetraceCommand.builder(diagnosticsHandler);
+    ParserState state = new ParserState(builder, diagnosticsHandler);
+    createParser().parse(args, state, err -> diagnosticsHandler.error(new StringDiagnostic(err)));
+
+    if (state.printHelp || state.printVersion) {
+      return state;
+    }
+
+    if (!state.hasSetProguardMap) {
+      diagnosticsHandler.error(new StringDiagnostic("Mapping file not specified"));
+      throw new RetraceAbortException();
+    }
+    if (!state.hasSetStackTrace) {
+      builder.setStackTrace(getStackTraceFromStandardInput(state.hasSetQuiet));
+    }
+    return state;
+  }
+
+  private static MappingSupplier<?> getPartitionMappingSupplier(
+      String partitionMap, DiagnosticsHandler diagnosticsHandler) {
+    Path path = Paths.get(partitionMap);
+    if (!Files.exists(path)) {
+      diagnosticsHandler.error(
+          new StringDiagnostic(String.format("Could not find mapping file '%s'.", partitionMap)));
+      throw new RetraceAbortException();
+    }
+    try {
+      return PartitionMapZipContainer.createPartitionMapZipContainerSupplier(path);
+    } catch (Exception e) {
+      diagnosticsHandler.error(new ExceptionDiagnostic(e));
+      throw new RetraceAbortException();
+    }
+  }
+
+  private static ProguardMappingSupplier getMappingSupplier(
+      String mappingPath, DiagnosticsHandler diagnosticsHandler) {
+    Path path = Paths.get(mappingPath);
+    if (!Files.exists(path)) {
+      diagnosticsHandler.error(
+          new StringDiagnostic(String.format("Could not find mapping file '%s'.", mappingPath)));
+      throw new RetraceAbortException();
+    }
+    boolean allowExperimentalMapVersion =
+        System.getProperty("com.android.tools.r8.experimentalmapping") != null;
+    return ProguardMappingSupplier.builder()
+        .setProguardMapProducer(ProguardMapProducer.fromPath(Paths.get(mappingPath)))
+        .setAllowExperimental(allowExperimentalMapVersion)
+        .setLoadAllDefinitions(false)
+        .build();
+  }
+
+  private static List<String> getStackTraceFromFile(
+      String stackTracePath, DiagnosticsHandler diagnostics) {
+    try {
+      return Files.readAllLines(Paths.get(stackTracePath), Charsets.UTF_8);
+    } catch (IOException e) {
+      diagnostics.error(new ExceptionDiagnostic(e));
+      throw new RetraceAbortException();
+    }
+  }
+
+  private final MappingSupplier<?> mappingSupplier;
+  private final DiagnosticsHandler diagnosticsHandler;
+
+  Retrace(
+      StackTraceLineParser<T, ST> stackTraceLineParser,
+      MappingSupplier<?> mappingSupplier,
+      DiagnosticsHandler diagnosticsHandler,
+      boolean isVerbose) {
+    super(stackTraceLineParser, mappingSupplier, diagnosticsHandler, isVerbose);
+    this.mappingSupplier = mappingSupplier;
+    this.diagnosticsHandler = diagnosticsHandler;
+  }
+
+  /**
+   * Retraces a complete stack frame and returns a list of retraced stack traces.
+   *
+   * @param stackTrace the stack trace to be retrace
+   * @param context The context to retrace the stack trace in
+   * @return list of potentially ambiguous stack traces.
+   */
+  public RetraceStackTraceResult<T> retraceStackTrace(
+      List<T> stackTrace, RetraceStackTraceContext context) {
+    return retraceStackTraceParsed(parse(stackTrace), context);
+  }
+
+  /**
+   * Retraces a complete stack frame and returns a list of retraced stack traces.
+   *
+   * @param stackTrace the stack trace to be retrace
+   * @param context The context to retrace the stack trace in
+   * @return list of potentially ambiguous stack traces.
+   */
+  public RetraceStackTraceResult<T> retraceStackTraceParsed(
+      List<ST> stackTrace, RetraceStackTraceContext context) {
+    registerUses(stackTrace);
+    return retraceStackTraceParsedWithRetracer(
+        mappingSupplier.createRetracer(diagnosticsHandler), stackTrace, context);
+  }
+
+  /**
+   * Retraces a stack trace frame with support for splitting up ambiguous results.
+   *
+   * @param stackTraceFrame The frame to retrace that can give rise to ambiguous results
+   * @param context The context to retrace the stack trace in
+   * @return A collection of potentially ambiguous retraced frames
+   */
+  public RetraceStackFrameAmbiguousResultWithContext<T> retraceFrame(
+      T stackTraceFrame, RetraceStackTraceContext context) {
+    ST parsedFrame = parse(stackTraceFrame);
+    registerUses(parsedFrame);
+    return retraceFrameWithRetracer(
+        mappingSupplier.createRetracer(diagnosticsHandler), parsedFrame, context);
+  }
+
+  /**
+   * Utility method for tracing a single line that also retraces ambiguous lines without being able
+   * to distinguish them. For retracing with ambiguous results separated, use {@link #retraceFrame}
+   *
+   * @param stackTraceLine the stack trace line to retrace
+   * @param context The context to retrace the stack trace in
+   * @return the retraced stack trace line
+   */
+  public RetraceStackFrameResultWithContext<T> retraceLine(
+      T stackTraceLine, RetraceStackTraceContext context) {
+    ST parsedFrame = parse(stackTraceLine);
+    registerUses(parsedFrame);
+    return retraceLineWithRetracer(
+        mappingSupplier.createRetracer(diagnosticsHandler), parsedFrame, context);
+  }
+
+  /**
+   * The main entry point for running retrace.
+   *
+   * @param command The command that describes the desired behavior of this retrace invocation.
+   */
+  public static void run(RetraceCommand command) {
+    try {
+      InternalOptions internalOptions = new InternalOptions();
+      internalOptions.printMemory = command.printMemory();
+      Timing timing = Timing.createRoot("R8 retrace", internalOptions, null);
+      RetraceOptions options = command.getOptions();
+      MappingSupplier<?> mappingSupplier = options.getMappingSupplier();
+      if (command.getOptions().isVerifyMappingFileHash()) {
+        mappingSupplier.verifyMappingFileHash(options.getDiagnosticsHandler());
+        return;
+      }
+      DiagnosticsHandler diagnosticsHandler = options.getDiagnosticsHandler();
+      StackTraceRegularExpressionParser stackTraceLineParser =
+          new StackTraceRegularExpressionParser(options.getRegularExpression());
+      StackTraceSupplier stackTraceSupplier = command.getStacktraceSupplier();
+      int lineNumber = 0;
+      RetraceStackTraceContext context = RetraceStackTraceContext.empty();
+      List<String> currentStackTrace;
+      while ((currentStackTrace = stackTraceSupplier.get()) != null) {
+        timing.begin("Parsing");
+        List<StackTraceElementStringProxy> parsedStackTrace = new ArrayList<>();
+        for (String line : currentStackTrace) {
+          if (line == null) {
+            diagnosticsHandler.error(
+                RetraceInvalidStackTraceLineDiagnostics.createNull(lineNumber));
+            throw new RetraceAbortException();
+          }
+          parsedStackTrace.add(stackTraceLineParser.parse(line));
+          lineNumber += 1;
+        }
+        timing.end();
+        timing.begin("Read proguard map");
+        StringRetrace stringRetracer =
+            new StringRetrace(
+                stackTraceLineParser, mappingSupplier, diagnosticsHandler, options.isVerbose());
+        timing.end();
+        timing.begin("Retracing");
+        RetraceStackFrameResultWithContext<String> result =
+            stringRetracer.retraceParsed(parsedStackTrace, context);
+        timing.end();
+        timing.begin("Report result");
+        context = result.getContext();
+        if (!result.isEmpty() || currentStackTrace.isEmpty()) {
+          command.getRetracedStackTraceConsumer().accept(result.getResult());
+        }
+        timing.end();
+      }
+      if (command.printTimes()) {
+        timing.report();
+      }
+      mappingSupplier
+          .getMapVersions(diagnosticsHandler)
+          .forEach(
+              mapVersionInfo -> {
+                if (mapVersionInfo.getMapVersion().isUnknown()) {
+                  diagnosticsHandler.warning(
+                      RetraceUnknownMapVersionDiagnostic.create(mapVersionInfo.getValue()));
+                }
+              });
+      mappingSupplier.finished(diagnosticsHandler);
+    } catch (InvalidMappingFileException e) {
+      command.getOptions().getDiagnosticsHandler().error(new ExceptionDiagnostic(e));
+      throw e;
+    }
+  }
+
+  public static void run(String[] args) throws RetraceFailedException {
+    // To be compatible with standard retrace and remapper, we translate -arg into --arg.
+    String[] mappedArgs = new String[args.length];
+    boolean printInfo = false;
+    for (int i = 0; i < args.length; i++) {
+      String arg = args[i];
+      if (arg == null || arg.length() < 2) {
+        mappedArgs[i] = arg;
+        continue;
+      }
+      if (arg.charAt(0) == '-' && arg.charAt(1) != '-') {
+        mappedArgs[i] = "-" + arg;
+      } else {
+        mappedArgs[i] = arg;
+      }
+      if (mappedArgs[i].equals("--info")) {
+        printInfo = true;
+      }
+    }
+    RetraceDiagnosticsHandler retraceDiagnosticsHandler =
+        new RetraceDiagnosticsHandler(new DiagnosticsHandler() {}, printInfo);
+    try {
+      run(mappedArgs, retraceDiagnosticsHandler);
+    } catch (Throwable t) {
+      throw failWithFakeEntry(
+          retraceDiagnosticsHandler,
+          t,
+          (message, cause, ignore) -> new RetraceFailedException(message, cause),
+          RetraceAbortException.class);
+    }
+  }
+
+  private static void run(String[] args, DiagnosticsHandler diagnosticsHandler) {
+    ParserState state = parseArguments(args, diagnosticsHandler);
+    if (state.printHelp) {
+      System.out.println("Retrace " + Version.getVersionString());
+      System.out.print(getUsageMessage());
+      return;
+    }
+    if (state.printVersion) {
+      System.out.println("Retrace " + Version.getVersionString());
+      return;
+    }
+    RetraceCommand.Builder builder = state.builder;
+    builder.setRetracedStackTraceConsumer(
+        retraced -> {
+          try (PrintStream printStream = new PrintStream(System.out, true, Charsets.UTF_8.name())) {
+            for (String line : retraced) {
+              printStream.println(line);
+            }
+          } catch (UnsupportedEncodingException e) {
+            diagnosticsHandler.error(new StringDiagnostic(e.getMessage()));
+          }
+        });
+    run(builder.build());
+  }
+
+  /**
+   * The main entry point for running a legacy compatible retrace from the command line.
+   *
+   * @param args The argument that describes this command.
+   */
+  public static void main(String... args) {
+    withMainProgramHandler(() -> run(args));
+  }
+
+  private static List<String> getStackTraceFromStandardInput(boolean printWaitingMessage) {
+    if (!printWaitingMessage) {
+      System.out.println("Waiting for stack-trace input...");
+    }
+    Scanner sc = new Scanner(new InputStreamReader(System.in, Charsets.UTF_8));
+    List<String> readLines = new ArrayList<>();
+    while (sc.hasNext()) {
+      readLines.add(sc.nextLine());
+    }
+    return readLines;
+  }
+
+  private interface MainAction {
+    void run() throws RetraceFailedException;
+  }
+
+  private static void withMainProgramHandler(MainAction action) {
+    try {
+      action.run();
+    } catch (RetraceFailedException | RetraceAbortException e) {
+      // Detail of the errors were already reported
+      throw new RuntimeException("Retrace failed", e);
+    } catch (Throwable t) {
+      throw new RuntimeException("Retrace failed with an internal error.", t);
+    }
+  }
+
+  public static <T, ST extends StackTraceElementProxy<T, ST>> Builder<T, ST> builder() {
+    return new Builder<>();
+  }
+
+  @KeepForApi
+  public static class Builder<T, ST extends StackTraceElementProxy<T, ST>>
+      extends RetraceBuilderBase<Builder<T, ST>, T, ST> {
+
+    private MappingSupplier<?> mappingSupplier;
+
+    @Override
+    public Builder<T, ST> self() {
+      return this;
+    }
+
+    public Builder<T, ST> setMappingSupplier(MappingSupplier<?> mappingSupplier) {
+      this.mappingSupplier = mappingSupplier;
+      return this;
+    }
+
+    public Retrace<T, ST> build() {
+      return new Retrace<>(stackTraceLineParser, mappingSupplier, diagnosticsHandler, isVerbose);
+    }
+  }
+
+  private static class RetraceDiagnosticsHandler implements DiagnosticsHandler {
+
+    private final DiagnosticsHandler diagnosticsHandler;
+    private final boolean printInfo;
+
+    public RetraceDiagnosticsHandler(DiagnosticsHandler diagnosticsHandler, boolean printInfo) {
+      this.diagnosticsHandler = diagnosticsHandler;
+      this.printInfo = printInfo;
+      assert diagnosticsHandler != null;
+    }
+
+    @Override
+    public void error(Diagnostic error) {
+      diagnosticsHandler.error(error);
+    }
+
+    @Override
+    public void warning(Diagnostic warning) {
+      diagnosticsHandler.warning(warning);
+    }
+
+    @Override
+    public void info(Diagnostic info) {
+      if (printInfo) {
+        diagnosticsHandler.info(info);
+      }
+    }
+  }
+}

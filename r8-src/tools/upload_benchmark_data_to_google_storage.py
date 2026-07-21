@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+# Copyright (c) 2024, the R8 project authors. Please see the AUTHORS file
+# for details. All rights reserved. Use of this source code is governed by a
+# BSD-style license that can be found in the LICENSE file.
+
+import historic_run
+import perf
+import utils
+
+import argparse
+import functools
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+TARGETS = ['r8-full']
+NUM_COMMITS = 1000
+
+FILES = [
+    'annotations.js', 'build.html', 'chart.js', 'd8.html', 'dom.js',
+    'extensions.js', 'r8.html', 'retrace.html', 'scales.js', 'state.js',
+    'stylesheet.css', 'tooltip.js', 'url.js', 'utils.js'
+]
+
+
+def download_cloud_bucket(dest):
+    os.makedirs(dest)
+    start = time.time()
+    utils.download_file_from_cloud_storage(perf.GetGSLocation('*'),
+                                           dest,
+                                           concurrent=True,
+                                           quiet=True,
+                                           flags=['-R'])
+    end = time.time()
+    print("Download bucket finished in %ss" % (end - start))
+
+
+def get_main_commits():
+    top = utils.get_sha1_from_revision('origin/main')
+    bottom = utils.get_nth_sha1_from_revision(NUM_COMMITS - 1, 'origin/main')
+    commits = historic_run.enumerate_git_commits(top, bottom)
+    assert len(commits) == NUM_COMMITS
+    return commits
+
+
+def get_release_branches():
+    remote_branches = subprocess.check_output(
+        ['git', 'branch', '-r']).decode('utf-8').strip().splitlines()
+    result = []
+    for remote_branch in remote_branches:
+        remote_branch = remote_branch.strip()
+
+        # Strip 'origin/'.
+        try:
+            remote_name_end_index = remote_branch.index('/')
+            remote_branch = remote_branch[remote_name_end_index + 1:]
+        except ValueError:
+            pass
+
+        # Filter out branches that are not on the form X.Y
+        if not re.search(r'^(0|[1-9]\d*)\.(0|[1-9]\d*)$', remote_branch):
+            continue
+
+        # Filter out branches prior to 8.9.
+        [major, minor] = remote_branch.split('.')
+        if int(major) < 8 or (major == '8' and int(minor) < 9):
+            continue
+
+        result.append(remote_branch)
+    return result
+
+
+def cmp_versions(x, y):
+    semver_x = utils.check_basic_semver_version(x.version(),
+                                                allowPrerelease=True)
+    semver_y = utils.check_basic_semver_version(y.version(),
+                                                allowPrerelease=True)
+    if semver_x.larger_than(semver_y):
+        return 1
+    if semver_y.larger_than(semver_x):
+        return -1
+    return 0
+
+
+def get_release_commits():
+    release_commits = []
+    for branch in get_release_branches():
+        (major, minor) = branch.split('.')
+        candidate_commits = subprocess.check_output([
+            'git', 'log', '--grep=-dev', '--max-count=100',
+            '--pretty=format:%H %s', 'origin/' + branch, '--',
+            'src/main/java/com/android/tools/r8/Version.java'
+        ]).decode('utf-8').strip().splitlines()
+        for candidate_commit in candidate_commits:
+            separator_index = candidate_commit.index(' ')
+            git_hash = candidate_commit[:separator_index]
+            git_title = candidate_commit[separator_index + 1:]
+            if not re.search(
+                    r'^Version %s\.%s\.(0|[1-9]\d*)-dev$' %
+                (major, minor), git_title):
+                continue
+            release_commits.append(historic_run.git_commit_from_hash(git_hash))
+    release_commits.sort(key=functools.cmp_to_key(cmp_versions), reverse=True)
+    return release_commits
+
+
+def get_try_commits(local_bucket_try_dict):
+    try_commits = []
+    seen_try_hashes = set()
+    for key, value in local_bucket_try_dict.items():
+        # The hash is the 4th component in the path:
+        # try/{benchmark}/{target}/{commit.hash()}/{filename}.
+        try_hash = key.split('/')[3]
+        if try_hash not in seen_try_hashes:
+            try_commit = historic_run.git_commit_from_hash(try_hash)
+            if try_commit is not None:
+                try_commits.append(try_commit)
+            seen_try_hashes.add(try_hash)
+    return try_commits
+
+
+def parse_json_from_cloud_storage(filename, local_bucket_dict):
+    if not filename in local_bucket_dict:
+        return None
+    return json.loads(local_bucket_dict[filename])
+
+
+def record_benchmark_result(commit, benchmark, benchmark_info,
+                            local_bucket_dict, target, benchmarks, is_try):
+    if not target in benchmark_info['targets']:
+        return
+    sub_benchmarks = benchmark_info.get('subBenchmarks', {})
+    sub_benchmarks_for_target = sub_benchmarks.get(target, [])
+    if sub_benchmarks_for_target:
+        for sub_benchmark in sub_benchmarks_for_target:
+            record_single_benchmark_result(commit, benchmark + sub_benchmark,
+                                           local_bucket_dict, target,
+                                           benchmarks, is_try)
+    else:
+        record_single_benchmark_result(commit, benchmark, local_bucket_dict,
+                                       target, benchmarks, is_try)
+
+
+def record_single_benchmark_result(commit, benchmark, local_bucket_dict, target,
+                                   benchmarks, is_try):
+    if is_try and commit.branch() is not None:
+        # Try job has landed on main.
+        return
+    filename = perf.GetArtifactLocation(benchmark,
+                                        target,
+                                        commit.hash(),
+                                        'result.json',
+                                        branch=commit.branch(),
+                                        is_try=is_try)
+    benchmark_data = parse_json_from_cloud_storage(filename, local_bucket_dict)
+    if benchmark_data:
+        benchmarks[benchmark] = benchmark_data
+
+
+def record_benchmark_results(commit, benchmarks, benchmark_data, is_try):
+    if benchmarks or benchmark_data:
+        data = {
+            'author': commit.author_name(),
+            'hash': commit.hash(),
+            'submitted': commit.committer_timestamp(),
+            'title': commit.title(),
+            'benchmarks': benchmarks
+        }
+        if is_try:
+            parent_hash = commit.parent_hash()
+            try:
+                # Find the merge base between the parent commit and origin/main.
+                merge_base = subprocess.check_output(
+                    ['git', 'merge-base', parent_hash, 'origin/main'],
+                    stderr=subprocess.PIPE,
+                    text=True).strip()
+                data['parent_hash'] = merge_base
+            except subprocess.CalledProcessError:
+                # Fallback to the direct parent if merge-base fails (e.g., if
+                # origin/main doesn't exist or there is no common ancestor).
+                data['parent_hash'] = parent_hash
+        version = commit.version()
+        if version:
+            data['version'] = version
+        benchmark_data.append(data)
+
+
+def trim_benchmark_results(benchmark_data):
+    new_benchmark_data_len = len(benchmark_data)
+    while new_benchmark_data_len > 0:
+        candidate_len = new_benchmark_data_len - 1
+        if not benchmark_data[candidate_len]['benchmarks']:
+            new_benchmark_data_len = candidate_len
+        else:
+            break
+    return benchmark_data[0:new_benchmark_data_len]
+
+
+def archive_benchmark_results(benchmark_data, dest, outdir, temp):
+    # Serialize JSON to temp file.
+    benchmark_data_file = os.path.join(temp, dest)
+    with open(benchmark_data_file, 'w') as f:
+        json.dump(benchmark_data, f)
+
+    # Write output files to public bucket.
+    perf.ArchiveOutputFile(benchmark_data_file,
+                           dest,
+                           header='Cache-Control:no-store',
+                           outdir=outdir)
+
+
+def run_bucket():
+    # Get the N most recent commits sorted by newest first.
+    main_commits = get_main_commits()
+
+    # Get all release commits from 8.9 and onwards sorted by newest first.
+    release_commits = get_release_commits()
+
+    # Download all benchmark data from the cloud bucket to a temp folder.
+    with utils.TempDir() as temp:
+        local_bucket = os.path.join(temp, perf.BUCKET)
+        download_cloud_bucket(local_bucket)
+        run(main_commits + release_commits, local_bucket, temp)
+
+
+def run_local(local_bucket):
+    commit_hashes = set()
+    for benchmark in os.listdir(local_bucket):
+        benchmark_dir = os.path.join(local_bucket, benchmark)
+        if benchmark == 'try' or not os.path.isdir(benchmark_dir):
+            continue
+        for target in os.listdir(benchmark_dir):
+            target_dir = os.path.join(local_bucket, benchmark, target)
+            if not os.path.isdir(target_dir):
+                continue
+            for commit_hash in os.listdir(target_dir):
+                commit_hash_dir = os.path.join(local_bucket, benchmark, target,
+                                               commit_hash)
+                if not os.path.isdir(commit_hash_dir):
+                    continue
+                commit_hashes.add(commit_hash)
+    commits = []
+    for commit_hash in commit_hashes:
+        commits.append(historic_run.git_commit_from_hash(commit_hash))
+    commits.sort(key=lambda c: c.committer_timestamp(), reverse=True)
+    with utils.TempDir() as temp:
+        outdir = os.path.join(utils.TOOLS_DIR, 'perf')
+        run(commits, local_bucket, temp, outdir=outdir)
+
+
+def run(commits, local_bucket, temp, outdir=None):
+    print('Loading bucket into memory')
+    local_bucket_dict = {}
+    local_bucket_try_dict = {}
+    for (root, dirs, files) in os.walk(local_bucket):
+        for file in files:
+            if file != 'result.json':
+                continue
+            abs_path = os.path.join(root, file)
+            rel_path = os.path.relpath(abs_path, local_bucket)
+            with open(abs_path, 'r') as f:
+                dict_or_try_dict = local_bucket_try_dict if rel_path.startswith(
+                    'try/') else local_bucket_dict
+                dict_or_try_dict[rel_path] = f.read()
+
+    # Aggregate all the result.json files into a single file that has the
+    # same format as tools/perf/benchmark_data.json.
+    process_commits(commits, local_bucket_dict, temp, outdir)
+    process_commits(get_try_commits(local_bucket_try_dict),
+                    local_bucket_try_dict,
+                    temp,
+                    outdir,
+                    is_try=True)
+
+    # Write remaining files to public bucket.
+    print('Writing static files')
+    if outdir is None:
+        for file in FILES:
+            dest = os.path.join(utils.TOOLS_DIR, 'perf', file)
+            perf.ArchiveOutputFile(dest, file)
+
+
+def process_commits(commits, local_bucket_dict, temp, outdir, is_try=False):
+    print('Processing commits')
+    build_benchmark_data = []
+    d8_benchmark_data = []
+    r8_benchmark_data = []
+    retrace_benchmark_data = []
+    for commit in commits:
+        build_benchmarks = {}
+        d8_benchmarks = {}
+        r8_benchmarks = {}
+        retrace_benchmarks = {}
+        for benchmark, benchmark_info in perf.ALL_BENCHMARKS.items():
+            record_benchmark_result(commit, benchmark, benchmark_info,
+                                    local_bucket_dict, 'build',
+                                    build_benchmarks, is_try)
+            record_benchmark_result(commit, benchmark, benchmark_info,
+                                    local_bucket_dict, 'd8', d8_benchmarks,
+                                    is_try)
+            record_benchmark_result(commit, benchmark, benchmark_info,
+                                    local_bucket_dict, 'r8-full', r8_benchmarks,
+                                    is_try)
+            record_benchmark_result(commit, benchmark, benchmark_info,
+                                    local_bucket_dict, 'retrace',
+                                    retrace_benchmarks, is_try)
+        record_benchmark_results(commit, build_benchmarks, build_benchmark_data,
+                                 is_try)
+        record_benchmark_results(commit, d8_benchmarks, d8_benchmark_data,
+                                 is_try)
+        record_benchmark_results(commit, r8_benchmarks, r8_benchmark_data,
+                                 is_try)
+        record_benchmark_results(commit, retrace_benchmarks,
+                                 retrace_benchmark_data, is_try)
+
+    # Trim data.
+    print('Trimming data')
+    build_benchmark_data = trim_benchmark_results(build_benchmark_data)
+    d8_benchmark_data = trim_benchmark_results(d8_benchmark_data)
+    r8_benchmark_data = trim_benchmark_results(r8_benchmark_data)
+    retrace_benchmark_data = trim_benchmark_results(retrace_benchmark_data)
+
+    # Write output JSON files to public bucket, or to tools/perf/ if running
+    # with --local-bucket.
+    print('Writing JSON')
+    data_file_suffix = '_try_data.json' if is_try else '_data.json'
+    archive_benchmark_results(build_benchmark_data,
+                              'build_benchmark' + data_file_suffix, outdir,
+                              temp)
+    archive_benchmark_results(d8_benchmark_data,
+                              'd8_benchmark' + data_file_suffix, outdir, temp)
+    archive_benchmark_results(r8_benchmark_data,
+                              'r8_benchmark' + data_file_suffix, outdir, temp)
+    archive_benchmark_results(retrace_benchmark_data,
+                              'retrace_benchmark' + data_file_suffix, outdir,
+                              temp)
+
+
+def parse_options():
+    result = argparse.ArgumentParser()
+    result.add_argument('--local-bucket', help='Local results dir.')
+    return result.parse_known_args()
+
+
+def main():
+    options, args = parse_options()
+    if options.local_bucket:
+        run_local(options.local_bucket)
+    else:
+        run_bucket()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

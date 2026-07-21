@@ -1,0 +1,263 @@
+// Copyright (c) 2016, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+// Copyright (c) 2016, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.graph;
+
+import com.android.tools.r8.DataResourceProvider;
+import com.android.tools.r8.ProgramResourceProvider;
+import com.android.tools.r8.naming.ClassNameMapper;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.timing.Timing;
+import com.google.common.collect.ImmutableList;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+
+public abstract class DexApplication implements DexDefinitionSupplier {
+
+  public final ImmutableList<DataResourceProvider> dataResourceProviders;
+
+  private final ClassNameMapper proguardMap;
+
+  public final InternalOptions options;
+  public final DexItemFactory dexItemFactory;
+  private final DexApplicationReadFlags flags;
+
+  /** Constructor should only be invoked by the DexApplication.Builder. */
+  DexApplication(
+      ClassNameMapper proguardMap,
+      DexApplicationReadFlags flags,
+      ImmutableList<DataResourceProvider> dataResourceProviders,
+      InternalOptions options) {
+    this.proguardMap = proguardMap;
+    this.flags = flags;
+    this.dataResourceProviders = dataResourceProviders;
+    this.options = options;
+    this.dexItemFactory = options.itemFactory;
+  }
+
+  public abstract Builder<?, ?> builder();
+
+  @Override
+  public DexItemFactory dexItemFactory() {
+    return dexItemFactory;
+  }
+
+  // Reorder classes randomly. Note that the order of classes in program or library
+  // class collections should not matter for compilation of valid code and when running
+  // with assertions enabled we reorder the classes randomly to catch possible issues.
+  // Also note that the order may add to non-determinism in reporting errors for invalid
+  // code, but this non-determinism exists even with the same order of classes since we
+  // may process classes concurrently and fail-fast on the first error.
+  private static class ReorderBox<T> {
+
+    private Collection<T> classes;
+
+    ReorderBox(Collection<T> classes) {
+      this.classes = classes;
+    }
+
+    boolean reorderClasses() {
+      if (!InternalOptions.DETERMINISTIC_DEBUGGING) {
+        List<T> shuffled = new ArrayList<>(classes);
+        Collections.shuffle(shuffled);
+        classes = ImmutableList.copyOf(shuffled);
+      }
+      return true;
+    }
+
+    Collection<T> getClasses() {
+      return classes;
+    }
+  }
+
+  abstract Collection<DexProgramClass> programClasses();
+
+  public abstract void forEachProgramType(Consumer<DexType> consumer);
+
+  public abstract void forEachLibraryType(Consumer<DexType> consumer);
+
+  public Collection<DexProgramClass> classes() {
+    ReorderBox<DexProgramClass> box = new ReorderBox<>(programClasses());
+    assert box.reorderClasses();
+    return box.getClasses();
+  }
+
+  public Collection<DexProgramClass> classesWithDeterministicOrder() {
+    Comparator<ClassDefinition> comparator = Comparator.comparing(ClassDefinition::getType);
+    if (options.testing.reverseClassSortingForDeterminism) {
+      comparator = comparator.reversed();
+    }
+    return classesWithDeterministicOrder(new ArrayList<>(programClasses()), comparator);
+  }
+
+  public static <T extends ClassDefinition> List<T> classesWithDeterministicOrder(
+      Collection<T> classes) {
+    return classesWithDeterministicOrder(new ArrayList<>(classes));
+  }
+
+  public static <T extends ClassDefinition> List<T> classesWithDeterministicOrder(List<T> classes) {
+    // To keep the order deterministic, we sort the classes by their type, which is a unique key.
+    classes.sort(Comparator.comparing(ClassDefinition::getType));
+    return classes;
+  }
+
+  private static Collection<DexProgramClass> classesWithDeterministicOrder(
+      List<DexProgramClass> classes, Comparator<ClassDefinition> comparator) {
+    classes.sort(comparator);
+    return classes;
+  }
+
+  public DexApplicationReadFlags getFlags() {
+    return flags;
+  }
+
+  @Override
+  public abstract DexClass definitionFor(DexType type);
+
+  // Retrieves the program or classpath definition corresponding to the given type. If the type is
+  // also defined on the library, then this always returns null. Note that this may return null even
+  // when the given type is only defined in the program, since this is unimplemented in the lazy
+  // app implementation.
+  public abstract ProgramOrClasspathClass definitionForProgramOrClasspathClassNotOnLibrary(
+      DexType type);
+
+  public abstract DexProgramClass programDefinitionFor(DexType type);
+
+  @Override
+  public abstract String toString();
+
+  public ClassNameMapper getProguardMap() {
+    return proguardMap;
+  }
+
+  public abstract static class Builder<S extends DexApplication, T extends Builder<S, T>> {
+
+    private final List<DexProgramClass> programClasses = new ArrayList<>();
+
+    final List<DataResourceProvider> dataResourceProviders = new ArrayList<>();
+
+    public final InternalOptions options;
+    public final DexItemFactory dexItemFactory;
+    ClassNameMapper proguardMap;
+    DexApplicationReadFlags flags;
+
+    public Builder(InternalOptions options) {
+      this.options = options;
+      this.dexItemFactory = options.itemFactory;
+    }
+
+    abstract T self();
+
+    public Builder(DexApplication application) {
+      flags = application.getFlags();
+      programClasses.addAll(application.programClasses());
+      dataResourceProviders.addAll(application.dataResourceProviders);
+      proguardMap = application.getProguardMap();
+      options = application.options;
+      dexItemFactory = application.dexItemFactory;
+    }
+
+    public boolean isDirect() {
+      return false;
+    }
+
+    public DirectMappedDexApplication.Builder asDirect() {
+      return null;
+    }
+
+    public T setFlags(DexApplicationReadFlags flags) {
+      this.flags = flags;
+      return self();
+    }
+
+    public synchronized T setProguardMap(ClassNameMapper proguardMap) {
+      assert this.proguardMap == null;
+      this.proguardMap = proguardMap;
+      return self();
+    }
+
+    public synchronized T removeProgramClasses(Predicate<DexProgramClass> predicate) {
+      this.programClasses.removeIf(predicate);
+      return self();
+    }
+
+    public synchronized T replaceProgramClasses(Collection<DexProgramClass> newProgramClasses) {
+      assert newProgramClasses != null;
+      this.programClasses.clear();
+      this.programClasses.addAll(newProgramClasses);
+
+      DexApplicationReadFlags.Builder builder = DexApplicationReadFlags.builder();
+      builder.setHasReadProgramClassFromDex(this.flags.hasReadProgramClassFromDex());
+      builder.setHasReadProgramClassFromCf(this.flags.hasReadProgramClassFromCf());
+      this.programClasses.forEach(
+          clazz -> {
+            DexType type = clazz.getType();
+            if (flags.getRecordWitnesses().contains(type)) {
+              builder.addRecordWitness(type);
+            }
+            if (flags.getVarHandleWitnesses().contains(type)) {
+              builder.addVarHandleWitness(type);
+            }
+            if (flags.getMethodHandlesLookupWitnesses().contains(type)) {
+              builder.addMethodHandlesLookupWitness(type);
+            }
+          });
+      this.flags = builder.build();
+      return self();
+    }
+
+    public synchronized T addDataResourceProviders(List<ProgramResourceProvider> providers) {
+      for (ProgramResourceProvider provider : providers) {
+        DataResourceProvider dataResourceProvider = provider.getDataResourceProvider();
+        if (dataResourceProvider != null) {
+          dataResourceProviders.add(dataResourceProvider);
+        }
+      }
+      return self();
+    }
+
+    public synchronized T addProgramClass(DexProgramClass clazz) {
+      programClasses.add(clazz);
+      return self();
+    }
+
+    public abstract void addProgramClassPotentiallyOverridingNonProgramClass(DexProgramClass clazz);
+
+    public synchronized T addProgramClasses(Collection<DexProgramClass> classes) {
+      programClasses.addAll(classes);
+      return self();
+    }
+
+    public abstract T addClasspathClass(DexClasspathClass clazz);
+
+    public List<DexProgramClass> getProgramClasses() {
+      return programClasses;
+    }
+
+    public abstract S build(Timing timing);
+  }
+
+  public static LazyLoadedDexApplication.Builder builder(InternalOptions options) {
+    return new LazyLoadedDexApplication.Builder(options);
+  }
+
+  public DirectMappedDexApplication asDirect() {
+    return null;
+  }
+
+  public boolean isDirect() {
+    return false;
+  }
+
+  public LazyLoadedDexApplication asLazy() {
+    return null;
+  }
+}

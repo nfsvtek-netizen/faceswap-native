@@ -1,0 +1,327 @@
+// Copyright (c) 2024, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+syntax = "proto3";
+
+package com.android.tools.r8.keepanno.proto;
+
+// All messages are placed under the outer class. This makes it a bit nicer to
+// implement the AST <-> Proto conversions without type conflicts.
+option java_multiple_files = false;
+
+// Camel-case the outer class name (default is `Keepspec`).
+option java_outer_classname = "KeepSpecProtos";
+
+// Java package consistent with R8 convention.
+option java_package = "com.android.tools.r8.keepanno.proto";
+
+// Top-level container for the keep specification
+message KeepSpec {
+  Version version = 1;
+  repeated Declaration declarations = 2;
+}
+
+message Version {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+}
+
+message Declaration {
+  oneof decl_oneof {
+    Edge edge = 2;
+    Check check = 3;
+  }
+}
+
+// Note: the messages and fields avoid the use of `descriptor` in any place as
+// that name is used internally in the protobuf encodings. We consistently use
+// the short-form `desc` throughout.
+
+message Context {
+  oneof context_oneof {
+    TypeDesc class_desc = 1;
+    MethodDesc method_desc = 2;
+    FieldDesc field_desc = 3;
+  }
+}
+
+message TypeDesc {
+  string desc = 1;
+}
+
+message MethodDesc {
+  string name = 1;
+  TypeDesc holder = 2;
+  TypeDesc return_type = 3;
+  repeated TypeDesc parameter_types = 4;
+}
+
+message FieldDesc {
+  string name = 1;
+  TypeDesc holder = 2;
+  TypeDesc field_type = 3;
+}
+
+message MetaInfo {
+  optional Context context = 1;
+  optional string description = 2;
+}
+
+enum CheckKind {
+  CHECK_UNSPECIFIED = 0;
+  CHECK_REMOVED = 1;
+  CHECK_OPTIMIZED_OUT = 2;
+}
+
+message Check {
+  optional MetaInfo meta_info = 1;
+  CheckKind kind = 2;
+  Bindings bindings = 3;
+  BindingReference item = 4;
+}
+
+message Edge {
+  MetaInfo meta_info = 1;
+  Bindings bindings = 2;
+  repeated Condition preconditions = 3;
+  repeated Target consequences = 4;
+}
+
+message Bindings {
+  repeated Binding bindings = 1;
+}
+
+message Binding {
+  string name = 1;
+  ItemPattern item = 2;
+}
+
+message BindingReference {
+  string name = 1;
+}
+
+message Condition {
+  BindingReference item = 1;
+}
+
+message Target {
+  BindingReference item = 1;
+  optional Constraints constraints = 2;
+  repeated Constraint constraint_additions = 3;
+}
+
+message Constraints {
+  repeated Constraint constraints = 1;
+}
+
+enum ConstraintElement {
+  CONSTRAINT_UNSPECIFIED = 0;
+  CONSTRAINT_LOOKUP = 1;
+  CONSTRAINT_NAME = 2;
+  CONSTRAINT_VISIBILITY_RELAX = 3;
+  CONSTRAINT_VISIBILITY_RESTRICT = 4;
+  CONSTRAINT_NEVER_INLINE = 5;
+  CONSTRAINT_CLASS_INSTANTIATE = 6;
+  CONSTRAINT_CLASS_OPEN_HIERARCHY = 7;
+  CONSTRAINT_METHOD_INVOKE = 8;
+  CONSTRAINT_METHOD_REPLACE = 9;
+  CONSTRAINT_FIELD_GET = 10;
+  CONSTRAINT_FIELD_SET = 11;
+  CONSTRAINT_FIELD_REPLACE = 12;
+  CONSTRAINT_GENERIC_SIGNATURE = 13;
+}
+
+message AnnotationPattern {
+  optional AnnotationRetention retention = 1;
+  optional ClassNamePattern name = 2;
+}
+
+enum AnnotationRetention {
+  RETENTION_UNSPECIFIED = 0;
+  RETENTION_RUNTIME = 1;
+  RETENTION_CLASS = 2;
+}
+
+message Constraint {
+  oneof constraint_oneof {
+    ConstraintElement element = 1;
+    AnnotationPattern annotation = 2;
+  }
+}
+
+message ItemPattern {
+  oneof item_oneof {
+    ClassItemPattern class_item = 1;
+    MemberItemPattern member_item = 2;
+  }
+}
+
+message ClassItemPattern {
+  optional ClassPattern class_pattern = 1;
+  optional AnnotatedByPattern annotated_by = 2;
+}
+
+message ClassPattern {
+  optional ClassNamePattern class_name = 1;
+  optional InstanceOfPattern instance_of = 2;
+}
+
+message InstanceOfPattern {
+  optional bool inclusive = 1;
+  optional ClassNamePattern class_name = 2;
+}
+
+message ClassNamePattern {
+  optional PackagePattern package = 1;
+  optional UnqualifiedNamePattern unqualified_name = 2;
+}
+
+message PackagePattern {
+  // No components matches any package.
+  repeated PackageComponentPattern components = 1;
+}
+
+message PackageComponentPattern {
+  // An absent single component matches any number of components.
+  optional StringPattern single_component = 1;
+}
+
+message StringPattern {
+  // The string pattern is split in two so that we can distinguish the exact
+  // empty string, from the inexact patterns.
+  oneof pattern_oneof {
+    // Unset oneof denotes any type.
+    string exact = 1;
+    StringPatternInexact inexact = 2;
+  }
+}
+
+message StringPatternInexact {
+  optional string prefix = 2;
+  optional string suffix = 3;
+}
+
+message UnqualifiedNamePattern {
+  optional StringPattern name = 1;
+}
+
+message AnnotatedByPattern {
+  optional ClassNamePattern name = 1;
+}
+
+message MemberItemPattern {
+  BindingReference class_reference = 1;
+  optional MemberPattern member_pattern = 2;
+}
+
+message MemberPattern {
+  oneof member_oneof {
+    MemberPatternGeneral general_member = 1;
+    MemberPatternField field_member = 2;
+    MemberPatternMethod method_member = 3;
+  }
+}
+
+enum AccessVisibility {
+  ACCESS_UNSPECIFIED = 0;
+  ACCESS_PUBLIC = 1;
+  ACCESS_PROTECTED = 2;
+  ACCESS_PACKAGE_PRIVATE = 3;
+  ACCESS_PRIVATE = 4;
+}
+
+message AccessVisibilitySet {
+  repeated AccessVisibility access_visibility = 1;
+}
+
+// Placeholder for an optional boolean modifier.
+// The optional value is encoded by it not being present at the reference point.
+message ModifierPattern {
+  bool value = 1;
+}
+
+message MemberAccessGeneral {
+  optional AccessVisibilitySet access_visibility = 1;
+  optional ModifierPattern static_pattern = 2;
+  optional ModifierPattern final_pattern = 3;
+  optional ModifierPattern synthetic_pattern = 4;
+}
+
+message MemberAccessField {
+  optional MemberAccessGeneral general_access = 1;
+  optional ModifierPattern volatile_pattern = 2;
+  optional ModifierPattern transient_pattern = 3;
+}
+
+message MemberAccessMethod {
+  optional MemberAccessGeneral general_access = 1;
+  optional ModifierPattern synchronized_pattern = 2;
+  optional ModifierPattern bridge_pattern = 3;
+  optional ModifierPattern native_pattern = 4;
+  optional ModifierPattern abstract_pattern = 5;
+  optional ModifierPattern strict_fp_pattern = 6;
+}
+
+message MemberPatternGeneral {
+  optional MemberAccessGeneral access = 1;
+  optional AnnotatedByPattern annotated_by = 2;
+}
+
+message MemberPatternField {
+  optional MemberAccessField access = 1;
+  optional AnnotatedByPattern annotated_by = 2;
+  optional StringPattern name = 3;
+  optional TypePattern field_type = 4;
+}
+
+message MemberPatternMethod {
+  optional MemberAccessMethod access = 1;
+  optional AnnotatedByPattern annotated_by = 2;
+  optional StringPattern name = 3;
+  optional MethodReturnTypePattern return_type = 4;
+  optional MethodParameterTypesPattern parameter_types = 5;
+}
+
+message MethodReturnTypePattern {
+  oneof return_type_oneof {
+    // Unset type denotes any type.
+    TypeVoid void_type = 1;
+    TypePattern some_type = 2;
+  }
+}
+
+message MethodParameterTypesPattern {
+  repeated TypePattern types = 1;
+}
+
+message TypeVoid {
+  // Placeholder to denote a 'void' method return type.
+}
+
+message TypePattern {
+  oneof type_oneof {
+    // Unset type denotes any type.
+    TypePatternPrimitive primitive = 1;
+    TypePatternArray array = 2;
+    ClassPattern class_pattern = 3;
+  }
+}
+
+enum TypePatternPrimitive {
+  PRIMITIVE_UNSPECIFIED = 0; // Denotes any primitive.
+  PRIMITIVE_BOOLEAN = 1;
+  PRIMITIVE_BYTE = 2;
+  PRIMITIVE_CHAR = 3;
+  PRIMITIVE_SHORT = 4;
+  PRIMITIVE_INT = 5;
+  PRIMITIVE_LONG = 6;
+  PRIMITIVE_FLOAT = 7;
+  PRIMITIVE_DOUBLE = 8;
+}
+
+message TypePatternArray {
+  // An unset or zero-valued dimensions will be interpreted as 1.
+  optional uint32 dimensions = 1;
+  optional TypePattern base_type = 2;
+}

@@ -1,0 +1,765 @@
+// Copyright (c) 2020, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.shaking;
+
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+import static com.android.tools.r8.utils.internal.MapUtils.ignoreKey;
+import static com.google.common.base.Predicates.alwaysFalse;
+
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexDefinition;
+import com.android.tools.r8.graph.DexDefinitionSupplier;
+import com.android.tools.r8.graph.DexEncodedField;
+import com.android.tools.r8.graph.DexEncodedMember;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItem;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DexReference;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramDefinition;
+import com.android.tools.r8.graph.ProgramField;
+import com.android.tools.r8.graph.ProgramMember;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.PrunedItems;
+import com.android.tools.r8.graph.lens.NonIdentityGraphLens;
+import com.android.tools.r8.shaking.KeepFieldInfo.Joiner;
+import com.android.tools.r8.shaking.rules.ApplicableRulesEvaluator;
+import com.android.tools.r8.shaking.rules.MaterializedRules;
+import com.android.tools.r8.shaking.rules.ReferencedFromExcludedClassInR8PartialRule;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.internal.ListUtils;
+import com.android.tools.r8.utils.internal.exceptions.Unreachable;
+import com.android.tools.r8.utils.timing.Timing;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Streams;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+
+// Non-mutable collection of keep information pertaining to a program.
+public abstract class KeepInfoCollection {
+
+  private static KeepClassInfo keepInfoForNonProgramClass() {
+    return KeepClassInfo.bottom();
+  }
+
+  private static KeepMethodInfo keepInfoForNonProgramMethod() {
+    return KeepMethodInfo.bottom();
+  }
+
+  private static KeepFieldInfo keepInfoForNonProgramField() {
+    return KeepFieldInfo.bottom();
+  }
+
+  /**
+   * Base accessor for keep info on a class.
+   *
+   * <p>Access may never be granted directly on DexType as the "keep info" for any non-program type
+   * is not the same as the default keep info for a program type. By typing the interface at program
+   * item we can eliminate errors where a reference to a non-program item results in optimizations
+   * assuming aspects of it can be changed when in fact they can not.
+   */
+  public abstract KeepClassInfo getClassInfo(DexProgramClass clazz);
+
+  /**
+   * Base accessor for keep info on a method.
+   *
+   * <p>See comment on class access for why this is typed at program method.
+   */
+  public abstract KeepMethodInfo getMethodInfo(DexEncodedMethod method, DexProgramClass holder);
+
+  public abstract void registerCompilerSynthesizedMethod(ProgramMethod method);
+
+  /**
+   * Base accessor for keep info on a field.
+   *
+   * <p>See comment on class access for why this is typed at program field.
+   */
+  public abstract KeepFieldInfo getFieldInfo(DexEncodedField field, DexProgramClass holder);
+
+  public KeepMemberInfo<?, ?> getMemberInfo(DexEncodedMember<?, ?> member, DexProgramClass holder) {
+    if (member.isDexEncodedField()) {
+      return getFieldInfo(member.asDexEncodedField(), holder);
+    }
+    assert member.isDexEncodedMethod();
+    return getMethodInfo(member.asDexEncodedMethod(), holder);
+  }
+
+  public final KeepClassInfo getClassInfo(DexClass clazz) {
+    return clazz != null && clazz.isProgramClass()
+        ? getClassInfo(clazz.asProgramClass())
+        : keepInfoForNonProgramClass();
+  }
+
+  public final KeepClassInfo getClassInfo(DexType type, DexDefinitionSupplier definitions) {
+    return getClassInfo(definitions.contextIndependentDefinitionFor(type));
+  }
+
+  public final KeepMemberInfo<?, ?> getMemberInfo(ProgramMember<?, ?> member) {
+    return getMemberInfo(member.getDefinition(), member.getHolder());
+  }
+
+  public final KeepMethodInfo getMethodInfo(ProgramMethod method) {
+    return getMethodInfo(method.getDefinition(), method.getHolder());
+  }
+
+  @SuppressWarnings("ReferenceEquality")
+  public final KeepMethodInfo getMethodInfo(
+      DexEncodedMethod method, DexDefinitionSupplier definitions) {
+    DexProgramClass holder =
+        asProgramClassOrNull(definitions.contextIndependentDefinitionFor(method.getHolderType()));
+    if (holder == null) {
+      return keepInfoForNonProgramMethod();
+    }
+    assert method == holder.lookupMethod(method.getReference());
+    return getMethodInfo(method, holder);
+  }
+
+  public final KeepMethodInfo getMethodInfoWithDefinitionLookup(
+      DexMethod method, DexDefinitionSupplier definitions) {
+    DexProgramClass holder =
+        asProgramClassOrNull(definitions.contextIndependentDefinitionFor(method.holder));
+    if (holder == null) {
+      return keepInfoForNonProgramMethod();
+    }
+    DexEncodedMethod definition = holder.lookupMethod(method);
+    return definition == null ? KeepMethodInfo.bottom() : getMethodInfo(definition, holder);
+  }
+
+  public final KeepFieldInfo getFieldInfo(ProgramField field) {
+    return getFieldInfo(field.getDefinition(), field.getHolder());
+  }
+
+  @SuppressWarnings("ReferenceEquality")
+  public final KeepFieldInfo getFieldInfo(
+      DexEncodedField field, DexDefinitionSupplier definitions) {
+    DexProgramClass holder =
+        asProgramClassOrNull(definitions.contextIndependentDefinitionFor(field.getHolderType()));
+    if (holder == null) {
+      return keepInfoForNonProgramField();
+    }
+    assert holder.lookupField(field.getReference()) == field;
+    return getFieldInfo(field, holder);
+  }
+
+  private KeepFieldInfo getFieldInfoWithDefinitionLookup(
+      DexField field, DexDefinitionSupplier definitions) {
+    DexProgramClass holder = asProgramClassOrNull(definitions.definitionFor(field.holder));
+    if (holder == null) {
+      return keepInfoForNonProgramField();
+    }
+    DexEncodedField definition = holder.lookupField(field);
+    return definition == null ? KeepFieldInfo.bottom() : getFieldInfo(definition, holder);
+  }
+
+  private KeepInfo<?, ?> getInfoWithDefinitionLookup(
+      DexReference reference, DexDefinitionSupplier definitions) {
+    if (reference.isDexType()) {
+      return getClassInfo(reference.asDexType(), definitions);
+    }
+    if (reference.isDexMethod()) {
+      return getMethodInfoWithDefinitionLookup(reference.asDexMethod(), definitions);
+    }
+    if (reference.isDexField()) {
+      return getFieldInfoWithDefinitionLookup(reference.asDexField(), definitions);
+    }
+    throw new Unreachable();
+  }
+
+  public final KeepInfo<?, ?> getInfo(DexDefinition definition, DexDefinitionSupplier definitions) {
+    if (definition.isDexClass()) {
+      return getClassInfo(definition.asDexClass());
+    }
+    if (definition.isDexEncodedMethod()) {
+      return getMethodInfo(definition.asDexEncodedMethod(), definitions);
+    }
+    if (definition.isDexEncodedField()) {
+      return getFieldInfo(definition.asDexEncodedField(), definitions);
+    }
+    throw new Unreachable();
+  }
+
+  public final KeepClassInfo getInfo(DexProgramClass clazz) {
+    return getClassInfo(clazz);
+  }
+
+  public final KeepInfo<?, ?> getInfo(ProgramDefinition definition) {
+    if (definition.isProgramClass()) {
+      return getClassInfo(definition.asProgramClass());
+    }
+    if (definition.isProgramMethod()) {
+      return getMethodInfo(definition.asProgramMethod());
+    }
+    if (definition.isProgramField()) {
+      return getFieldInfo(definition.asProgramField());
+    }
+    throw new Unreachable();
+  }
+
+  public abstract boolean isKotlinMetadataRemovalAllowed(GlobalKeepInfoConfiguration configuration);
+
+  public final boolean isPinned(
+      ProgramDefinition definition, GlobalKeepInfoConfiguration configuration) {
+    return getInfo(definition).isPinned(configuration);
+  }
+
+  public final boolean isPinned(
+      DexDefinition definition,
+      GlobalKeepInfoConfiguration configuration,
+      DexDefinitionSupplier definitions) {
+    return getInfo(definition, definitions).isPinned(configuration);
+  }
+
+  public final boolean isPinnedWithDefinitionLookup(
+      DexReference reference,
+      GlobalKeepInfoConfiguration configuration,
+      DexDefinitionSupplier definitions) {
+    return getInfoWithDefinitionLookup(reference, definitions).isPinned(configuration);
+  }
+
+  public final boolean isMinificationAllowed(
+      ProgramDefinition definition, GlobalKeepInfoConfiguration configuration) {
+    return configuration.isMinificationEnabled()
+        && getInfo(definition).isMinificationAllowed(configuration);
+  }
+
+  public abstract KeepInfoCollection rebuildWithoutEventConsumer();
+
+  public abstract boolean verifyPinnedTypesAreLive(Set<DexType> liveTypes, InternalOptions options);
+
+  // TODO(b/156715504): We should try to avoid the need for iterating pinned items.
+  @Deprecated
+  public abstract void forEachPinnedType(Consumer<DexType> consumer, InternalOptions options);
+
+  // TODO(b/156715504): We should try to avoid the need for iterating pinned items.
+  @Deprecated
+  public abstract void forEachPinnedMethod(Consumer<DexMethod> consumer, InternalOptions options);
+
+  // TODO(b/156715504): We should try to avoid the need for iterating pinned items.
+  @Deprecated
+  public abstract void forEachPinnedField(Consumer<DexField> consumer, InternalOptions options);
+
+  public abstract KeepInfoCollection rewrite(
+      DexDefinitionSupplier definitions,
+      NonIdentityGraphLens lens,
+      InternalOptions options,
+      Timing timing);
+
+  public abstract KeepInfoCollectionExported exportToCollection();
+
+  public void exportToDirectory(Path directory) throws IOException {
+    exportToCollection().exportToDirectory(directory);
+  }
+
+  public abstract KeepInfoCollection mutate(Consumer<MutableKeepInfoCollection> mutator);
+
+  public abstract void writeToDirectory(Path directory) throws IOException;
+
+  public abstract ApplicableRulesEvaluator getApplicableRules();
+
+  // Mutation interface for building up the keep info.
+  public static class MutableKeepInfoCollection extends KeepInfoCollection {
+
+    private final AppView<?> appView;
+    private final DexItemFactory factory;
+    private final Enqueuer.Mode mode;
+
+    // These are typed at signatures but the interface should make sure never to allow access
+    // directly with a signature. See the comment in KeepInfoCollection.
+    private final Map<DexType, KeepClassInfo> keepClassInfo;
+    private final Map<DexMethod, KeepMethodInfo> keepMethodInfo;
+    private final Map<DexField, KeepFieldInfo> keepFieldInfo;
+
+    private boolean allowKotlinMetadataRemoval = true;
+
+    // Collection of materialized rules.
+    private MaterializedRules materializedRules;
+
+    private final KeepInfoCanonicalizer canonicalizer;
+    private KeepInfoCollectionEventConsumer eventConsumer;
+
+    MutableKeepInfoCollection(
+        AppView<?> appView, Enqueuer enqueuer, KeepInfoCollectionEventConsumer eventConsumer) {
+      this(
+          appView,
+          enqueuer.getMode(),
+          new IdentityHashMap<>(),
+          new IdentityHashMap<>(),
+          new IdentityHashMap<>(),
+          MaterializedRules.empty(),
+          appView.testing().enableKeepInfoCanonicalizer
+              ? KeepInfoCanonicalizer.newCanonicalizer()
+              : KeepInfoCanonicalizer.newNopCanonicalizer(),
+          eventConsumer);
+    }
+
+    private MutableKeepInfoCollection(
+        AppView<?> appView,
+        Enqueuer.Mode mode,
+        Map<DexType, KeepClassInfo> keepClassInfo,
+        Map<DexMethod, KeepMethodInfo> keepMethodInfo,
+        Map<DexField, KeepFieldInfo> keepFieldInfo,
+        MaterializedRules materializedRules,
+        KeepInfoCanonicalizer keepInfoCanonicalizer,
+        KeepInfoCollectionEventConsumer eventConsumer) {
+      this.appView = appView;
+      this.factory = appView.dexItemFactory();
+      this.mode = mode;
+      this.keepClassInfo = keepClassInfo;
+      this.keepMethodInfo = keepMethodInfo;
+      this.keepFieldInfo = keepFieldInfo;
+      this.materializedRules = materializedRules;
+      this.canonicalizer = keepInfoCanonicalizer;
+      this.eventConsumer = eventConsumer;
+    }
+
+    public void setMaterializedRules(MaterializedRules materializedRules) {
+      assert this.materializedRules == MaterializedRules.empty();
+      assert materializedRules != null;
+      this.materializedRules = materializedRules;
+    }
+
+    @Override
+    public ApplicableRulesEvaluator getApplicableRules() {
+      return materializedRules.toApplicableRules();
+    }
+
+    public void removeKeepInfoForMergedClasses(PrunedItems prunedItems) {
+      if (prunedItems.hasRemovedClasses()) {
+        keepClassInfo.keySet().removeAll(prunedItems.getRemovedClasses());
+      }
+      if (prunedItems.hasRemovedFields()) {
+        keepFieldInfo.keySet().removeAll(prunedItems.getRemovedFields());
+      }
+      if (prunedItems.hasRemovedMembers()) {
+        keepMethodInfo.keySet().removeAll(prunedItems.getRemovedMethods());
+      }
+    }
+
+    public void removeKeepInfoForPrunedItems(PrunedItems prunedItems) {
+      if (prunedItems.hasRemovedClasses()) {
+        keepClassInfo.keySet().removeAll(prunedItems.getRemovedClasses());
+      }
+      if (prunedItems.hasRemovedClasses() || prunedItems.hasRemovedFields()) {
+        keepFieldInfo.keySet().removeIf(prunedItems::isRemoved);
+      }
+      if (prunedItems.hasRemovedClasses() || prunedItems.hasRemovedMembers()) {
+        keepMethodInfo.keySet().removeIf(prunedItems::isRemoved);
+      }
+      materializedRules.pruneItems(prunedItems);
+    }
+
+    @Override
+    public KeepInfoCollection rewrite(
+        DexDefinitionSupplier definitions,
+        NonIdentityGraphLens lens,
+        InternalOptions options,
+        Timing timing) {
+      timing.begin("Rewrite KeepInfoCollection");
+      Map<DexType, KeepClassInfo> newClassInfo = rewriteClassInfo(lens, options, timing);
+      Map<DexMethod, KeepMethodInfo> newMethodInfo = rewriteMethodInfo(lens, options, timing);
+      Map<DexField, KeepFieldInfo> newFieldInfo = rewriteFieldInfo(lens, options, timing);
+      MutableKeepInfoCollection result =
+          new MutableKeepInfoCollection(
+              appView,
+              mode,
+              newClassInfo,
+              newMethodInfo,
+              newFieldInfo,
+              materializedRules.rewriteWithLens(lens),
+              canonicalizer,
+              eventConsumer);
+      timing.end();
+      return result;
+    }
+
+    @Override
+    public KeepInfoCollectionExported exportToCollection() {
+      return new KeepInfoCollectionExported(keepClassInfo, keepMethodInfo, keepFieldInfo);
+    }
+
+    private Map<DexType, KeepClassInfo> rewriteClassInfo(
+        NonIdentityGraphLens lens, InternalOptions options, Timing timing) {
+      timing.begin("Rewrite class info");
+      Map<DexType, KeepClassInfo> newClassInfo = new IdentityHashMap<>(keepClassInfo.size());
+      keepClassInfo.forEach(
+          (type, info) -> {
+            DexType newType = lens.lookupType(type);
+            if (options.dexItemFactory().intType.isIdenticalTo(newType)) {
+              assert !info.isPinned(options);
+              return;
+            }
+            assert type.isIdenticalTo(newType)
+                    || !info.isPinned(options)
+                    || info.isMinificationAllowed(options)
+                    || info.isRepackagingAllowed(options)
+                : type.toSourceString()
+                    + " -> "
+                    + newType.toSourceString()
+                    + ": isPinned: "
+                    + info.isPinned(options)
+                    + ", isMinificationAllowed: "
+                    + info.isMinificationAllowed(options)
+                    + ", isRepackagingAllowed: "
+                    + info.isRepackagingAllowed(options);
+            KeepClassInfo previous = newClassInfo.put(newType, info);
+            assert previous == null;
+          });
+      timing.end();
+      return newClassInfo;
+    }
+
+    private Map<DexField, KeepFieldInfo> rewriteFieldInfo(
+        NonIdentityGraphLens lens, InternalOptions options, Timing timing) {
+      timing.begin("Rewrite field info");
+      Map<DexField, KeepFieldInfo> newFieldInfo = new IdentityHashMap<>(keepFieldInfo.size());
+      keepFieldInfo.forEach(
+          (field, info) -> {
+            DexField newField = lens.getRenamedFieldSignature(field);
+            assert newField.name.isIdenticalTo(field.name)
+                || !info.isPinned(options)
+                || info.isMinificationAllowed(options);
+            KeepFieldInfo previous = newFieldInfo.put(newField, info);
+            assert previous == null;
+          });
+      timing.end();
+      return newFieldInfo;
+    }
+
+    @SuppressWarnings("UnusedVariable")
+    private Map<DexMethod, KeepMethodInfo> rewriteMethodInfo(
+        NonIdentityGraphLens lens, InternalOptions options, Timing timing) {
+      timing.begin("Rewrite method info");
+      Map<DexMethod, KeepMethodInfo> newMethodInfo = new IdentityHashMap<>(keepMethodInfo.size());
+      keepMethodInfo.forEach(
+          (method, info) -> {
+            DexMethod newMethod = lens.getRenamedMethodSignature(method);
+            assert !info.isPinned(options)
+                || info.isMinificationAllowed(options)
+                || newMethod.name.isIdenticalTo(method.name);
+            assert !info.isPinned(options)
+                || newMethod.getArity() == method.getArity()
+                || (info.isShrinkingAllowed(options) && lens.isNonStartupInStartupOutlinerLens());
+            assert !info.isPinned(options)
+                || Streams.zip(
+                        newMethod.getParameters().stream(),
+                        method.getParameters().stream().map(lens::lookupType),
+                        Object::equals)
+                    .allMatch(x -> x)
+                || (info.isShrinkingAllowed(options) && lens.isNonStartupInStartupOutlinerLens());
+            assert !info.isPinned(options)
+                || newMethod.getReturnType().isIdenticalTo(lens.lookupType(method.getReturnType()));
+            KeepMethodInfo previous = newMethodInfo.put(newMethod, info);
+            // TODO(b/169927809): Avoid collisions.
+            // assert previous == null;
+          });
+      timing.end();
+      return newMethodInfo;
+    }
+
+    public void ensureCompilerSynthesizedClass(DexProgramClass clazz) {
+      keepClassInfo.computeIfAbsent(clazz.getType(), ignoreKey(SyntheticKeepClassInfo::bottom));
+    }
+
+    @Override
+    public void registerCompilerSynthesizedMethod(ProgramMethod method) {
+      assert !keepMethodInfo.containsKey(method.getReference());
+      keepMethodInfo.put(method.getReference(), SyntheticKeepMethodInfo.bottom());
+    }
+
+    public void registerCompilerSynthesizedItems(KeepInfoCollection keepInfoCollection) {
+      keepInfoCollection.mutate(
+          mutableKeepInfoCollection -> {
+            mutableKeepInfoCollection.keepClassInfo.forEach(
+                (c, info) -> {
+                  if (info instanceof SyntheticKeepClassInfo) {
+                    assert !keepClassInfo.containsKey(c);
+                    keepClassInfo.put(c, info);
+                  }
+                });
+            mutableKeepInfoCollection.keepMethodInfo.forEach(
+                (m, info) -> {
+                  if (info instanceof SyntheticKeepMethodInfo) {
+                    assert !keepMethodInfo.containsKey(m);
+                    keepMethodInfo.put(m, info);
+                  }
+                });
+          });
+    }
+
+    @Override
+    public KeepClassInfo getClassInfo(DexProgramClass clazz) {
+      return keepClassInfo.getOrDefault(clazz.type, KeepClassInfo.bottom());
+    }
+
+    @Override
+    public KeepMethodInfo getMethodInfo(DexEncodedMethod method, DexProgramClass holder) {
+      assert method.getHolderType().isIdenticalTo(holder.getType());
+      return keepMethodInfo.getOrDefault(method.getReference(), KeepMethodInfo.bottom());
+    }
+
+    @Override
+    public KeepFieldInfo getFieldInfo(DexEncodedField field, DexProgramClass holder) {
+      assert field.getHolderType().isIdenticalTo(holder.getType());
+      return keepFieldInfo.getOrDefault(field.getReference(), KeepFieldInfo.bottom());
+    }
+
+    public void joinClass(DexProgramClass clazz, Consumer<? super KeepClassInfo.Joiner> fn) {
+      eventConsumer.acceptKeepClassInfo(clazz.getType(), fn);
+      KeepClassInfo info = getClassInfo(clazz);
+      if (info.isTop()) {
+        assert info == KeepClassInfo.top();
+        return;
+      }
+      KeepClassInfo.Joiner joiner = info.joiner();
+      fn.accept(joiner);
+      KeepClassInfo joined = joiner.join();
+      if (info.equals(joined)) {
+        return;
+      }
+      keepClassInfo.put(clazz.type, canonicalizer.canonicalizeKeepClassInfo(joined));
+      maybeDisallowKotlinMetadataRemoval(clazz, info, joined, joiner);
+      reportWhyAreYouNotObfuscating(clazz, info, joined, joiner);
+    }
+
+    private void maybeDisallowKotlinMetadataRemoval(
+        DexProgramClass clazz,
+        KeepClassInfo oldInfo,
+        KeepClassInfo newInfo,
+        KeepClassInfo.Joiner joiner) {
+      if (!oldInfo.internalIsShrinkingAllowed()
+          || newInfo.internalIsShrinkingAllowed()
+          || clazz.getType().isNotIdenticalTo(factory.kotlinMetadataType)) {
+        return;
+      }
+      // The kotlin.Metadata class went from not being kept to being kept.
+      if (joiner.getReasons().isEmpty()
+          && !joiner.getRules().isEmpty()
+          && Iterables.all(
+              joiner.getRules(),
+              rule -> rule instanceof ReferencedFromExcludedClassInR8PartialRule)) {
+        // We do not want to disallow kotlin.Metadata removal in R8 partial simply because
+        // kotlin.Metadata is referenced from D8.
+        return;
+      }
+      allowKotlinMetadataRemoval = false;
+    }
+
+    private void reportWhyAreYouNotObfuscating(
+        ProgramDefinition definition,
+        KeepInfo<?, ?> previousKeepInfo,
+        KeepInfo<?, ?> joinedKeepInfo,
+        KeepInfo.Joiner<?, ?, ?> joiner) {
+      InternalOptions options = appView.options();
+      if (!mode.isFinalTreeShaking()
+          || options.getProguardConfiguration() == null
+          || !options.getProguardConfiguration().hasWhyAreYouNotObfuscatingRule()
+          || !previousKeepInfo.internalIsMinificationAllowed()
+          || joiner.isMinificationAllowed()) {
+        return;
+      }
+      MinimumKeepInfoCollection minimumKeepInfoCollection =
+          appView
+              .rootSet()
+              .getDependentMinimumKeepInfo()
+              .getUnconditionalMinimumKeepInfoOrDefault(MinimumKeepInfoCollection.empty());
+      if (!minimumKeepInfoCollection.hasMinimumKeepInfoThatMatches(
+          definition.getReference(), KeepInfo.Joiner::isWhyAreYouNotObfuscatingEnabled)) {
+        return;
+      }
+      assert !joinedKeepInfo.internalIsMinificationAllowed();
+      boolean foundRule = false;
+      for (ProguardKeepRuleBase rule : joiner.getRules()) {
+        if (!rule.getModifiers().allowsObfuscation) {
+          appView
+              .reporter()
+              .warning(
+                  definition.getReference().toSourceString() + " is not obfuscated due to " + rule);
+          foundRule = true;
+        }
+      }
+      if (!foundRule) {
+        boolean foundReason = false;
+        for (KeepReason reason : joiner.getReasons()) {
+          appView
+              .reporter()
+              .warning(
+                  definition.getReference().toSourceString()
+                      + " is not obfuscated due to "
+                      + reason);
+          foundReason = true;
+        }
+        assert foundReason;
+      }
+    }
+
+    public void keepClass(DexProgramClass clazz) {
+      joinClass(clazz, KeepInfo.Joiner::top);
+    }
+
+    public void joinMethod(ProgramMethod method, Consumer<? super KeepMethodInfo.Joiner> fn) {
+      eventConsumer.acceptKeepMethodInfo(method.getReference(), fn);
+      KeepMethodInfo info = getMethodInfo(method);
+      if (info.isTop()) {
+        assert info == KeepMethodInfo.top();
+        return;
+      }
+      KeepMethodInfo.Joiner joiner = info.joiner();
+      fn.accept(joiner);
+      KeepMethodInfo joined = joiner.join();
+      if (info.equals(joined)) {
+        return;
+      }
+      keepMethodInfo.put(method.getReference(), canonicalizer.canonicalizeKeepMethodInfo(joined));
+      reportWhyAreYouNotObfuscating(method, info, joined, joiner);
+    }
+
+    public void keepMethod(ProgramMethod method) {
+      joinMethod(method, KeepInfo.Joiner::top);
+    }
+
+    public void joinField(ProgramField field, Consumer<? super KeepFieldInfo.Joiner> fn) {
+      eventConsumer.acceptKeepFieldInfo(field.getReference(), fn);
+      KeepFieldInfo info = getFieldInfo(field);
+      if (info.isTop()) {
+        assert info == KeepFieldInfo.top();
+        return;
+      }
+      Joiner joiner = info.joiner();
+      fn.accept(joiner);
+      KeepFieldInfo joined = joiner.join();
+      if (info.equals(joined)) {
+        return;
+      }
+      keepFieldInfo.put(field.getReference(), canonicalizer.canonicalizeKeepFieldInfo(joined));
+      reportWhyAreYouNotObfuscating(field, info, joined, joiner);
+    }
+
+    public void keepField(ProgramField field) {
+      joinField(field, KeepInfo.Joiner::top);
+    }
+
+    @Override
+    public boolean isKotlinMetadataRemovalAllowed(GlobalKeepInfoConfiguration configuration) {
+      return allowKotlinMetadataRemoval && configuration.isTreeShakingEnabled();
+    }
+
+    @Override
+    public KeepInfoCollection mutate(Consumer<MutableKeepInfoCollection> mutator) {
+      mutator.accept(this);
+      return this;
+    }
+
+    @Override
+    public KeepInfoCollection rebuildWithoutEventConsumer() {
+      return new MutableKeepInfoCollection(
+          appView,
+          mode,
+          keepClassInfo,
+          keepMethodInfo,
+          keepFieldInfo,
+          materializedRules,
+          canonicalizer,
+          new EmptyKeepInfoCollectionEventConsumer());
+    }
+
+    @Override
+    public boolean verifyPinnedTypesAreLive(Set<DexType> liveTypes, InternalOptions options) {
+      keepClassInfo.forEach(
+          (type, info) -> {
+            assert !info.isPinned(options) || liveTypes.contains(type);
+          });
+      return true;
+    }
+
+    @Override
+    public void forEachPinnedType(Consumer<DexType> consumer, InternalOptions options) {
+      keepClassInfo.forEach(
+          (type, info) -> {
+            if (info.isPinned(options)) {
+              consumer.accept(type);
+            }
+          });
+    }
+
+    @Override
+    public void forEachPinnedMethod(Consumer<DexMethod> consumer, InternalOptions options) {
+      keepMethodInfo.forEach(
+          (method, info) -> {
+            if (info.isPinned(options)) {
+              consumer.accept(method);
+            }
+          });
+    }
+
+    @Override
+    public void forEachPinnedField(Consumer<DexField> consumer, InternalOptions options) {
+      keepFieldInfo.forEach(
+          (field, info) -> {
+            if (info.isPinned(options)) {
+              consumer.accept(field);
+            }
+          });
+    }
+
+    @Override
+    public void writeToDirectory(Path directory) throws IOException {
+      writePropertyToFile(
+          directory.resolve("no-horizontal-class-merging.txt"),
+          classInfo -> !classInfo.internalIsHorizontalClassMergingAllowed(),
+          alwaysFalse(),
+          alwaysFalse());
+      writePropertyToFile(
+          directory.resolve("no-optimization.txt"),
+          classInfo -> !classInfo.internalIsOptimizationAllowed(),
+          fieldInfo -> !fieldInfo.internalIsOptimizationAllowed(),
+          methodInfo -> !methodInfo.internalIsOptimizationAllowed());
+      writePropertyToFile(
+          directory.resolve("no-shrinking.txt"),
+          classInfo -> !classInfo.internalIsShrinkingAllowed(),
+          fieldInfo -> !fieldInfo.internalIsShrinkingAllowed(),
+          methodInfo -> !methodInfo.internalIsShrinkingAllowed());
+    }
+
+    private void writePropertyToFile(
+        Path path,
+        Predicate<KeepClassInfo> classInfoPredicate,
+        Predicate<KeepFieldInfo> fieldInfoPredicate,
+        Predicate<KeepMethodInfo> methodInfoPredicate)
+        throws IOException {
+      List<DexReference> lines = new ArrayList<>();
+      keepClassInfo.forEach(
+          (clazz, info) -> {
+            if (classInfoPredicate.test(info)) {
+              lines.add(clazz);
+            }
+          });
+      keepFieldInfo.forEach(
+          (field, info) -> {
+            if (fieldInfoPredicate.test(info)) {
+              lines.add(field);
+            }
+          });
+      keepMethodInfo.forEach(
+          (method, info) -> {
+            if (methodInfoPredicate.test(info)) {
+              lines.add(method);
+            }
+          });
+      lines.sort(DexReference::compareTo);
+      Files.write(path, ListUtils.map(lines, DexItem::toSourceString));
+    }
+  }
+}

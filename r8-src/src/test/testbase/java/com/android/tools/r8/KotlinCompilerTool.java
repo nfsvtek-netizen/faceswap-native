@@ -1,0 +1,541 @@
+// Copyright (c) 2019, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8;
+
+import static com.android.tools.r8.KotlinCompilerTool.KotlinCompilerVersion.MAX_SUPPORTED_VERSION;
+import static com.android.tools.r8.KotlinCompilerTool.KotlinLambdaGeneration.CLASS;
+import static com.android.tools.r8.KotlinCompilerTool.KotlinLambdaGeneration.INVOKE_DYNAMIC;
+import static com.android.tools.r8.KotlinCompilerTool.KotlinTargetVersion.JAVA_6;
+import static com.android.tools.r8.KotlinCompilerTool.KotlinTargetVersion.JAVA_8;
+import static com.android.tools.r8.ToolHelper.isWindows;
+import static com.google.common.io.Files.getNameWithoutExtension;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
+
+import com.android.tools.r8.TestRuntime.CfRuntime;
+import com.android.tools.r8.ToolHelper.CacheLookupKey;
+import com.android.tools.r8.ToolHelper.CommandResultCache;
+import com.android.tools.r8.ToolHelper.ProcessResult;
+import com.android.tools.r8.utils.internal.ConsumerUtils;
+import com.android.tools.r8.utils.internal.FileUtils;
+import com.android.tools.r8.utils.internal.StringUtils;
+import com.android.tools.r8.utils.internal.ThrowingConsumer;
+import com.android.tools.r8.utils.internal.collections.Pair;
+import com.android.tools.r8.utils.internal.exceptions.Unimplemented;
+import com.android.tools.r8.utils.structural.Ordered;
+import com.google.common.hash.Hasher;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.jar.Manifest;
+import java.util.stream.Collectors;
+import java.util.zip.ZipFile;
+import org.junit.rules.TemporaryFolder;
+
+public class KotlinCompilerTool {
+
+  public enum KotlinTargetVersion {
+    NONE(""),
+    JAVA_6("JAVA_6"),
+    JAVA_8("JAVA_8");
+
+    private final String folderName;
+
+    KotlinTargetVersion(String folderName) {
+      this.folderName = folderName;
+    }
+
+    public String getFolderName() {
+      return folderName;
+    }
+
+    public String getJvmTargetString() {
+      switch (this) {
+        case JAVA_6:
+          return "1.6";
+        case JAVA_8:
+          return "1.8";
+        default:
+          throw new Unimplemented("JvmTarget not specified for " + this);
+      }
+    }
+
+    public boolean isDefaultForVersion(KotlinCompilerVersion version) {
+      return this == version.defaultTargetVersion;
+    }
+  }
+
+  public enum KotlinCompilerVersion implements Ordered<KotlinCompilerVersion> {
+    KOTLINC_1_3_72("kotlin-compiler-1.3.72", CLASS, JAVA_6),
+    KOTLINC_1_4_20("kotlin-compiler-1.4.20", CLASS, JAVA_6),
+    // JVM target 1,8 default from Kotlin 1.5.0,
+    // https://kotlinlang.org/docs/whatsnew15.html#new-default-jvm-target-1-8
+    KOTLINC_1_5_0("kotlin-compiler-1.5.0", CLASS, JAVA_8),
+    KOTLINC_1_6_0("kotlin-compiler-1.6.0", CLASS, JAVA_8),
+    KOTLINC_1_7_0("kotlin-compiler-1.7.0", CLASS, JAVA_8),
+    KOTLINC_1_8_0("kotlin-compiler-1.8.0", CLASS, JAVA_8),
+    KOTLINC_1_9_21("kotlin-compiler-1.9.21", CLASS, JAVA_8),
+    KOTLINC_2_0_20("kotlin-compiler-2.0.20", INVOKE_DYNAMIC, JAVA_8),
+    KOTLINC_2_1_10("kotlin-compiler-2.1.10", INVOKE_DYNAMIC, JAVA_8),
+    KOTLINC_2_2_0("kotlin-compiler-2.2.0", INVOKE_DYNAMIC, JAVA_8),
+    KOTLINC_2_3_10("kotlin-compiler-2.3.10", INVOKE_DYNAMIC, JAVA_8),
+    KOTLIN_DEV("kotlin-compiler-dev", INVOKE_DYNAMIC, JAVA_8);
+
+    public static final KotlinCompilerVersion MIN_SUPPORTED_VERSION = KOTLINC_2_2_0;
+    public static final KotlinCompilerVersion MAX_SUPPORTED_VERSION = KOTLINC_2_2_0;
+    public static final KotlinCompilerVersion[] DEV_COMPILERS =
+        new KotlinCompilerVersion[] {KOTLINC_2_3_10, KOTLIN_DEV};
+
+    private final String folder;
+    private final KotlinLambdaGeneration defaultLambdaGeneration;
+    private final KotlinTargetVersion defaultTargetVersion;
+
+    KotlinCompilerVersion(
+        String folder,
+        KotlinLambdaGeneration defaultLambdaGeneration,
+        KotlinTargetVersion defaultTargetVersion) {
+      this.folder = folder;
+      this.defaultLambdaGeneration = defaultLambdaGeneration;
+      this.defaultTargetVersion = defaultTargetVersion;
+    }
+
+    public KotlinCompiler getCompiler() {
+      return new KotlinCompiler(this);
+    }
+
+    public static List<KotlinCompilerVersion> getSupported() {
+      return Arrays.stream(KotlinCompilerVersion.values())
+          .filter(
+              compiler ->
+                  compiler.isGreaterThanOrEqualTo(MIN_SUPPORTED_VERSION)
+                      && compiler.isLessThanOrEqualTo(MAX_SUPPORTED_VERSION))
+          .collect(Collectors.toList());
+    }
+  }
+
+  public enum KotlinLambdaGeneration {
+    CLASS,
+    INVOKE_DYNAMIC;
+
+    public String getKotlincFlag() {
+      if (this == CLASS) {
+        return "-Xlambdas=class";
+      } else {
+        assert this == INVOKE_DYNAMIC;
+        return "-Xlambdas=indy";
+      }
+    }
+
+    public void apply(KotlinCompilerTool compiler) {
+      if (this == CLASS) {
+        compiler.generateLambdaClasses();
+      } else {
+        assert this == INVOKE_DYNAMIC;
+        compiler.generateInvokeDynamic();
+      }
+    }
+
+    public boolean isClass() {
+      return this == CLASS;
+    }
+
+    public boolean isInvokeDynamic() {
+      return this == INVOKE_DYNAMIC;
+    }
+
+    public boolean isDefaultForVersion(KotlinCompilerVersion version) {
+      return this == version.defaultLambdaGeneration;
+    }
+  }
+
+  public static final class KotlinCompiler {
+
+    private final String name;
+    private final Path lib;
+    private final Path compiler;
+    private final KotlinCompilerVersion compilerVersion;
+
+    public KotlinCompiler(KotlinCompilerVersion compilerVersion) {
+      this.lib =
+          Paths.get(ToolHelper.THIRD_PARTY_DIR, "kotlin", compilerVersion.folder, "kotlinc", "lib");
+      this.compiler = lib.resolve("kotlin-compiler.jar");
+      this.compilerVersion = compilerVersion;
+      this.name = compilerVersion.name();
+    }
+
+    public KotlinCompiler(String name, Path compiler, KotlinCompilerVersion compilerVersion) {
+      this.compiler = compiler;
+      this.lib = null;
+      this.compilerVersion = compilerVersion;
+      this.name = name;
+    }
+
+    public static KotlinCompiler latest() {
+      return MAX_SUPPORTED_VERSION.getCompiler();
+    }
+
+    public Path getCompiler() {
+      return compiler;
+    }
+
+    public Path getFolder() {
+      return lib;
+    }
+
+    public boolean is(KotlinCompilerVersion version) {
+      return compilerVersion == version;
+    }
+
+    public boolean isOneOf(KotlinCompilerVersion... versions) {
+      return Arrays.stream(versions).anyMatch(this::is);
+    }
+
+    public boolean isNot(KotlinCompilerVersion version) {
+      return !is(version);
+    }
+
+    public KotlinCompilerVersion getCompilerVersion() {
+      return compilerVersion;
+    }
+
+    public Path getKotlinStdlibJar() {
+      Path stdLib = getFolder().resolve("kotlin-stdlib.jar");
+      assert Files.exists(stdLib) : "Expected kotlin stdlib jar";
+      return stdLib;
+    }
+
+    public Path getKotlinReflectJar() {
+      Path reflectJar = getFolder().resolve("kotlin-reflect.jar");
+      assert Files.exists(reflectJar) : "Expected kotlin reflect jar";
+      return reflectJar;
+    }
+
+    public Path getKotlinScriptRuntime() {
+      Path reflectJar = getFolder().resolve("kotlin-script-runtime.jar");
+      assert Files.exists(reflectJar) : "Expected kotlin script runtime jar";
+      return reflectJar;
+    }
+
+    public Path getKotlinAnnotationJar() {
+      Path annotationJar = getFolder().resolve("annotations-13.0.jar");
+      assert Files.exists(annotationJar) : "Expected annotation jar";
+      return annotationJar;
+    }
+
+    public Path getKotlinxCoroutinesCoreJar() {
+      Path kotlinxCoroutinesCoreJar = getFolder().resolve("kotlinx-coroutines-core-jvm.jar");
+      assert Files.exists(kotlinxCoroutinesCoreJar) : "Expected kotlinx-coroutines-core jar";
+      return kotlinxCoroutinesCoreJar;
+    }
+
+    public void checkClasspath() throws IOException {
+      try (ZipFile zipFile = new ZipFile(compiler.toFile(), UTF_8)) {
+        Manifest manifest =
+            new Manifest(zipFile.getInputStream(zipFile.getEntry("META-INF/MANIFEST.MF")));
+        String classPath = manifest.getMainAttributes().getValue("Class-Path");
+        String[] classPathEntries = classPath.split(" ");
+        // Expect all classpath entries to be present ajacent to the compiler jar.
+        for (String classPathEntry : classPathEntries) {
+          assert !classPathEntry.contains("/");
+          assert Files.exists(compiler.getParent().resolve(classPathEntry))
+              : "Kotlin compiler missing classpath: " + classPathEntry;
+        }
+      }
+    }
+
+    @Override
+    public String toString() {
+      return name;
+    }
+  }
+
+  private final CfRuntime jdk;
+  private final TestState state;
+  private final KotlinCompiler compiler;
+  private final KotlinTargetVersion targetVersion;
+  private final KotlinLambdaGeneration lambdaGeneration;
+  private final List<Path> sources = new ArrayList<>();
+  private final List<Path> classpath = new ArrayList<>();
+  private final List<String> additionalArguments = new ArrayList<>();
+  private boolean useJvmAssertions;
+  // TODO(b/211590675): We should enable assertions by default.
+  private boolean enableAssertions = true;
+  private Path output = null;
+
+  private KotlinCompilerTool(
+      CfRuntime jdk,
+      TestState state,
+      KotlinCompiler kotlinCompiler,
+      KotlinTargetVersion kotlinTargetVersion,
+      KotlinLambdaGeneration lambdaGeneration) {
+    this.jdk = jdk;
+    this.state = state;
+    this.compiler = kotlinCompiler;
+    this.targetVersion = kotlinTargetVersion;
+    this.lambdaGeneration = lambdaGeneration;
+  }
+
+  public KotlinCompiler getCompiler() {
+    return compiler;
+  }
+
+  public KotlinTargetVersion getTargetVersion() {
+    return targetVersion;
+  }
+
+  public KotlinLambdaGeneration getLambdaGeneration() {
+    return lambdaGeneration;
+  }
+
+  public static KotlinCompilerTool create(
+      CfRuntime jdk,
+      TemporaryFolder temp,
+      KotlinCompiler kotlinCompiler,
+      KotlinTargetVersion kotlinTargetVersion,
+      KotlinLambdaGeneration lambdaGeneration) {
+    return new KotlinCompilerTool(
+        jdk, new TestState(temp), kotlinCompiler, kotlinTargetVersion, lambdaGeneration);
+  }
+
+  public KotlinCompilerTool addArguments(String... arguments) {
+    Collections.addAll(additionalArguments, arguments);
+    return this;
+  }
+
+  public KotlinCompilerTool enableExperimentalContextParameters() {
+    return addArguments("-Xcontext-parameters");
+  }
+
+  public KotlinCompilerTool enableExperimentalContextReceivers() {
+    return addArguments("-Xcontext-receivers");
+  }
+
+  public KotlinCompilerTool addSourceFiles(Path... files) {
+    return addSourceFiles(Arrays.asList(files));
+  }
+
+  public KotlinCompilerTool addSourceFiles(Collection<Path> files) {
+    sources.addAll(files);
+    return this;
+  }
+
+  public KotlinCompilerTool addSourceFilesWithNonKtExtension(TemporaryFolder temp, Path... files) {
+    return addSourceFilesWithNonKtExtension(temp, Arrays.asList(files));
+  }
+
+  public KotlinCompilerTool includeRuntime() {
+    assert !additionalArguments.contains("-include-runtime");
+    addArguments("-include-runtime");
+    return this;
+  }
+
+  public KotlinCompilerTool noReflect() {
+    assert !additionalArguments.contains("-no-reflect");
+    addArguments("-no-reflect");
+    return this;
+  }
+
+  public KotlinCompilerTool noStdLib() {
+    assert !additionalArguments.contains("-no-stdlib");
+    addArguments("-no-stdlib");
+    return this;
+  }
+
+  // This forces using invokedynamic for Kotlin lambdas.
+  public KotlinCompilerTool generateLambdaClasses() {
+    assert !additionalArguments.contains(CLASS.getKotlincFlag())
+        && !additionalArguments.contains(INVOKE_DYNAMIC.getKotlincFlag());
+    addArguments(CLASS.getKotlincFlag());
+    return this;
+  }
+
+  // This forces generation kotlinc of lambda classes for Kotlin lambdas
+  public KotlinCompilerTool generateInvokeDynamic() {
+    assert !additionalArguments.contains(CLASS.getKotlincFlag())
+        && !additionalArguments.contains(INVOKE_DYNAMIC.getKotlincFlag());
+    addArguments(INVOKE_DYNAMIC.getKotlincFlag());
+    return this;
+  }
+
+  public KotlinCompilerTool disableAssertions() {
+    this.enableAssertions = false;
+    return this;
+  }
+
+  public KotlinCompilerTool addSourceFilesWithNonKtExtension(
+      TemporaryFolder temp, Collection<Path> files) {
+    return addSourceFiles(
+        files.stream()
+            .map(
+                fileNotNamedKt -> {
+                  try {
+                    // The Kotlin compiler does not require particular naming of files except for
+                    // the extension, so just create a file called source.kt in a new directory.
+                    String newFileName = getNameWithoutExtension(fileNotNamedKt.toString()) + ".kt";
+                    Path fileNamedKt = temp.newFolder().toPath().resolve(newFileName);
+                    Files.copy(fileNotNamedKt, fileNamedKt);
+                    return fileNamedKt;
+                  } catch (IOException e) {
+                    throw new RuntimeException(e);
+                  }
+                })
+            .collect(Collectors.toList()));
+  }
+
+  public KotlinCompilerTool addClasspathFiles(Path... files) {
+    return addClasspathFiles(Arrays.asList(files));
+  }
+
+  public KotlinCompilerTool addClasspathFiles(Collection<Path> files) {
+    classpath.addAll(files);
+    return this;
+  }
+
+  public KotlinCompilerTool setOutputPath(Path file) {
+    assertTrue("Output path must be an existing directory or a non-existing jar file",
+        (!Files.exists(file) && FileUtils.isJarFile(file) && Files.exists(file.getParent()))
+            || (Files.exists(file) && Files.isDirectory(file)));
+    this.output = file;
+    return this;
+  }
+
+  public KotlinCompilerTool setUseJvmAssertions(boolean useJvmAssertions) {
+    this.useJvmAssertions = useJvmAssertions;
+    return this;
+  }
+
+  public KotlinCompilerTool apply(Consumer<KotlinCompilerTool> consumer) {
+    consumer.accept(this);
+    return this;
+  }
+
+  private Path getOrCreateOutputPath() throws IOException {
+    return output != null ? output : state.getNewTempFolder().resolve("out.jar");
+  }
+
+  /** Compile and return the compilations process result object. */
+  public ProcessResult compileRaw() throws IOException {
+    assertNotNull("An output path must be specified prior to compilation.", output);
+    return compileInternal(output);
+  }
+
+  /** Compile asserting success and return the output path. */
+  public Path compile() throws IOException {
+    return compile(false);
+  }
+
+  public Path compile(boolean expectingFailure) throws IOException {
+    return compile(expectingFailure, ConsumerUtils.emptyConsumer());
+  }
+
+  public Path compile(boolean expectingFailure, Consumer<ProcessResult> consumer)
+      throws IOException {
+    Path output = getOrCreateOutputPath();
+    ProcessResult result = compileInternal(output);
+    if (expectingFailure) {
+      assertNotEquals(result.toString(), result.exitCode, 0);
+    } else {
+      assertEquals(result.toString(), result.exitCode, 0);
+    }
+    consumer.accept(result);
+    return output;
+  }
+
+  private ProcessResult compileInternal(Path output) throws IOException {
+    CommandLineAndHasherConsumers commandLineAndHasherConsumers =
+        buildCommandLineAndHasherConsumers(output);
+    CacheLookupKey cacheLookupKey = null;
+    if (CommandResultCache.isEnabled()) {
+      cacheLookupKey =
+          new CacheLookupKey(
+              hasher ->
+                  commandLineAndHasherConsumers.hasherConsumers.forEach(
+                      hasherConsumer -> hasherConsumer.acceptWithRuntimeException(hasher)));
+      Pair<ProcessResult, Path> lookupResult =
+          CommandResultCache.getInstance().lookup(cacheLookupKey);
+      if (lookupResult != null
+          && lookupResult.getFirst().exitCode == 0
+          && lookupResult.getSecond() != null) {
+        Files.copy(lookupResult.getSecond(), output);
+        return lookupResult.getFirst();
+      }
+    }
+    ProcessBuilder builder = new ProcessBuilder(commandLineAndHasherConsumers.cmdline);
+    builder.directory(new File(ToolHelper.getProjectRoot()));
+    ProcessResult processResult = ToolHelper.runProcess(builder);
+    if (CommandResultCache.isEnabled() && output.toFile().isFile()) {
+      CommandResultCache.getInstance().putResult(processResult, cacheLookupKey, output);
+    }
+    return processResult;
+  }
+
+  public static class CommandLineAndHasherConsumers {
+    final List<String> cmdline = new ArrayList<>();
+    final List<ThrowingConsumer<Hasher, IOException>> hasherConsumers = new ArrayList<>();
+  }
+
+  private CommandLineAndHasherConsumers buildCommandLineAndHasherConsumers(Path output)
+      throws IOException {
+    compiler.checkClasspath();
+    CommandLineAndHasherConsumers commandLineAndHasherConsumers =
+        new CommandLineAndHasherConsumers();
+    List<String> cmdline = commandLineAndHasherConsumers.cmdline;
+    cmdline.add(jdk.getJavaExecutable().toString());
+    if (enableAssertions) {
+      cmdline.add("-ea");
+    }
+    cmdline.add("-cp");
+    cmdline.add(compiler.getCompiler().toString());
+    cmdline.add(ToolHelper.K2JVMCompiler);
+    if (useJvmAssertions) {
+      cmdline.add("-Xassertions=jvm");
+    }
+    cmdline.add("-jdk-home");
+    cmdline.add(jdk.getJavaHome().toString());
+    cmdline.add("-jvm-target");
+    cmdline.add(targetVersion.getJvmTargetString());
+    cmdline.add(lambdaGeneration.getKotlincFlag());
+    // Until now this is just command line files, no inputs, hash existing command
+    String noneFileCommandLineArguments = StringUtils.join("", cmdline);
+    commandLineAndHasherConsumers.hasherConsumers.add(
+        hasher -> hasher.putString(noneFileCommandLineArguments, UTF_8));
+
+    for (Path source : sources) {
+      cmdline.add(source.toString());
+      commandLineAndHasherConsumers.hasherConsumers.add(
+          hasher -> hasher.putBytes(Files.readAllBytes(source)));
+    }
+    cmdline.add("-d");
+    cmdline.add(output.toString());
+    if (!classpath.isEmpty()) {
+      cmdline.add("-cp");
+      cmdline.add(classpath
+          .stream()
+          .map(Path::toString)
+          .collect(Collectors.joining(isWindows() ? ";" : ":")));
+      for (Path path : classpath) {
+        commandLineAndHasherConsumers.hasherConsumers.add(
+            hasher -> {
+              hasher.putString("--cp", UTF_8);
+              hasher.putBytes(Files.readAllBytes(path));
+            });
+      }
+    }
+    cmdline.addAll(additionalArguments);
+    commandLineAndHasherConsumers.hasherConsumers.add(
+        hasher -> additionalArguments.forEach(s -> hasher.putString(s, UTF_8)));
+    return commandLineAndHasherConsumers;
+  }
+}

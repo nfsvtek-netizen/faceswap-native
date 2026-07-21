@@ -1,0 +1,397 @@
+// Copyright (c) 2022, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.benchmarks;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+import com.android.tools.r8.DexSegments;
+import com.android.tools.r8.dex.DexSection;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.longs.LongList;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
+import java.util.function.IntToLongFunction;
+import java.util.function.LongConsumer;
+
+public class BenchmarkResultsSingle implements BenchmarkResults {
+
+  private final String name;
+  private final Set<BenchmarkMetric> metrics;
+  private final LongList runtimeResults = new LongArrayList();
+
+  // Consider using LongSet to eliminate duplicate results for size.
+  private final LongList codeSizeResults = new LongArrayList();
+  private final LongList gcOldGenCountResults = new LongArrayList();
+  private final LongList gcOldGenTimeResults = new LongArrayList();
+  private final LongList gcYoungGenCountResults = new LongArrayList();
+  private final LongList gcYoungGenTimeResults = new LongArrayList();
+  private final LongList instructionCodeSizeResults = new LongArrayList();
+  private final LongList composableInstructionCodeSizeResults = new LongArrayList();
+  private final LongList dex2OatSizeResults = new LongArrayList();
+  private final List<DexSegments.Result> dexSegmentsSizeResults = new ArrayList<>();
+  private final LongList resourceSizeResults = new LongArrayList();
+
+  public BenchmarkResultsSingle(String name, Set<BenchmarkMetric> metrics) {
+    this.name = name;
+    this.metrics = metrics;
+  }
+
+  public String getName() {
+    return name;
+  }
+
+  public LongList getCodeSizeResults() {
+    return codeSizeResults;
+  }
+
+  public LongList getInstructionCodeSizeResults() {
+    return instructionCodeSizeResults;
+  }
+
+  public LongList getComposableInstructionCodeSizeResults() {
+    return composableInstructionCodeSizeResults;
+  }
+
+  public List<DexSegments.Result> getDexSegmentsSizeResults() {
+    return dexSegmentsSizeResults;
+  }
+
+  public LongList getDex2OatSizeResults() {
+    return dex2OatSizeResults;
+  }
+
+  public LongList getGcOldGenCountResults() {
+    return gcOldGenCountResults;
+  }
+
+  public LongList getGcOldGenTimeResults() {
+    return gcOldGenTimeResults;
+  }
+
+  public LongList getGcYoungGenCountResults() {
+    return gcYoungGenCountResults;
+  }
+
+  public LongList getGcYoungGenTimeResults() {
+    return gcYoungGenTimeResults;
+  }
+
+  public LongList getRuntimeResults() {
+    return runtimeResults;
+  }
+
+  public LongList getResourceSizeResults() {
+    return resourceSizeResults;
+  }
+
+  @Override
+  public void addGcOldGenCountResult(long result) {
+    verifyMetric(
+        BenchmarkMetric.GcOldGenCount, metrics.contains(BenchmarkMetric.GcOldGenCount), true);
+    gcOldGenCountResults.add(result);
+  }
+
+  @Override
+  public void addGcOldGenTimeResult(long result) {
+    verifyMetric(
+        BenchmarkMetric.GcOldGenTime, metrics.contains(BenchmarkMetric.GcOldGenTime), true);
+    gcOldGenTimeResults.add(result);
+  }
+
+  @Override
+  public void addGcYoungGenCountResult(long result) {
+    verifyMetric(
+        BenchmarkMetric.GcYoungGenCount, metrics.contains(BenchmarkMetric.GcYoungGenCount), true);
+    gcYoungGenCountResults.add(result);
+  }
+
+  @Override
+  public void addGcYoungGenTimeResult(long result) {
+    verifyMetric(
+        BenchmarkMetric.GcYoungGenTime, metrics.contains(BenchmarkMetric.GcYoungGenTime), true);
+    gcYoungGenTimeResults.add(result);
+  }
+
+  @Override
+  public void addRuntimeResult(long result) {
+    verifyMetric(BenchmarkMetric.RunTimeRaw, metrics.contains(BenchmarkMetric.RunTimeRaw), true);
+    runtimeResults.add(result);
+  }
+
+  @Override
+  public void addCodeSizeResult(long result) {
+    verifyMetric(BenchmarkMetric.CodeSize, metrics.contains(BenchmarkMetric.CodeSize), true);
+    codeSizeResults.add(result);
+  }
+
+  @Override
+  public void addInstructionCodeSizeResult(long result) {
+    verifyMetric(
+        BenchmarkMetric.InstructionCodeSize,
+        metrics.contains(BenchmarkMetric.InstructionCodeSize),
+        true);
+    instructionCodeSizeResults.add(result);
+  }
+
+  @Override
+  public void addComposableInstructionCodeSizeResult(long result) {
+    verifyMetric(
+        BenchmarkMetric.ComposableInstructionCodeSize,
+        metrics.contains(BenchmarkMetric.ComposableInstructionCodeSize),
+        true);
+    composableInstructionCodeSizeResults.add(result);
+  }
+
+  @Override
+  public void addDexSegmentsSizeResult(DexSegments.Result result) {
+    verifyMetric(
+        BenchmarkMetric.DexSegmentsCodeSize,
+        metrics.contains(BenchmarkMetric.DexSegmentsCodeSize),
+        true);
+    dexSegmentsSizeResults.add(result);
+  }
+
+  @Override
+  public void addDex2OatSizeResult(long result) {
+    verifyMetric(
+        BenchmarkMetric.Dex2OatCodeSize, metrics.contains(BenchmarkMetric.Dex2OatCodeSize), true);
+    dex2OatSizeResults.add(result);
+  }
+
+  @Override
+  public void addResourceSizeResult(long result) {
+    verifyMetric(
+        BenchmarkMetric.ResourceSize, true, metrics.contains(BenchmarkMetric.ResourceSize));
+    resourceSizeResults.add(result);
+  }
+
+  @Override
+  public void doAverage() {
+    assertFalse(runtimeResults.isEmpty());
+    long averageRuntimeResult =
+        Math.round(runtimeResults.stream().mapToLong(Long::longValue).average().orElse(0));
+    runtimeResults.clear();
+    addRuntimeResult(averageRuntimeResult);
+
+    assertTrue(codeSizeResults.isEmpty());
+    assertTrue(instructionCodeSizeResults.isEmpty());
+    assertTrue(composableInstructionCodeSizeResults.isEmpty());
+    assertTrue(dex2OatSizeResults.isEmpty());
+    assertTrue(dexSegmentsSizeResults.isEmpty());
+    assertTrue(resourceSizeResults.isEmpty());
+  }
+
+  @Override
+  public BenchmarkResults getSubResults(String name) {
+    throw new BenchmarkConfigError(
+        "Unexpected attempt to get sub-results for benchmark without sub-benchmarks");
+  }
+
+  @Override
+  public boolean isBenchmarkingGc() {
+    if (metrics.contains(BenchmarkMetric.GcOldGenCount)) {
+      assert metrics.contains(BenchmarkMetric.GcOldGenTime);
+      assert metrics.contains(BenchmarkMetric.GcYoungGenCount);
+      assert metrics.contains(BenchmarkMetric.GcYoungGenTime);
+      return true;
+    }
+    return false;
+  }
+
+  private static void verifyMetric(BenchmarkMetric metric, boolean expected, boolean actual) {
+    if (expected != actual) {
+      throw new BenchmarkConfigError(
+          "Mismatched config and result for "
+              + metric.name()
+              + ". Expected by config: "
+              + expected
+              + ", but has result: "
+              + actual);
+    }
+  }
+
+  private void verifyConfigAndResults() {
+    verifyMetric(
+        BenchmarkMetric.RunTimeRaw,
+        metrics.contains(BenchmarkMetric.RunTimeRaw),
+        !runtimeResults.isEmpty());
+    verifyMetric(
+        BenchmarkMetric.CodeSize,
+        isBenchmarkingCodeSize() && metrics.contains(BenchmarkMetric.CodeSize),
+        !codeSizeResults.isEmpty());
+    verifyMetric(
+        BenchmarkMetric.InstructionCodeSize,
+        isBenchmarkingCodeSize() && metrics.contains(BenchmarkMetric.InstructionCodeSize),
+        !instructionCodeSizeResults.isEmpty());
+    verifyMetric(
+        BenchmarkMetric.ComposableInstructionCodeSize,
+        isBenchmarkingCodeSize() && metrics.contains(BenchmarkMetric.ComposableInstructionCodeSize),
+        !composableInstructionCodeSizeResults.isEmpty());
+    verifyMetric(
+        BenchmarkMetric.DexSegmentsCodeSize,
+        isBenchmarkingCodeSize() && metrics.contains(BenchmarkMetric.DexSegmentsCodeSize),
+        !dexSegmentsSizeResults.isEmpty());
+    verifyMetric(
+        BenchmarkMetric.Dex2OatCodeSize,
+        isBenchmarkingCodeSize() && metrics.contains(BenchmarkMetric.Dex2OatCodeSize),
+        !dex2OatSizeResults.isEmpty());
+  }
+
+  private void printRunTime(long duration) {
+    String value = BenchmarkResults.prettyTime(duration);
+    System.out.println(BenchmarkResults.prettyMetric(name, BenchmarkMetric.RunTimeRaw, value));
+  }
+
+  private void printCodeSize(long bytes) {
+    System.out.println(BenchmarkResults.prettyMetric(name, BenchmarkMetric.CodeSize, bytes));
+  }
+
+  private void printInstructionCodeSize(long bytes) {
+    System.out.println(
+        BenchmarkResults.prettyMetric(name, BenchmarkMetric.InstructionCodeSize, bytes));
+  }
+
+  private void printComposableInstructionCodeSize(long bytes) {
+    System.out.println(
+        BenchmarkResults.prettyMetric(name, BenchmarkMetric.ComposableInstructionCodeSize, bytes));
+  }
+
+  private void printDexSegmentSize(int section, long bytes) {
+    System.out.println(
+        BenchmarkResults.prettyMetric(
+            name,
+            BenchmarkMetric.DexSegmentsCodeSize + ", " + DexSection.typeName(section),
+            bytes));
+  }
+
+  private void printDex2OatSize(long bytes) {
+    System.out.println(BenchmarkResults.prettyMetric(name, BenchmarkMetric.Dex2OatCodeSize, bytes));
+  }
+
+  private void printGcOldGenCount(long count) {
+    System.out.println(BenchmarkResults.prettyMetric(name, BenchmarkMetric.GcOldGenCount, count));
+  }
+
+  private void printGcOldGenTime(long duration) {
+    String value = BenchmarkResults.prettyTime(duration);
+    System.out.println(BenchmarkResults.prettyMetric(name, BenchmarkMetric.GcOldGenTime, value));
+  }
+
+  private void printGcYoungGenCount(long count) {
+    System.out.println(BenchmarkResults.prettyMetric(name, BenchmarkMetric.GcYoungGenCount, count));
+  }
+
+  private void printGcYoungGenTime(long duration) {
+    String value = BenchmarkResults.prettyTime(duration);
+    System.out.println(BenchmarkResults.prettyMetric(name, BenchmarkMetric.GcYoungGenTime, value));
+  }
+
+  private void printResourceSize(long bytes) {
+    System.out.println(BenchmarkResults.prettyMetric(name, BenchmarkMetric.ResourceSize, bytes));
+  }
+
+  @Override
+  public void printResults(ResultMode mode, boolean failOnCodeSizeDifferences) {
+    verifyConfigAndResults();
+    if (!runtimeResults.isEmpty()) {
+      long sum = runtimeResults.stream().mapToLong(l -> l).sum();
+      long result = mode == ResultMode.SUM ? sum : sum / runtimeResults.size();
+      printRunTime(result);
+    }
+    printCodeSizeResults(codeSizeResults, failOnCodeSizeDifferences, this::printCodeSize);
+    printCodeSizeResults(
+        instructionCodeSizeResults, failOnCodeSizeDifferences, this::printInstructionCodeSize);
+    printCodeSizeResults(
+        composableInstructionCodeSizeResults,
+        failOnCodeSizeDifferences,
+        this::printComposableInstructionCodeSize);
+    for (int section : DexSection.getConstants()) {
+      printCodeSizeResults(
+          dexSegmentsSizeResults,
+          i -> dexSegmentsSizeResults.get(i).get(section).getSegmentSize(),
+          failOnCodeSizeDifferences,
+          result -> printDexSegmentSize(section, result));
+    }
+    printCodeSizeResults(dex2OatSizeResults, failOnCodeSizeDifferences, this::printDex2OatSize);
+    printCodeSizeResults(resourceSizeResults, failOnCodeSizeDifferences, this::printResourceSize);
+    printGcCountResults(gcOldGenCountResults, mode, this::printGcOldGenCount);
+    printGcTimeResults(gcOldGenTimeResults, mode, this::printGcOldGenTime);
+    printGcCountResults(gcYoungGenCountResults, mode, this::printGcYoungGenCount);
+    printGcTimeResults(gcYoungGenTimeResults, mode, this::printGcYoungGenTime);
+  }
+
+  private static void printCodeSizeResults(
+      LongList codeSizeResults, boolean failOnCodeSizeDifferences, LongConsumer printer) {
+    printCodeSizeResults(
+        codeSizeResults, codeSizeResults::getLong, failOnCodeSizeDifferences, printer);
+  }
+
+  private void printGcCountResults(LongList gcCountResults, ResultMode mode, LongConsumer printer) {
+    if (!gcCountResults.isEmpty()) {
+      long sum = gcCountResults.stream().mapToLong(l -> l).sum();
+      long result = mode == ResultMode.SUM ? sum : sum / gcCountResults.size();
+      printer.accept(result);
+    }
+  }
+
+  private void printGcTimeResults(LongList gcTimeResults, ResultMode mode, LongConsumer printer) {
+    if (!gcTimeResults.isEmpty()) {
+      long sum = gcTimeResults.stream().mapToLong(l -> l).sum();
+      long result = mode == ResultMode.SUM ? sum : sum / gcTimeResults.size();
+      printer.accept(result);
+    }
+  }
+
+  private static void printCodeSizeResults(
+      Collection<?> codeSizeResults,
+      IntToLongFunction getter,
+      boolean failOnCodeSizeDifferences,
+      LongConsumer printer) {
+    if (codeSizeResults.isEmpty()) {
+      return;
+    }
+    long size = getter.applyAsLong(0);
+    if (failOnCodeSizeDifferences) {
+      for (int i = 1; i < codeSizeResults.size(); i++) {
+        if (size != getter.applyAsLong(i)) {
+          throw new RuntimeException(
+              "Unexpected code size difference: " + size + " and " + getter.applyAsLong(i));
+        }
+      }
+    }
+    printer.accept(size);
+  }
+
+  public int size() {
+    return runtimeResults.size();
+  }
+
+  @Override
+  public void writeResults(Path path, BenchmarkResults warmupResults) throws IOException {
+    try (PrintStream out = new PrintStream(Files.newOutputStream(path))) {
+      Gson gson =
+          new GsonBuilder()
+              .registerTypeAdapter(
+                  BenchmarkResultsSingle.class, new BenchmarkResultsSingleAdapter())
+              .registerTypeAdapter(
+                  BenchmarkResultsWarmup.class, new BenchmarkResultsWarmupAdapter())
+              .create();
+      JsonObject json = (JsonObject) gson.toJsonTree(this);
+      if (warmupResults != null) {
+        json.add("warmup", gson.toJsonTree(warmupResults));
+      }
+      out.print(json);
+    }
+  }
+}

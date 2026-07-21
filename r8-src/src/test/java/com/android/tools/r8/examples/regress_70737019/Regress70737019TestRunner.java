@@ -1,0 +1,49 @@
+// Copyright (c) 2023, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.examples.regress_70737019;
+
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.examples.ExamplesTestBase;
+import com.android.tools.r8.utils.internal.StringUtils;
+import com.google.common.collect.ImmutableList;
+import java.util.List;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+
+@RunWith(Parameterized.class)
+public class Regress70737019TestRunner extends ExamplesTestBase {
+
+  public Regress70737019TestRunner(TestParameters parameters) {
+    super(parameters);
+  }
+
+  @Override
+  public Class<?> getMainClass() {
+    return TestClass.class;
+  }
+
+  @Override
+  public List<Class<?>> getTestClasses() throws Exception {
+    String outerClass = typeName(TestClass.class);
+    return ImmutableList.of(
+        getMainClass(),
+        Class.forName(outerClass + "$1"),
+        Class.forName(outerClass + "$X"),
+        Class.forName(outerClass + "$A"),
+        Class.forName(outerClass + "$B"),
+        Class.forName(outerClass + "$C"));
+  }
+
+  @Override
+  public String getExpected() {
+    return StringUtils.lines(
+        "r  = NaN",
+        "mZ = false",
+        "mI = 1",
+        "mJ = 0",
+        "mF = NaN",
+        "mD = 0.0",
+        "mArray = [[[[[[[[[[1.0775E8]]]]]]]]]]");
+  }
+}

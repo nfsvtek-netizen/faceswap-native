@@ -1,0 +1,305 @@
+// Copyright (c) 2023, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.ir.conversion;
+
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexApplication;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.lens.GraphLens;
+import com.android.tools.r8.ir.analysis.fieldaccess.TrivialFieldAccessReprocessor;
+import com.android.tools.r8.ir.optimize.info.MethodResolutionOptimizationInfoAnalysis;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackDelayed;
+import com.android.tools.r8.naming.IdentifierMinifier;
+import com.android.tools.r8.optimize.argumentpropagation.ArgumentPropagator;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
+import com.android.tools.r8.utils.internal.Action;
+import com.android.tools.r8.utils.timing.Timing;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+
+public class PrimaryR8IRConverter extends IRConverter {
+
+  private final Timing timing;
+
+  public PrimaryR8IRConverter(
+      AppView<? extends AppInfoWithClassHierarchy> appView,
+      Timing timing,
+      boolean enableListIterationRewriter) {
+    super(appView);
+    this.timing = timing;
+    if (enableListIterationRewriter) {
+      rewriterPassCollection.enableListIterationRewriter(appView);
+    }
+  }
+
+  public void optimize(AppView<AppInfoWithLiveness> appView, ExecutorService executorService)
+      throws ExecutionException, IOException {
+    timing.begin("Create IR");
+    try {
+      DexApplication application =
+          internalOptimize(appView.withLiveness(), executorService).asDirect();
+      AppInfoWithClassHierarchy newAppInfo =
+          appView.appInfo().rebuildWithClassHierarchy(previous -> application, timing);
+      appView.withClassHierarchy().setAppInfo(newAppInfo);
+    } finally {
+      timing.end();
+    }
+  }
+
+  private DexApplication internalOptimize(
+      AppView<AppInfoWithLiveness> appView, ExecutorService executorService)
+      throws ExecutionException {
+    workaroundAbstractMethodOnNonAbstractClassVerificationBug(executorService);
+
+    // The process is in two phases in general.
+    // 1) Subject all DexEncodedMethods to optimization, except some optimizations that require
+    //    reprocessing IR code of methods, e.g., outlining, double-inlining, class staticizer, etc.
+    //    - a side effect is candidates for those optimizations are identified.
+    // 2) Revisit DexEncodedMethods for the collected candidates.
+
+    printPhase("Primary optimization pass");
+
+    GraphLens graphLensForPrimaryOptimizationPass = appView.graphLens();
+
+    // Setup optimizations for the primary optimization pass.
+    appView.withArgumentPropagator(
+        argumentPropagator -> argumentPropagator.initializeCodeScanner(executorService, timing));
+    enumUnboxer.prepareForPrimaryOptimizationPass(graphLensForPrimaryOptimizationPass);
+    numberUnboxer.prepareForPrimaryOptimizationPass(timing, executorService);
+    outliner.prepareForPrimaryOptimizationPass(graphLensForPrimaryOptimizationPass);
+
+    if (fieldAccessAnalysis != null && fieldAccessAnalysis.fieldAssignmentTracker() != null) {
+      fieldAccessAnalysis.fieldAssignmentTracker().initialize(executorService);
+    }
+
+    // Process the application identifying outlining candidates.
+    OptimizationFeedbackDelayed feedback = delayedOptimizationFeedback;
+    PostMethodProcessor.Builder postMethodProcessorBuilder =
+        new PostMethodProcessor.Builder(graphLensForPrimaryOptimizationPass);
+    {
+      timing.begin("Build primary method processor");
+      MethodProcessorEventConsumer eventConsumer =
+          MethodProcessorEventConsumer.createForR8(appView);
+      PrimaryMethodProcessor primaryMethodProcessor =
+          PrimaryMethodProcessor.create(
+              appView.withLiveness(), eventConsumer, executorService, timing);
+      timing.end();
+      timing.begin("IR conversion phase 1");
+      assert appView.graphLens() == graphLensForPrimaryOptimizationPass;
+      primaryMethodProcessor.forEachMethod(
+          (method, methodProcessingContext) ->
+              processDesugaredMethod(
+                  method,
+                  feedback,
+                  primaryMethodProcessor,
+                  methodProcessingContext,
+                  MethodConversionOptions.forLirPhase(appView),
+                  timing.createThreadTiming(method.toSourceString(), options)),
+          this::waveStart,
+          this::waveDone,
+          timing,
+          executorService);
+      lastWaveDone(postMethodProcessorBuilder, executorService);
+      eventConsumer.finished(appView);
+      assert appView.graphLens() == graphLensForPrimaryOptimizationPass;
+      timing.end();
+    }
+
+    // Rewrite DexItemBasedConstString static field values before updating code lens.
+    new IdentifierMinifier(appView).rewriteDexItemBasedConstStringInStaticFields(executorService);
+
+    // The field access info collection is not maintained during IR processing.
+    appView
+        .appInfoWithLiveness()
+        .getMutableFieldAccessInfoCollection()
+        .destroyUniqueWriteContexts();
+
+    // Assure that no more optimization feedback left after primary processing.
+    assert feedback.noUpdatesLeft();
+    appView.setAllCodeProcessed();
+
+    // All the code has been processed so the rewriting required by the lenses is done everywhere,
+    // we clear lens code rewriting so that the lens rewriter can be re-executed in phase 2 if new
+    // lenses with code rewriting are added.
+    List<GraphLens> prunedGraphLenses =
+        appView.clearCodeRewritings(executorService, Timing.empty());
+
+    // Commit synthetics from the primary optimization pass.
+    commitPendingSyntheticItems(appView, timing);
+
+    // Post processing:
+    //   1) Second pass for methods whose collected call site information become more precise.
+    //   2) Second inlining pass for dealing with double inline callers.
+    printPhase("Post optimization pass");
+
+    // Analyze the data collected by the argument propagator, use the analysis result to update
+    // the parameter optimization infos, and rewrite the application.
+    // TODO(b/199237357): Automatically rewrite state when lens changes.
+    numberUnboxer.rewriteWithLens();
+    outliner.updateAppliedLens(prunedGraphLenses).rewriteWithLens();
+    appView.withArgumentPropagator(
+        argumentPropagator ->
+            argumentPropagator.tearDownCodeScanner(
+                this, postMethodProcessorBuilder, executorService, timing));
+
+    if (libraryMethodOverrideAnalysis != null) {
+      libraryMethodOverrideAnalysis.finish();
+    }
+
+    if (!options.debug) {
+      new TrivialFieldAccessReprocessor(appView.withLiveness(), postMethodProcessorBuilder)
+          .run(executorService, feedback, timing);
+    }
+
+    numberUnboxer.rewriteWithLens();
+    outliner.rewriteWithLens();
+    enumUnboxer.unboxEnums(
+        appView, this, postMethodProcessorBuilder, executorService, feedback, timing);
+    appView.unboxedEnums().checkEnumsUnboxed(appView);
+
+    numberUnboxer.rewriteWithLens();
+    outliner.rewriteWithLens();
+    numberUnboxer.unboxNumbers(postMethodProcessorBuilder, timing, executorService);
+
+    GraphLens graphLensForSecondaryOptimizationPass = appView.graphLens();
+
+    outliner.rewriteWithLens();
+
+    MethodResolutionOptimizationInfoAnalysis.run(
+        appView, executorService, postMethodProcessorBuilder);
+
+    {
+      timing.begin("IR conversion phase 2");
+      MethodProcessorEventConsumer eventConsumer =
+          MethodProcessorEventConsumer.createForR8(appView);
+      PostMethodProcessor postMethodProcessor =
+          timing.time(
+              "Build post method processor",
+              () ->
+                  postMethodProcessorBuilder.build(
+                      appView, eventConsumer, executorService, timing));
+      if (postMethodProcessor != null) {
+        assert appView.graphLens() == graphLensForSecondaryOptimizationPass;
+        timing.begin("Process code");
+        postMethodProcessor.forEachMethod(
+            (method, methodProcessingContext) ->
+                processDesugaredMethod(
+                    method,
+                    feedback,
+                    postMethodProcessor,
+                    methodProcessingContext,
+                    MethodConversionOptions.forLirPhase(appView),
+                    timing.createThreadTiming(method.toSourceString(), options)),
+            this,
+            feedback,
+            appView.options().getThreadingModule(),
+            executorService,
+            timing);
+        timing.end();
+        timing.time("Update visible optimization info", feedback::updateVisibleOptimizationInfo);
+        eventConsumer.finished(appView);
+        assert appView.graphLens() == graphLensForSecondaryOptimizationPass;
+      }
+      timing.end();
+    }
+
+    appView.clearMethodResolutionOptimizationInfoCollection();
+
+    // All the code that should be impacted by the lenses inserted between phase 1 and phase 2
+    // have now been processed and rewritten, we clear code lens rewriting so that the class
+    // staticizer and phase 3 does not perform again the rewriting.
+    appView.clearCodeRewritings(executorService, Timing.empty());
+
+    // Commit synthetics before creating a builder (otherwise the builder will not include the
+    // synthetics.)
+    commitPendingSyntheticItems(appView, timing);
+
+    // Update optimization info for all synthesized methods at once.
+    feedback.updateVisibleOptimizationInfo();
+
+    // TODO(b/127694949): Adapt to PostOptimization.
+    outliner.performOutlining(this, feedback, executorService, timing);
+    clearDexMethodCompilationState();
+
+    if (identifierNameStringMarker != null) {
+      identifierNameStringMarker.decoupleIdentifierNameStringsInFields(executorService);
+    }
+
+    // Assure that no more optimization feedback left after post processing.
+    assert feedback.noUpdatesLeft();
+    return appView.appInfo().app();
+  }
+
+  private void clearDexMethodCompilationState() {
+    appView.appInfo().classes().forEach(this::clearDexMethodCompilationState);
+  }
+
+  private void clearDexMethodCompilationState(DexProgramClass clazz) {
+    clazz.forEachMethod(DexEncodedMethod::markNotProcessed);
+  }
+
+  private static void commitPendingSyntheticItems(
+      AppView<AppInfoWithLiveness> appView, Timing timing) {
+    if (appView.getSyntheticItems().hasPendingSyntheticClasses()) {
+      appView.rebuildAppInfo(timing);
+    }
+  }
+
+  public void waveStart(ProgramMethodSet wave, int waveId) {
+    onWaveDoneActions = Collections.synchronizedList(new ArrayList<>());
+    timing.begin("Wave " + waveId);
+  }
+
+  public void waveDone(ProgramMethodSet wave, ExecutorService executorService) {
+    timing.end();
+    try (Timing t0 = timing.begin("Wave done")) {
+      delayedOptimizationFeedback.refineAppInfoWithLiveness(appView.appInfo().withLiveness());
+      delayedOptimizationFeedback.updateVisibleOptimizationInfo();
+      if (fieldAccessAnalysis != null && fieldAccessAnalysis.fieldAssignmentTracker() != null) {
+        fieldAccessAnalysis.fieldAssignmentTracker().waveDone(wave, delayedOptimizationFeedback);
+      }
+      appView.withArgumentPropagator(ArgumentPropagator::waveDone);
+      if (appView.options().protoShrinking().enableRemoveProtoEnumSwitchMap()) {
+        appView.protoShrinker().protoEnumSwitchMapRemover.updateVisibleStaticFieldValues();
+      }
+      enumUnboxer.updateEnumUnboxingCandidatesInfo();
+      assert delayedOptimizationFeedback.noUpdatesLeft();
+      if (onWaveDoneActions != null) {
+        onWaveDoneActions.forEach(Action::execute);
+        onWaveDoneActions = null;
+      }
+    }
+  }
+
+  private void lastWaveDone(
+      PostMethodProcessor.Builder postMethodProcessorBuilder, ExecutorService executorService)
+      throws ExecutionException {
+    pruneItems(executorService);
+    unsetFieldAccessAnalysis();
+    unsetConditionalAssumeRules();
+    if (inliner != null) {
+      inliner.onLastWaveDone(postMethodProcessorBuilder, executorService, timing);
+    }
+
+    // Ensure determinism of method-to-reprocess set.
+    appView.testing().checkDeterminism(postMethodProcessorBuilder::dump);
+  }
+
+  public void pruneItems(ExecutorService executorService) throws ExecutionException {
+    if (prunedItemsBuilder.hasFullyInlinedMethods() || prunedItemsBuilder.hasRemovedMethods()) {
+      appView.pruneItems(
+          prunedItemsBuilder.setPrunedApp(appView.app()).build(), executorService, timing);
+      prunedItemsBuilder.clearFullyInlinedMethods();
+      prunedItemsBuilder.clearRemovedMethods();
+    }
+  }
+}

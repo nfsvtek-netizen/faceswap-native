@@ -1,0 +1,875 @@
+// Copyright (c) 2016, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.dex;
+
+import static com.android.tools.r8.utils.positions.LineNumberOptimizer.runAndWriteMap;
+
+import com.android.tools.r8.ByteBufferProvider;
+import com.android.tools.r8.ByteDataView;
+import com.android.tools.r8.D8.ConvertedCfFiles;
+import com.android.tools.r8.DataResourceConsumer;
+import com.android.tools.r8.DataResourceProvider;
+import com.android.tools.r8.DexFilePerClassFileConsumer;
+import com.android.tools.r8.DexIndexedConsumer;
+import com.android.tools.r8.FeatureSplit;
+import com.android.tools.r8.ProgramConsumer;
+import com.android.tools.r8.SourceFileEnvironment;
+import com.android.tools.r8.debuginfo.DebugRepresentation;
+import com.android.tools.r8.debuginfo.DebugRepresentation.DebugRepresentationPredicate;
+import com.android.tools.r8.dex.FileWriter.ByteBufferResult;
+import com.android.tools.r8.dex.distribution.Distributor;
+import com.android.tools.r8.dex.distribution.FilePerInputClassDistributor;
+import com.android.tools.r8.dex.distribution.FillFilesDistributor;
+import com.android.tools.r8.dex.distribution.MonoDexDistributor;
+import com.android.tools.r8.dex.jumbostrings.JumboStringRewriter;
+import com.android.tools.r8.features.FeatureSplitConfiguration.DataResourceProvidersAndConsumer;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.Code;
+import com.android.tools.r8.graph.DexAnnotation;
+import com.android.tools.r8.graph.DexAnnotationSet;
+import com.android.tools.r8.graph.DexCode;
+import com.android.tools.r8.graph.DexDebugInfo;
+import com.android.tools.r8.graph.DexEncodedField;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DexString;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.EnclosingMethodAttribute;
+import com.android.tools.r8.graph.InnerClassAttribute;
+import com.android.tools.r8.graph.ObjectToOffsetMapping;
+import com.android.tools.r8.metadata.impl.BuildMetadataFactory;
+import com.android.tools.r8.metadata.impl.R8StatsMetadataImpl;
+import com.android.tools.r8.naming.KotlinModuleSynthesizer;
+import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.naming.ProguardMapSupplier.ProguardMapId;
+import com.android.tools.r8.naming.ProguardMapSupplier.ProguardMapSupplierResult;
+import com.android.tools.r8.partial.R8PartialSubCompilationConfiguration.R8PartialR8SubCompilationConfiguration;
+import com.android.tools.r8.partial.R8PartialUtils;
+import com.android.tools.r8.profile.startup.StartupCompleteness;
+import com.android.tools.r8.profile.startup.profile.StartupProfile;
+import com.android.tools.r8.shaking.MainDexInfo;
+import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.DexVersion;
+import com.android.tools.r8.utils.ExceptionUtils;
+import com.android.tools.r8.utils.InternalGlobalSyntheticsProgramConsumer;
+import com.android.tools.r8.utils.InternalGlobalSyntheticsProgramConsumer.InternalGlobalSyntheticsDexIndexedConsumer;
+import com.android.tools.r8.utils.InternalGlobalSyntheticsProgramConsumer.InternalGlobalSyntheticsDexPerFileConsumer;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.OriginalSourceFiles;
+import com.android.tools.r8.utils.Reporter;
+import com.android.tools.r8.utils.ThreadUtils;
+import com.android.tools.r8.utils.internal.ArrayUtils;
+import com.android.tools.r8.utils.internal.BooleanUtils;
+import com.android.tools.r8.utils.internal.IntBox;
+import com.android.tools.r8.utils.internal.ListUtils;
+import com.android.tools.r8.utils.internal.MapUtils;
+import com.android.tools.r8.utils.internal.PredicateUtils;
+import com.android.tools.r8.utils.internal.SupplierUtils;
+import com.android.tools.r8.utils.timing.Timing;
+import com.android.tools.r8.utils.timing.TimingMerger;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ObjectArrays;
+import it.unimi.dsi.fastutil.objects.Reference2LongMap;
+import it.unimi.dsi.fastutil.objects.Reference2LongOpenHashMap;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+public class ApplicationWriter {
+
+  public final AppView<?> appView;
+  public final InternalOptions options;
+
+  private final Predicate<DexType> isTypeMissing;
+  private final Optional<Marker> currentMarker;
+  public Collection<Marker> previousMarkers;
+  public List<DexString> markerStrings;
+  public Set<VirtualFile> globalSyntheticFiles;
+
+  public DexIndexedConsumer programConsumer;
+  public InternalGlobalSyntheticsProgramConsumer globalsSyntheticsConsumer;
+
+  private static class SortAnnotations {
+
+    private final AppView<?> appView;
+    private final NamingLens namingLens;
+
+    public SortAnnotations(AppView<?> appView) {
+      this.appView = appView;
+      this.namingLens = appView.getNamingLens();
+    }
+
+    void run(ExecutorService executorService, Timing timing) throws ExecutionException {
+      timing.begin("Sort annotations");
+      ThreadUtils.processItems(
+          appView.appInfo().classes(),
+          this::processClass,
+          appView.options().getThreadingModule(),
+          executorService);
+      timing.end();
+    }
+
+    private void processClass(DexProgramClass clazz) {
+      // Sort all annotations.
+      clazz.annotations().forEach(this::processAnnotation);
+      for (DexEncodedMethod method : clazz.methods()) {
+        method.annotations().forEach(this::processAnnotation);
+        method.getParameterAnnotations().forEach(this::processAnnotationSet);
+      }
+      for (DexEncodedField field : clazz.fields()) {
+        field.annotations().forEach(this::processAnnotation);
+      }
+    }
+
+    private void processAnnotation(DexAnnotation annotation) {
+      annotation.getAnnotation().sort();
+    }
+
+    private void processAnnotationSet(DexAnnotationSet annotationSet) {
+      annotationSet.sort(namingLens);
+    }
+  }
+
+  protected ApplicationWriter(AppView<?> appView, Marker marker, DexIndexedConsumer consumer) {
+    this.appView = appView;
+    this.options = appView.options();
+    this.currentMarker = Optional.ofNullable(marker);
+    this.programConsumer = consumer;
+    this.isTypeMissing =
+        PredicateUtils.isNull(appView.appInfo()::definitionForWithoutExistenceAssert);
+    this.previousMarkers = appView.dexItemFactory().extractMarkers();
+  }
+
+  public static ApplicationWriter create(AppView<?> appView, Marker marker) {
+    return ApplicationWriter.create(appView, marker, null);
+  }
+
+  public static ApplicationWriter create(
+      AppView<?> appView, Marker marker, DexIndexedConsumer consumer) {
+    if (appView.options().enableContainerDex()) {
+      if (!DexVersion.getDexVersion(appView.options().getMinApiLevel()).isContainerDex()) {
+        appView
+            .options()
+            .reporter
+            .warning("Forcing container DEX for an API level not supporting it");
+      }
+      return new ApplicationWriterContainer(appView, marker, consumer);
+    } else {
+      return new ApplicationWriter(appView, marker, consumer);
+    }
+  }
+
+  private NamingLens getNamingLens() {
+    return appView.getNamingLens();
+  }
+
+  private List<VirtualFile> distribute(ExecutorService executorService, Timing timing)
+      throws ExecutionException {
+    Collection<DexProgramClass> classes = appView.appInfo().classes();
+    Collection<DexProgramClass> globalSynthetics = new ArrayList<>();
+    if (appView.options().intermediate && appView.options().hasGlobalSyntheticsConsumer()) {
+      Collection<DexProgramClass> allClasses = classes;
+      classes = new ArrayList<>(allClasses.size());
+      for (DexProgramClass clazz : allClasses) {
+        if (appView.getSyntheticItems().isGlobalSyntheticClassTransitive(clazz)) {
+          Consumer<DexProgramClass> globalSyntheticCreatedCallback =
+              appView.options().testing.globalSyntheticCreatedCallback;
+          if (globalSyntheticCreatedCallback != null) {
+            globalSyntheticCreatedCallback.accept(clazz);
+          }
+          globalSynthetics.add(clazz);
+        } else {
+          classes.add(clazz);
+        }
+      }
+    }
+
+    // Distribute classes into dex files.
+    Distributor distributor;
+    if (options.isGeneratingDexFilePerClassFile()) {
+      distributor =
+          new FilePerInputClassDistributor(
+              this,
+              classes,
+              options.getDexFilePerClassFileConsumer().combineSyntheticClassesWithPrimaryClass());
+    } else if (!options.canUseMultidex()
+        && options.mainDexKeepRules.isEmpty()
+        && appView.appInfo().getMainDexInfo().isEmpty()
+        && options.enableMainDexListCheck) {
+      distributor = new MonoDexDistributor(this, classes, options, executorService);
+    } else {
+      // Retrieve the startup order for writing the app. Use an empty startup profile if the startup
+      // profile should not be used for layout.
+      StartupProfile startupProfile =
+          options.getStartupOptions().isStartupLayoutOptimizationEnabled()
+              ? appView.getStartupProfile()
+              : StartupProfile.empty();
+      distributor =
+          new FillFilesDistributor(this, classes, options, executorService, startupProfile);
+    }
+
+    List<VirtualFile> virtualFiles = distributor.run(timing);
+    if (!globalSynthetics.isEmpty()) {
+      List<VirtualFile> files =
+          new FilePerInputClassDistributor(this, globalSynthetics, false).run(timing);
+      globalSyntheticFiles = new HashSet<>(files);
+      virtualFiles.addAll(globalSyntheticFiles);
+      globalsSyntheticsConsumer =
+          options.isGeneratingDexFilePerClassFile()
+              ? new InternalGlobalSyntheticsDexPerFileConsumer(
+                  options.getGlobalSyntheticsConsumer(), appView)
+              : new InternalGlobalSyntheticsDexIndexedConsumer(
+                  options.getGlobalSyntheticsConsumer());
+    }
+    while (!virtualFiles.isEmpty() && ListUtils.last(virtualFiles).isEmpty()) {
+      ListUtils.removeLast(virtualFiles);
+    }
+    return virtualFiles;
+  }
+
+  /**
+   * For each class within a virtual file, this function insert a string that contains the
+   * checksum information about that class.
+   *
+   * This needs to be done after distribute but before dex string sorting.
+   */
+  private void encodeChecksums(Iterable<VirtualFile> files) {
+    Collection<DexProgramClass> classes = appView.appInfo().classes();
+    Reference2LongMap<DexString> inputChecksums = new Reference2LongOpenHashMap<>(classes.size());
+    for (DexProgramClass clazz : classes) {
+      inputChecksums.put(getNamingLens().lookupDescriptor(clazz.getType()), clazz.getChecksum());
+    }
+    for (VirtualFile file : files) {
+      ClassesChecksum toWrite = new ClassesChecksum();
+      for (DexProgramClass clazz : file.classes()) {
+        DexString desc = getNamingLens().lookupDescriptor(clazz.type);
+        toWrite.addChecksum(desc.toString(), inputChecksums.getLong(desc));
+      }
+      file.getTransaction()
+          .addChecksumString(appView.dexItemFactory().createString(toWrite.toJsonString()));
+      file.commitTransaction();
+    }
+  }
+
+  private boolean willComputeProguardMap() {
+    return options.hasMappingFileSupport();
+  }
+
+  /** Writer that never needs the input app to deal with mapping info for kotlin. */
+  public void write(ExecutorService executorService, Timing timing)
+      throws IOException, ExecutionException {
+    assert !willComputeProguardMap();
+    write(executorService, timing, null);
+  }
+
+  protected void writeVirtualFiles(
+      ExecutorService executorService,
+      List<VirtualFile> virtualFiles,
+      List<DexString> forcedStrings,
+      Timing timing)
+      throws ExecutionException {
+    TimingMerger merger = timing.beginMerger("Write files", executorService);
+    Collection<Timing> timings =
+        ThreadUtils.processItemsWithResults(
+            virtualFiles,
+            virtualFile -> {
+              Timing fileTiming =
+                  timing.createThreadTiming("VirtualFile " + virtualFile.getId(), options);
+              writeVirtualFile(virtualFile, fileTiming, forcedStrings);
+              fileTiming.end();
+              return fileTiming;
+            },
+            appView.options().getThreadingModule(),
+            executorService);
+    merger.add(timings);
+    merger.end();
+    if (globalsSyntheticsConsumer != null) {
+      globalsSyntheticsConsumer.finished(appView);
+    } else if (options.hasGlobalSyntheticsConsumer()) {
+      // Make sure to also call finished even if no global output was generated.
+      options.getGlobalSyntheticsConsumer().finished(appView.reporter());
+    }
+  }
+
+  public void write(ExecutorService executorService, Timing timing, AndroidApp inputApp)
+      throws IOException, ExecutionException {
+    timing.begin("DexApplication.write");
+
+    List<LazyDexString> lazyDexStrings = new ArrayList<>();
+    computeMarkerStrings(lazyDexStrings);
+    OriginalSourceFiles originalSourceFiles = computeSourceFileString(lazyDexStrings);
+
+    ProguardMapSupplierResult mapSupplierResult = ProguardMapSupplierResult.createEmpty();
+    try {
+      timing.begin("Insert Attribute Annotations");
+      // TODO(b/151313715): Move this to the writer threads.
+      insertAttributeAnnotations();
+      timing.end();
+
+      // Each DexCallSite must have its instruction offset set for sorting.
+      if (options.isGeneratingDex()) {
+        timing.begin("Set call-site contexts");
+        setCallSiteContexts(executorService);
+        timing.end();
+      }
+
+      StartupCompleteness.run(appView);
+
+      // Generate the dex file contents.
+      timing.begin("Distribute");
+      List<VirtualFile> virtualFiles = distribute(executorService, timing);
+      timing.end();
+      if (options.encodeChecksums) {
+        timing.begin("Encode checksums");
+        encodeChecksums(virtualFiles);
+        timing.end();
+      }
+      assert previousMarkers == null
+          || previousMarkers.isEmpty()
+          || appView.dexItemFactory().extractMarkers() != null;
+      assert appView.withProtoShrinker(
+          shrinker -> virtualFiles.stream().allMatch(shrinker::verifyDeadProtoTypesNotReferenced),
+          true);
+
+      new SortAnnotations(appView).run(executorService, timing);
+      JumboStringRewriter.create(appView, lazyDexStrings, virtualFiles)
+          .run(executorService, timing);
+
+      // Now that the instruction offsets in each code object are fixed, compute the mapping file
+      // content.
+      if (willComputeProguardMap()) {
+        // TODO(b/220999985): Refactor line number optimization to be per file and thread it above.
+        DebugRepresentationPredicate representation =
+            DebugRepresentation.fromFiles(virtualFiles, options);
+        mapSupplierResult =
+            runAndWriteMap(
+                inputApp, appView, executorService, timing, originalSourceFiles, representation);
+      } else if (options.convertPcBasedDebugInfoToNative) {
+        convertPcBasedDebugInfoToNative(appView, executorService, timing);
+      }
+
+      // With the mapping id/hash known, it is safe to compute the remaining dex strings.
+      timing.begin("Compute lazy strings");
+      List<DexString> forcedStrings = new ArrayList<>();
+      for (LazyDexString lazyDexString : lazyDexStrings) {
+        forcedStrings.add(lazyDexString.compute(mapSupplierResult.awaitProguardMapId()));
+      }
+      timing.end();
+
+      // Finalize the R8 partial compilation build metadata stats. This must be done before writing
+      // the virtual files, since the writing of the virtual files unsets the code object of each
+      // method.
+      if (options.r8BuildMetadataConsumer != null) {
+        R8PartialUtils.acceptR8PartialR8SubCompilationConfiguration(
+            appView,
+            configuration ->
+                configuration
+                    .getStatsMetadataBuilder()
+                    .finalizeStats(appView.withClassHierarchy()));
+      }
+
+      // Write the actual dex code.
+      writeVirtualFiles(executorService, virtualFiles, forcedStrings, timing);
+
+      // Fail if there are pending errors, e.g., the program consumers may have reported errors.
+      options.reporter.failIfPendingErrors();
+      // Supply info to all additional resource consumers.
+      if (!(programConsumer instanceof ConvertedCfFiles)) {
+        supplyAdditionalConsumers(appView, virtualFiles);
+      }
+    } finally {
+      mapSupplierResult.await();
+      timing.end();
+    }
+  }
+
+  private void convertPcBasedDebugInfoToNative(
+      AppView<?> appView, ExecutorService executorService, Timing timing)
+      throws ExecutionException {
+    if (!options.isNativePcDebugInfoSupported()) {
+      return;
+    }
+    ThreadUtils.processItemsThatMatches(
+        appView.appInfo().classes(),
+        options::canEncodeDexPcNativelyInsteadOfDebugInfo,
+        (clazz, unusedTiming) -> convertPcBasedDebugInfoToNative(clazz),
+        options,
+        executorService,
+        timing,
+        timing.beginMerger("Convert PcEncodedDebugInfo to native encoding", executorService));
+  }
+
+  private void convertPcBasedDebugInfoToNative(DexProgramClass clazz) {
+    for (DexEncodedMethod method : clazz.methods(DexEncodedMethod::hasCode)) {
+      Code code = method.getCode();
+      if (!code.isDexCode()) {
+        continue;
+      }
+      DexCode dexCode = code.asDexCode();
+      DexDebugInfo debugInfo = dexCode.getDebugInfo();
+      if (debugInfo != null && debugInfo.isPcBasedInfo()) {
+        dexCode.setDebugInfo(null);
+      }
+    }
+  }
+
+  private void computeMarkerStrings(List<LazyDexString> lazyDexStrings) {
+    List<Marker> allMarkers = new ArrayList<>();
+    if (previousMarkers != null) {
+      allMarkers.addAll(previousMarkers);
+    }
+    DexItemFactory factory = appView.dexItemFactory();
+    currentMarker.ifPresent(
+        marker -> {
+          if (willComputeProguardMap()) {
+            lazyDexStrings.add(
+                new LazyDexString() {
+
+                  @Override
+                  public DexString internalCompute(ProguardMapId proguardMapId) {
+                    marker.setPgMapId(proguardMapId.getId());
+                    return marker.toDexString(factory);
+                  }
+                });
+          } else {
+            allMarkers.add(marker);
+          }
+        });
+    allMarkers.sort(Comparator.comparing(Marker::toString));
+    markerStrings = ListUtils.map(allMarkers, marker -> marker.toDexString(factory));
+  }
+
+  private OriginalSourceFiles computeSourceFileString(List<LazyDexString> lazyDexStrings) {
+    if (options.sourceFileProvider == null) {
+      return OriginalSourceFiles.fromClasses();
+    }
+    if (!willComputeProguardMap()) {
+      rewriteSourceFile(appView.appInfo().classes(), null);
+      return OriginalSourceFiles.unreachable();
+    }
+    // Clear all source files so as not to collect the original files.
+    Map<DexProgramClass, DexString> originalSourceFiles = computeOriginalSourceFiles();
+    // Add a lazy dex string computation to defer construction of the actual string.
+    lazyDexStrings.add(
+        new LazyDexString() {
+          @Override
+          public DexString internalCompute(ProguardMapId proguardMapId) {
+            return rewriteSourceFile(originalSourceFiles.keySet(), proguardMapId);
+          }
+        });
+    return OriginalSourceFiles.fromMap(originalSourceFiles);
+  }
+
+  private Map<DexProgramClass, DexString> computeOriginalSourceFiles() {
+    Collection<DexProgramClass> classes = appView.appInfo().classes();
+    if (options.partialSubCompilationConfiguration == null) {
+      return MapUtils.transform(
+          classes,
+          IdentityHashMap::new,
+          Function.identity(),
+          DexProgramClass::getAndClearSourceFile);
+    } else {
+      R8PartialR8SubCompilationConfiguration subCompilationConfiguration =
+          options.partialSubCompilationConfiguration.asR8();
+      return MapUtils.transform(
+          classes,
+          ignore ->
+              new IdentityHashMap<>(
+                  classes.size() - subCompilationConfiguration.getDexingOutputClasses().size()),
+          clazz -> subCompilationConfiguration.isD8Definition(clazz) ? null : clazz,
+          DexProgramClass::getAndClearSourceFile);
+    }
+  }
+
+  public static SourceFileEnvironment createSourceFileEnvironment(ProguardMapId proguardMapId) {
+    if (proguardMapId == null) {
+      return new SourceFileEnvironment() {
+        @Override
+        public String getMapId() {
+          return null;
+        }
+
+        @Override
+        public String getMapHash() {
+          return null;
+        }
+      };
+    }
+    return new SourceFileEnvironment() {
+      @Override
+      public String getMapId() {
+        return proguardMapId.getId();
+      }
+
+      @Override
+      public String getMapHash() {
+        return proguardMapId.getHash();
+      }
+    };
+  }
+
+  private DexString rewriteSourceFile(
+      Collection<DexProgramClass> classes, ProguardMapId proguardMapId) {
+    assert options.sourceFileProvider != null;
+    SourceFileEnvironment environment = createSourceFileEnvironment(proguardMapId);
+    String sourceFile = options.sourceFileProvider.get(environment);
+    DexString dexSourceFile =
+        sourceFile == null ? null : options.itemFactory.createString(sourceFile);
+    classes.forEach(clazz -> clazz.setSourceFile(dexSourceFile));
+    return dexSourceFile;
+  }
+
+  protected void writeVirtualFile(
+      VirtualFile virtualFile, Timing timing, List<DexString> forcedStrings) {
+    if (virtualFile.isEmpty()) {
+      return;
+    }
+
+    ProgramConsumer consumer;
+    ByteBufferProvider byteBufferProvider;
+
+    if (globalSyntheticFiles != null && globalSyntheticFiles.contains(virtualFile)) {
+      consumer = globalsSyntheticsConsumer;
+      byteBufferProvider = globalsSyntheticsConsumer;
+    } else if (programConsumer != null) {
+      consumer = programConsumer;
+      byteBufferProvider = programConsumer;
+    } else if (virtualFile.getPrimaryClassDescriptor() != null) {
+      consumer = options.getDexFilePerClassFileConsumer();
+      byteBufferProvider = options.getDexFilePerClassFileConsumer();
+    } else {
+      if (virtualFile.getFeatureSplit() != null) {
+        ProgramConsumer featureConsumer = virtualFile.getFeatureSplit().getProgramConsumer();
+        assert featureConsumer instanceof DexIndexedConsumer;
+        consumer = featureConsumer;
+        byteBufferProvider = (DexIndexedConsumer) featureConsumer;
+      } else {
+        consumer = options.getDexIndexedConsumer();
+        byteBufferProvider = options.getDexIndexedConsumer();
+      }
+    }
+
+    timing.begin("Reindex for lazy strings");
+    ObjectToOffsetMapping objectMapping = virtualFile.getObjectMapping();
+    objectMapping.computeAndReindexForLazyDexStrings(forcedStrings);
+    timing.end();
+
+    timing.begin("Write bytes");
+    ByteBufferResult result = writeDexFile(objectMapping, byteBufferProvider, virtualFile, timing);
+    ByteDataView data =
+        new ByteDataView(result.buffer.array(), result.buffer.arrayOffset(), result.length);
+    timing.end();
+    timing.begin("Pass bytes to consumer");
+    if (consumer instanceof DexFilePerClassFileConsumer) {
+      ((DexFilePerClassFileConsumer) consumer)
+          .accept(
+              virtualFile.getPrimaryClassDescriptor(),
+              data,
+              virtualFile.getClassDescriptors(),
+              options.reporter);
+    } else {
+      ((DexIndexedConsumer) consumer)
+          .accept(virtualFile.getId(), data, virtualFile.getClassDescriptors(), options.reporter);
+    }
+    virtualFile.recordChecksumAndSizeInBytesForBuildMetadata(data, options);
+    timing.end();
+    // Release use of the backing buffer now that accept has returned.
+    data.invalidate();
+    byteBufferProvider.releaseByteBuffer(result.buffer.asByteBuffer());
+  }
+
+  @SuppressWarnings("DefaultCharset")
+  public static void supplyAdditionalConsumers(AppView<?> appView, List<VirtualFile> virtualFiles) {
+    InternalOptions options = appView.options();
+    Reporter reporter = options.reporter;
+    appView.getArtProfileCollection().supplyConsumers(appView);
+    if (options.configurationConsumer != null) {
+      ExceptionUtils.withConsumeResourceHandler(
+          reporter,
+          options.configurationConsumer,
+          options.getProguardConfiguration().getParsedConfiguration());
+      ExceptionUtils.withFinishedResourceHandler(reporter, options.configurationConsumer);
+    }
+    if (options.mainDexListConsumer != null) {
+      ExceptionUtils.withConsumeResourceHandler(
+          reporter, options.mainDexListConsumer, writeMainDexList(appView));
+      ExceptionUtils.withFinishedResourceHandler(reporter, options.mainDexListConsumer);
+    }
+
+    KotlinModuleSynthesizer kotlinModuleSynthesizer = new KotlinModuleSynthesizer(appView);
+
+    DataResourceConsumer dataResourceConsumer = options.dataResourceConsumer;
+    ResourceAdapter resourceAdapter = new ResourceAdapter(appView);
+    if (dataResourceConsumer != null) {
+      ImmutableList<DataResourceProvider> dataResourceProviders =
+          appView.app().dataResourceProviders;
+      DataResourceWriter.adaptAndPassDataResources(
+          options, dataResourceConsumer, dataResourceProviders, resourceAdapter);
+
+      appView.appServices().write(appView, FeatureSplit.BASE, dataResourceConsumer);
+      // Rewrite/synthesize kotlin_module files
+      kotlinModuleSynthesizer
+          .synthesizeKotlinModuleFiles()
+          .forEach(file -> dataResourceConsumer.accept(file, reporter));
+    }
+
+    if (options.hasFeatureSplitConfiguration()) {
+      for (DataResourceProvidersAndConsumer entry :
+          options.getFeatureSplitConfiguration().getDataResourceProvidersAndConsumers()) {
+        DataResourceWriter.adaptAndPassDataResources(
+            options, entry.consumer, entry.providers, resourceAdapter);
+        appView.appServices().write(appView, entry.featureSplit, entry.consumer);
+      }
+    }
+
+    if (options.d8BuildMetadataConsumer != null) {
+      assert !appView.hasClassHierarchy();
+      options.d8BuildMetadataConsumer.accept(
+          BuildMetadataFactory.createForD8(appView.withoutClassHierarchy(), virtualFiles));
+    } else if (options.r8BuildMetadataConsumer != null) {
+      assert appView.hasClassHierarchy();
+      options.r8BuildMetadataConsumer.accept(
+          BuildMetadataFactory.createForR8(appView.withClassHierarchy(), virtualFiles));
+    } else if (appView.hasClassHierarchy()) {
+      assert R8StatsMetadataImpl.Counters.create(appView.withClassHierarchy()).validate();
+    }
+  }
+
+  private void insertAttributeAnnotations() {
+    // Convert inner-class attributes to DEX annotations
+    for (DexProgramClass clazz : appView.appInfo().classes()) {
+      insertAttributeAnnotationsForClass(clazz);
+      clazz.fields().forEach(this::insertAttributeAnnotationsForField);
+      clazz.methods().forEach(this::insertAttributeAnnotationsForMethod);
+    }
+  }
+
+  @SuppressWarnings("ReferenceEquality")
+  private void insertAttributeAnnotationsForClass(DexProgramClass clazz) {
+    EnclosingMethodAttribute enclosingMethod = clazz.getEnclosingMethodAttribute();
+    List<InnerClassAttribute> innerClasses = clazz.getInnerClasses();
+
+    IntBox allocatedSize = new IntBox();
+    Supplier<List<DexAnnotation>> annotationsSupplier =
+        SupplierUtils.nonThreadSafeMemoize(
+            () -> {
+              allocatedSize.set(
+                  BooleanUtils.intValue(enclosingMethod != null)
+                      + innerClasses.size()
+                      + 1
+                      + BooleanUtils.intValue(clazz.getClassSignature().hasSignature())
+                      + BooleanUtils.intValue(options.canUseNestBasedAccess() && clazz.isInANest())
+                      + BooleanUtils.intValue(
+                          clazz.hasPermittedSubclassAttributes() && options.canUseSealedClasses()));
+              return new ArrayList<>(allocatedSize.get());
+            });
+
+    // EnclosingMember translates directly to an enclosing class/method if present.
+    if (enclosingMethod != null) {
+      List<DexAnnotation> annotations = annotationsSupplier.get();
+      if (enclosingMethod.getEnclosingMethod() != null) {
+        annotations.add(
+            DexAnnotation.createEnclosingMethodAnnotation(
+                enclosingMethod.getEnclosingMethod(), options.itemFactory));
+      } else {
+        // At this point DEX can't distinguish between local classes and member classes based on
+        // the enclosing class annotation itself.
+        annotations.add(
+            DexAnnotation.createEnclosingClassAnnotation(
+                enclosingMethod.getEnclosingClass(), options.itemFactory));
+      }
+    }
+
+    // Each inner-class entry becomes a inner-class (or inner-class & enclosing-class pair) if
+    // it relates to the present class. If it relates to the outer-type (and is named) it becomes
+    // part of the member-classes annotation.
+    if (!innerClasses.isEmpty()) {
+      List<DexAnnotation> annotations = annotationsSupplier.get();
+      List<DexType> memberClasses = new ArrayList<>(innerClasses.size());
+      for (InnerClassAttribute innerClass : innerClasses) {
+        if (clazz.type == innerClass.getInner()) {
+          if (enclosingMethod == null
+              && (innerClass.getOuter() == null || innerClass.isAnonymous())) {
+            options.warningMissingEnclosingMember(
+                clazz.type, clazz.origin, clazz.getInitialClassFileVersion());
+          } else {
+            annotations.add(
+                DexAnnotation.createInnerClassAnnotation(
+                    getNamingLens().lookupInnerName(innerClass, options),
+                    innerClass.getAccess(),
+                    options.itemFactory));
+            if (innerClass.getOuter() != null && innerClass.isNamed()) {
+              annotations.add(
+                  DexAnnotation.createEnclosingClassAnnotation(
+                      innerClass.getOuter(), options.itemFactory));
+            }
+          }
+        } else if (clazz.type == innerClass.getOuter() && innerClass.isNamed()) {
+          memberClasses.add(innerClass.getInner());
+        }
+      }
+      if (!memberClasses.isEmpty()) {
+        annotations.add(
+            DexAnnotation.createMemberClassesAnnotation(memberClasses, options.itemFactory));
+      }
+    }
+
+    if (clazz.getClassSignature().hasSignature()) {
+      List<DexAnnotation> annotations = annotationsSupplier.get();
+      annotations.add(
+          DexAnnotation.createSignatureAnnotation(
+              clazz.getClassSignature().toRenamedString(getNamingLens(), isTypeMissing),
+              options.itemFactory));
+    }
+
+    if (options.canUseNestBasedAccess()) {
+      if (clazz.isNestHost()) {
+        List<DexAnnotation> annotations = annotationsSupplier.get();
+        annotations.add(
+            DexAnnotation.createNestMembersAnnotation(
+                clazz.getNestMembersClassAttributes(), options.itemFactory));
+      }
+
+      if (clazz.isNestMember()) {
+        List<DexAnnotation> annotations = annotationsSupplier.get();
+        annotations.add(
+            DexAnnotation.createNestHostAnnotation(
+                clazz.getNestHostClassAttribute(), options.itemFactory));
+      }
+    }
+
+    if (clazz.hasPermittedSubclassAttributes() && options.canUseSealedClasses()) {
+      List<DexAnnotation> annotations = annotationsSupplier.get();
+      annotations.add(
+          DexAnnotation.createPermittedSubclassesAnnotation(
+              clazz.getPermittedSubclassAttributes(), options.itemFactory));
+    }
+
+    if (clazz.isRecord() && options.emitRecordAnnotationsInDex) {
+      List<DexAnnotation> annotations = annotationsSupplier.get();
+      annotations.add(DexAnnotation.createRecordAnnotation(clazz, appView));
+    }
+
+    if (allocatedSize.get() > 0) {
+      List<DexAnnotation> annotations = annotationsSupplier.get();
+      assert allocatedSize.get() >= annotations.size();
+
+      // Append the annotations to annotations array of the class.
+      DexAnnotation[] copy =
+          ObjectArrays.concat(
+              clazz.annotations().annotations,
+              annotations.toArray(DexAnnotation.EMPTY_ARRAY),
+              DexAnnotation.class);
+      clazz.setAnnotations(DexAnnotationSet.create(copy));
+    }
+
+    // Clear the attribute structures now that they are represented in annotations.
+    clazz.clearEnclosingMethodAttribute();
+    clazz.clearInnerClasses();
+    clazz.clearClassSignature();
+    clazz.clearPermittedSubclasses();
+    clazz.clearRecordComponents();
+  }
+
+  private void insertAttributeAnnotationsForField(DexEncodedField field) {
+    if (field.getGenericSignature().hasNoSignature()) {
+      return;
+    }
+    // Append the annotations to annotations array of the field.
+    field.setAnnotations(
+        DexAnnotationSet.create(
+            ArrayUtils.appendSingleElement(
+                field.annotations().annotations,
+                DexAnnotation.createSignatureAnnotation(
+                    field.getGenericSignature().toRenamedString(getNamingLens(), isTypeMissing),
+                    options.itemFactory))));
+    field.clearGenericSignature();
+  }
+
+  private void insertAttributeAnnotationsForMethod(DexEncodedMethod method) {
+    if (method.getGenericSignature().hasNoSignature()) {
+      return;
+    }
+    // Append the annotations to annotations array of the method.
+    method.setAnnotations(
+        DexAnnotationSet.create(
+            ArrayUtils.appendSingleElement(
+                method.annotations().annotations,
+                DexAnnotation.createSignatureAnnotation(
+                    method.getGenericSignature().toRenamedString(getNamingLens(), isTypeMissing),
+                    options.itemFactory))));
+    method.clearGenericSignature();
+  }
+
+  private void setCallSiteContexts(ExecutorService executorService) throws ExecutionException {
+    ThreadUtils.processItems(
+        appView.appInfo().classes(),
+        this::setCallSiteContexts,
+        appView.options().getThreadingModule(),
+        executorService);
+  }
+
+  private void setCallSiteContexts(DexProgramClass clazz) {
+    clazz.forEachProgramMethodMatching(
+        DexEncodedMethod::hasCode,
+        method -> method.getDefinition().getCode().asDexWritableCode().setCallSiteContexts(method));
+  }
+
+  private ByteBufferResult writeDexFile(
+      ObjectToOffsetMapping objectMapping,
+      ByteBufferProvider provider,
+      VirtualFile virtualFile,
+      Timing timing) {
+    FileWriter fileWriter = new FileWriter(appView, provider, objectMapping, virtualFile);
+    // Collect the non-fixed sections.
+    timing.time("collect", fileWriter::collect);
+    // Generate and write the bytes.
+    return timing.time("generate", () -> fileWriter.generate(timing));
+  }
+
+  private static String mapMainDexListName(DexType type, NamingLens namingLens) {
+    return DescriptorUtils.descriptorToJavaType(namingLens.lookupDescriptor(type).toString())
+        .replace('.', '/') + ".class";
+  }
+
+  private static String writeMainDexList(AppView<?> appView) {
+    // TODO(b/178231294): Clean up by streaming directly to the consumer.
+    MainDexInfo mainDexInfo = appView.appInfo().getMainDexInfo();
+    StringBuilder builder = new StringBuilder();
+    List<DexType> list = new ArrayList<>(mainDexInfo.size());
+    mainDexInfo.forEach(list::add);
+    list.sort(DexType::compareTo);
+    list.forEach(
+        type -> builder.append(mapMainDexListName(type, appView.getNamingLens())).append('\n'));
+    return builder.toString();
+  }
+
+  public abstract static class LazyDexString {
+    private boolean computed = false;
+
+    public abstract DexString internalCompute(ProguardMapId proguardMapId);
+
+    public final DexString compute(ProguardMapId proguardMapId) {
+      assert !computed;
+      DexString value = internalCompute(proguardMapId);
+      computed = true;
+      return value;
+    }
+  }
+}

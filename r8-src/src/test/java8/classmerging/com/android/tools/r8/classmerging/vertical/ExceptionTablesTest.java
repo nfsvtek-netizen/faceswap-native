@@ -1,0 +1,195 @@
+// Copyright (c) 2020, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.classmerging.vertical;
+
+import static com.android.tools.r8.utils.codeinspector.Matchers.isAbsent;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.Assert.assertEquals;
+
+import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.transformers.ClassFileTransformer;
+import com.android.tools.r8.transformers.MethodTransformer;
+import com.android.tools.r8.utils.codeinspector.CodeInspector;
+import com.android.tools.r8.utils.codeinspector.MethodSubject;
+import com.android.tools.r8.utils.codeinspector.TypeSubject;
+import com.android.tools.r8.utils.codeinspector.VerticallyMergedClassesInspector;
+import com.android.tools.r8.utils.internal.ArrayUtils;
+import com.android.tools.r8.utils.internal.BooleanUtils;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
+import org.objectweb.asm.Label;
+
+// If an exception class A is merged into another exception class B, then all exception tables
+// should be updated, and class A should be removed entirely.
+@RunWith(Parameterized.class)
+public class ExceptionTablesTest extends VerticalClassMergerTestBase {
+
+  private final boolean disableInitial;
+
+  @Parameters(name = "{1}, disable initial: {0}")
+  public static List<Object[]> data() {
+    return buildParameters(
+        BooleanUtils.values(), TestBase.getTestParameters().withAllRuntimesAndApiLevels().build());
+  }
+
+  public ExceptionTablesTest(boolean disableInitial, TestParameters parameters) {
+    super(parameters);
+    this.disableInitial = disableInitial;
+  }
+
+  private static String convertType(String type) {
+    if (binaryName(IllegalArgumentException.class).equals(type)) {
+      return binaryName(ExceptionB.class);
+    } else if (binaryName(IllegalStateException.class).equals(type)) {
+      return binaryName(Exception2.class);
+    } else {
+      return type;
+    }
+  }
+
+  private byte[] getTestClass() {
+    return ClassFileTransformer.create(TestClass.class)
+        .addMethodTransformer(
+            new MethodTransformer() {
+
+              @Override
+              public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
+                super.visitTryCatchBlock(start, end, handler, convertType(type));
+              }
+
+              @Override
+              public void visitFrame(
+                  int type, int numLocal, Object[] local, int numStack, Object[] stack) {
+                Object[] newStack =
+                    ArrayUtils.map(
+                        stack, typeString -> convertType((String) typeString), new String[] {});
+                super.visitFrame(type, numLocal, local, numStack, newStack);
+              }
+
+              @Override
+              public void visitMethodInsn(
+                  int opcode, String owner, String name, String descriptor, boolean isInterface) {
+                super.visitMethodInsn(opcode, convertType(owner), name, descriptor, isInterface);
+              }
+            })
+        .transform();
+  }
+
+  @Test
+  public void testClassesHaveBeenMerged() throws Exception {
+    byte[] testClass = getTestClass();
+    String testClassName = TestClass.class.getTypeName();
+    testForR8(parameters.getBackend())
+        .addProgramClasses(ExceptionA.class, ExceptionB.class, Exception1.class, Exception2.class)
+        .addProgramClassFileData(testClass)
+        .addKeepMainRule(testClassName)
+        .applyIf(
+            disableInitial,
+            testBuilder ->
+                testBuilder.addOptionsModification(
+                    options -> options.getVerticalClassMergerOptions().disableInitial()),
+            testBuilder ->
+                testBuilder.addVerticallyMergedClassesInspector(
+                    this::inspectVerticallyMergedClasses))
+        .setMinApi(parameters)
+        .compile()
+        .inspect(this::inspect)
+        .run(parameters.getRuntime(), testClassName)
+        .assertSuccess();
+  }
+
+  private void inspectVerticallyMergedClasses(VerticallyMergedClassesInspector inspector) {
+    inspector.assertMergedIntoSubtype(ExceptionA.class, Exception1.class);
+  }
+
+  private void inspect(CodeInspector inspector) {
+    assertThat(inspector.clazz(TestClass.class), isPresent());
+    assertThat(inspector.clazz(ExceptionB.class), isPresent());
+    assertThat(inspector.clazz(Exception2.class), isPresent());
+    assertThat(inspector.clazz(ExceptionA.class), isAbsent());
+    assertThat(inspector.clazz(Exception1.class), isAbsent());
+
+    // Check that only two exception guard types remain.
+    MethodSubject mainMethodSubject = inspector.clazz(TestClass.class).mainMethod();
+    assertThat(mainMethodSubject, isPresent());
+    Set<TypeSubject> guards =
+        mainMethodSubject
+            .streamTryCatches()
+            .flatMap(tryCatch -> tryCatch.guards().stream())
+            .collect(Collectors.toSet());
+    assertEquals(2, guards.size());
+  }
+
+  public static class TestClass {
+
+    public static void main(String[] args) {
+      // The following will lead to a catch handler for ExceptionA, which is merged into ExceptionB.
+      try {
+        doSomethingThatMightThrowExceptionB();
+        doSomethingThatMightThrowException2();
+      } catch (IllegalArgumentException exception) {
+        // IllegalArgumentException will be replaced by ExceptionB (this avoids an un-ignorable
+        // javac warning).
+        System.out.println("Caught exception: " + exception.getMessage());
+      } catch (ExceptionA exception) {
+        System.out.println("Caught exception: " + exception.getMessage());
+      } catch (IllegalStateException exception) {
+        // IllegalStateException will be replaced by Exception2 (this avoids an un-ignorable javac
+        // warning).
+        System.out.println("Caught exception: " + exception.getMessage());
+      } catch (Exception1 exception) {
+        System.out.println("Caught exception: " + exception.getMessage());
+      }
+    }
+
+    private static void doSomethingThatMightThrowExceptionB() throws ExceptionB {
+      if (System.nanoTime() > 0) {
+        throw new ExceptionB("Ouch!");
+      }
+    }
+
+    private static void doSomethingThatMightThrowException2() throws Exception2 {
+      if (System.nanoTime() > 0) {
+        throw new Exception2("Ouch!");
+      }
+    }
+  }
+
+  // Will be merged into ExceptionB when class merging is enabled.
+  public static class ExceptionA extends Exception {
+
+    public ExceptionA(String message) {
+      super(message);
+    }
+  }
+
+  public static class ExceptionB extends ExceptionA {
+
+    public ExceptionB(String message) {
+      super(message);
+    }
+  }
+
+  public static class Exception1 extends Exception {
+
+    public Exception1(String message) {
+      super(message);
+    }
+  }
+
+  public static class Exception2 extends Exception1 {
+
+    public Exception2(String message) {
+      super(message);
+    }
+  }
+}

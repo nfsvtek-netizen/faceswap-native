@@ -1,0 +1,164 @@
+// Copyright (c) 2018, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8;
+
+import static com.android.tools.r8.DiagnosticsMatcher.diagnosticMessage;
+import static org.hamcrest.CoreMatchers.containsString;
+
+import com.android.tools.r8.KotlinCompilerTool.KotlinCompiler;
+import com.android.tools.r8.KotlinCompilerTool.KotlinLambdaGeneration;
+import com.android.tools.r8.KotlinCompilerTool.KotlinTargetVersion;
+import com.android.tools.r8.TestRuntime.CfRuntime;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.internal.FileUtils;
+import com.android.tools.r8.utils.internal.SemanticVersion;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import org.junit.rules.TemporaryFolder;
+
+public abstract class KotlinTestBase extends TestBase {
+
+  protected static final String checkParameterIsNotNullSignature =
+      "void kotlin.jvm.internal.Intrinsics.checkParameterIsNotNull("
+          + "java.lang.Object, java.lang.String)";
+  protected static final String throwParameterIsNotNullExceptionSignature =
+      "void kotlin.jvm.internal.Intrinsics.throwParameterIsNullException(java.lang.String)";
+  public static final String METADATA_DESCRIPTOR = "Lkotlin/Metadata;";
+  public static final String METADATA_TYPE =
+      DescriptorUtils.descriptorToJavaType(METADATA_DESCRIPTOR);
+
+  private static final String RSRC = "kotlinR8TestResources";
+
+  private static final Map<String, KotlinCompileMemoizer> compileMemoizers = new HashMap<>();
+
+  protected final KotlinCompiler kotlinc;
+  protected final KotlinTargetVersion targetVersion;
+  protected final KotlinLambdaGeneration lambdaGeneration;
+  protected final KotlinTestParameters kotlinParameters;
+
+  protected KotlinTestBase(KotlinTestParameters kotlinParameters) {
+    this.targetVersion = kotlinParameters.getTargetVersion();
+    this.kotlinc = kotlinParameters.getCompiler();
+    this.lambdaGeneration = kotlinParameters.getLambdaGeneration();
+    this.kotlinParameters = kotlinParameters;
+  }
+
+  public static CfRuntime getKotlincHostRuntime(TestRuntime runtime) {
+    return runtime.isCf() ? runtime.asCf() : TestRuntime.getCheckedInJdk9();
+  }
+
+  @Deprecated
+  protected static List<Path> getKotlinFilesInTestPackage(Package pkg) throws IOException {
+    String folder = DescriptorUtils.getBinaryNameFromJavaType(pkg.getName());
+    return Files.walk(Paths.get(ToolHelper.TESTS_DIR, "java", folder))
+        .filter(path -> path.toString().endsWith(".kt"))
+        .collect(Collectors.toList());
+  }
+
+  @Deprecated
+  protected static Path getKotlinFileInTestPackage(Package pkg, String fileName) {
+    String folder = DescriptorUtils.getBinaryNameFromJavaType(pkg.getName());
+    return getKotlinFileInTest(folder, fileName);
+  }
+
+  @Deprecated
+  protected static Path getKotlinFileInTest(String folder, String fileName) {
+    return Paths.get(ToolHelper.TESTS_DIR, "java", folder, fileName + FileUtils.KT_EXTENSION);
+  }
+
+  protected static Path getKotlinSourceFileFromResources(String folder, String fileName) {
+    String resourceName = "/" + folder + "/" + fileName + FileUtils.KT_EXTENSION;
+    return ToolHelper.getResourceAsReadOnlyFile(KotlinTestBase.class, resourceName);
+  }
+
+  protected static Path getKotlinSourceFileFromResources(Class<?> clazz, String relativePath) {
+    return ToolHelper.getResourceAsReadOnlyFile(clazz, relativePath + FileUtils.KT_EXTENSION);
+  }
+
+  protected static Path getKotlinSourceFileFromResources(Package pkg, String fileName) {
+    String path = pkg.getName().replace('.', '/') + "/" + fileName + FileUtils.KT_EXTENSION;
+    return ToolHelper.getResourceAsReadOnlyFile(KotlinTestBase.class, "/" + path);
+  }
+
+  public static Path getKotlinFileInResource(String folder, String fileName) {
+    return Paths.get(ToolHelper.TESTS_DIR, RSRC, folder, fileName + FileUtils.KT_EXTENSION);
+  }
+
+  public static List<Path> getKotlinFilesInResource(String folder) {
+    try {
+      return Files.walk(Paths.get(ToolHelper.TESTS_DIR, RSRC, folder))
+          .filter(path -> path.toString().endsWith(".kt") || path.toString().endsWith(".java"))
+          .collect(Collectors.toList());
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  public static Path getKotlinResourcesFolder() {
+    return Paths.get(ToolHelper.TESTS_DIR, RSRC);
+  }
+
+  protected Path getJavaJarFile(String folder) {
+    return Paths.get(ToolHelper.THIRD_PARTY_DIR, RSRC, folder + FileUtils.JAR_EXTENSION);
+  }
+
+  protected KotlinCompilerTool kotlinCompilerTool() {
+    return KotlinCompilerTool.create(
+        CfRuntime.getCheckedInJdk9(), temp, kotlinc, targetVersion, lambdaGeneration);
+  }
+
+  public static KotlinCompileMemoizer getCompileMemoizer(Path... source) {
+    return new KotlinCompileMemoizer(Arrays.asList(source));
+  }
+
+  public static KotlinCompileMemoizer getCompileMemoizer(Collection<Path> sources) {
+    assert sources.size() > 0;
+    return new KotlinCompileMemoizer(sources);
+  }
+
+  public static KotlinCompileMemoizer getCompileMemoizer(
+      Collection<Path> sources, CfRuntime runtime, TemporaryFolder temporaryFolder) {
+    return new KotlinCompileMemoizer(sources, runtime, temporaryFolder);
+  }
+
+  public static KotlinCompileMemoizer getCompileMemoizer(
+      Collection<Path> sources, String sharedFolder) {
+    return compileMemoizers.computeIfAbsent(
+        sharedFolder, ignore -> new KotlinCompileMemoizer(sources));
+  }
+
+  public ThrowableConsumer<R8TestCompileResult> assertUnusedKeepRuleForKotlinMetadata(
+      boolean condition) {
+    return compileResult -> {
+      if (!condition) {
+        return;
+      }
+      compileResult
+          .getDiagnosticMessages()
+          .assertInfoThatMatches(
+              diagnosticMessage(
+                  containsString(
+                      "Proguard configuration rule does not match anything: `-keep class"
+                          + " kotlin.Metadata")));
+    };
+  }
+
+  public static ThrowableConsumer<R8FullTestBuilder>
+      configureForLibraryWithEmbeddedProguardRules() {
+    // When running on main explicitly configure max compiler version for checking against
+    // embeded proguard rules.
+    return builder ->
+        builder.applyIf(
+            Version.isMainVersion(), b -> b.setFakeCompilerVersion(SemanticVersion.max()));
+  }
+
+}

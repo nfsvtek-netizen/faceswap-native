@@ -1,0 +1,1421 @@
+// Copyright (c) 2020, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.synthesis;
+
+import static com.android.tools.r8.utils.internal.ConsumerUtils.emptyConsumer;
+
+import com.android.tools.r8.FeatureSplit;
+import com.android.tools.r8.SyntheticInfoConsumer;
+import com.android.tools.r8.SyntheticInfoConsumerData;
+import com.android.tools.r8.contexts.CompilationContext.UniqueContext;
+import com.android.tools.r8.errors.MissingGlobalSyntheticsConsumerDiagnostic;
+import com.android.tools.r8.features.ClassToFeatureSplitMap;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.ClassResolutionResult;
+import com.android.tools.r8.graph.ClasspathMethod;
+import com.android.tools.r8.graph.ClasspathOrLibraryClass;
+import com.android.tools.r8.graph.DexApplication;
+import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexClassAndMethod;
+import com.android.tools.r8.graph.DexClasspathClass;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DexProto;
+import com.android.tools.r8.graph.DexReference;
+import com.android.tools.r8.graph.DexString;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.MethodCollection;
+import com.android.tools.r8.graph.ProgramDefinition;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ProgramOrClasspathClass;
+import com.android.tools.r8.graph.ProgramOrClasspathDefinition;
+import com.android.tools.r8.graph.PrunedItems;
+import com.android.tools.r8.graph.lens.NonIdentityGraphLens;
+import com.android.tools.r8.ir.desugar.desugaredlibrary.DesugaredLibraryTypeRewriter;
+import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.partial.R8PartialSubCompilationConfiguration.R8PartialR8SubCompilationConfiguration;
+import com.android.tools.r8.references.ClassReference;
+import com.android.tools.r8.references.Reference;
+import com.android.tools.r8.synthesis.SyntheticFinalization.Result;
+import com.android.tools.r8.synthesis.SyntheticNaming.SyntheticKind;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.StringDiagnostic;
+import com.android.tools.r8.utils.internal.Box;
+import com.android.tools.r8.utils.internal.ConsumerUtils;
+import com.android.tools.r8.utils.internal.IterableUtils;
+import com.android.tools.r8.utils.internal.ListUtils;
+import com.android.tools.r8.utils.internal.SetUtils;
+import com.android.tools.r8.utils.internal.exceptions.Unreachable;
+import com.android.tools.r8.utils.timing.Timing;
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
+import java.util.function.BiPredicate;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import org.objectweb.asm.ClassWriter;
+
+public class SyntheticItems {
+
+  public boolean isSyntheticClassEligibleForMerging(DexProgramClass clazz) {
+    SyntheticDefinition<?, ?, ?> definition = pending.definitions.get(clazz.type);
+    if (definition != null) {
+      return definition.getKind().isShareable();
+    }
+    Iterable<SyntheticReference<?, ?, ?>> references =
+        Iterables.concat(committed.getItems(clazz.type), finalized.getItems(clazz.getType()));
+    Iterator<SyntheticReference<?, ?, ?>> iterator = references.iterator();
+    if (iterator.hasNext()) {
+      boolean sharable = iterator.next().getKind().isShareable();
+      assert Iterables.all(references, r -> sharable == r.getKind().isShareable());
+      return sharable;
+    }
+    return false;
+  }
+
+  public interface GlobalSyntheticsStrategy {
+    ContextsForGlobalSynthetics getStrategy();
+
+    static GlobalSyntheticsStrategy forNonSynthesizing() {
+      ContextsForGlobalSyntheticsInSingleOutputMode instance =
+          new ContextsForGlobalSyntheticsInSingleOutputMode() {
+            @Override
+            public void addGlobalContexts(
+                DexType globalType, Collection<? extends ProgramDefinition> contexts) {
+              throw new Unreachable("Unexpected attempt to add globals to non-desugaring build.");
+            }
+          };
+      return () -> instance;
+    }
+
+    static GlobalSyntheticsStrategy forSingleOutputMode() {
+      ContextsForGlobalSynthetics instance = new ContextsForGlobalSyntheticsInSingleOutputMode();
+      return () -> instance;
+    }
+
+    static GlobalSyntheticsStrategy forPerFileMode() {
+      // Allocate a new context set as the new pending set.
+      return ContextsForGlobalSyntheticsInPerFileMode::new;
+    }
+  }
+
+  interface ContextsForGlobalSynthetics {
+    boolean isEmpty();
+
+    void forEach(BiConsumer<DexType, Set<DexType>> fn);
+
+    void addGlobalContexts(DexType globalType, Collection<? extends ProgramDefinition> contexts);
+  }
+
+  private static class ContextsForGlobalSyntheticsInSingleOutputMode
+      implements ContextsForGlobalSynthetics {
+
+    @Override
+    public boolean isEmpty() {
+      return true;
+    }
+
+    @Override
+    public void forEach(BiConsumer<DexType, Set<DexType>> fn) {
+      // nothing to do.
+    }
+
+    @Override
+    public void addGlobalContexts(
+        DexType globalType, Collection<? extends ProgramDefinition> contexts) {
+      // contexts are ignored in single output modes.
+    }
+  }
+
+  private static class ContextsForGlobalSyntheticsInPerFileMode
+      implements ContextsForGlobalSynthetics {
+    private final ConcurrentHashMap<DexType, Set<DexType>> globalContexts =
+        new ConcurrentHashMap<>();
+
+    @Override
+    public boolean isEmpty() {
+      return globalContexts.isEmpty();
+    }
+
+    @Override
+    public void forEach(BiConsumer<DexType, Set<DexType>> fn) {
+      globalContexts.forEach(fn);
+    }
+
+    @Override
+    public void addGlobalContexts(
+        DexType globalType, Collection<? extends ProgramDefinition> contexts) {
+      Set<DexType> contextReferences =
+          globalContexts.computeIfAbsent(globalType, k -> ConcurrentHashMap.newKeySet());
+      contexts.forEach(definition -> contextReferences.add(definition.getContextType()));
+    }
+  }
+
+  enum State {
+    OPEN,
+    FINALIZED
+  }
+
+  /** Collection of pending items. */
+  private static class PendingSynthetics {
+
+    /** Thread safe collection of synthetic items not yet committed to the application. */
+    private final ConcurrentHashMap<DexType, SyntheticDefinition<?, ?, ?>> definitions =
+        new ConcurrentHashMap<>();
+
+    boolean isEmpty() {
+      return definitions.isEmpty();
+    }
+
+    boolean containsMethod(DexType type) {
+      return definitions.containsKey(type) && definitions.get(type).isMethodDefinition();
+    }
+
+    boolean containsType(DexType type) {
+      return definitions.containsKey(type);
+    }
+
+    @SuppressWarnings("ReferenceEquality")
+    boolean containsTypeOfKind(DexType type, SyntheticKind kind) {
+      SyntheticDefinition<?, ?, ?> definition = definitions.get(type);
+      return definition != null && definition.getKind() == kind;
+    }
+
+    boolean verifyNotRewritten(NonIdentityGraphLens lens) {
+      assert definitions.keySet().equals(lens.rewriteTypes(definitions.keySet()));
+      return true;
+    }
+
+    Collection<DexProgramClass> getAllProgramClasses() {
+      List<DexProgramClass> allPending = new ArrayList<>(definitions.size());
+      for (SyntheticDefinition<?, ?, ?> item : definitions.values()) {
+        if (item.isProgramDefinition()) {
+          allPending.add(item.asProgramDefinition().getHolder());
+        }
+      }
+      return Collections.unmodifiableList(allPending);
+    }
+
+    Collection<DexClass> getAllClasses() {
+      List<DexClass> allPending = new ArrayList<>(definitions.size());
+      for (SyntheticDefinition<?, ?, ?> item : definitions.values()) {
+        allPending.add(item.getHolder());
+      }
+      return Collections.unmodifiableList(allPending);
+    }
+  }
+
+  private final State state;
+  private final SyntheticNaming naming;
+  private final CommittedSyntheticsCollection committed;
+  private final CommittedSyntheticsCollection finalized;
+  private final PendingSynthetics pending = new PendingSynthetics();
+  private final ContextsForGlobalSynthetics globalContexts;
+  private final GlobalSyntheticsStrategy globalSyntheticsStrategy;
+
+  public Set<DexType> collectSyntheticsFromContext(DexType context) {
+    Set<DexType> result = Sets.newIdentityHashSet();
+    internalCollectSyntheticsFromContext(context, committed, result);
+    internalCollectSyntheticsFromContext(context, finalized, result);
+    return result;
+  }
+
+  private static void internalCollectSyntheticsFromContext(
+      DexType context, CommittedSyntheticsCollection committed, Set<DexType> result) {
+    committed.forEachMethodFlattened(
+        (synthetic, methodReference) -> {
+          if (context.isIdenticalTo(methodReference.getContext().getSynthesizingContextType())) {
+            result.add(synthetic);
+          }
+        });
+    committed.forEachClassFlattened(
+        (synthetic, classReference) -> {
+          if (context.isIdenticalTo(classReference.getContext().getSynthesizingContextType())) {
+            result.add(synthetic);
+          }
+        });
+  }
+
+  public CommittedSyntheticsCollection getCommitted() {
+    return committed;
+  }
+
+  public CommittedSyntheticsCollection getFinalized() {
+    return finalized;
+  }
+
+  public SyntheticNaming getNaming() {
+    return naming;
+  }
+
+  public GlobalSyntheticsStrategy getGlobalSyntheticsStrategy() {
+    return globalSyntheticsStrategy;
+  }
+
+  // Only for use from initial AppInfo/AppInfoWithClassHierarchy create functions. */
+  public static CommittedItems createInitialSyntheticItems(
+      DexApplication application, GlobalSyntheticsStrategy globalSyntheticsStrategy) {
+    R8PartialR8SubCompilationConfiguration subCompilationConfiguration =
+        application.options.getR8PartialR8SubCompilationOptions();
+    return new CommittedItems(
+        State.OPEN,
+        application,
+        CommittedSyntheticsCollection.empty(),
+        subCompilationConfiguration != null
+            ? subCompilationConfiguration.getSynthetics()
+            : CommittedSyntheticsCollection.empty(),
+        ImmutableList.of(),
+        globalSyntheticsStrategy);
+  }
+
+  // Only for conversion to a mutable synthetic items collection.
+  SyntheticItems(CommittedItems commit) {
+    this(
+        commit.state,
+        commit.committed,
+        commit.finalized,
+        commit.globalSyntheticsStrategy,
+        commit.getApplication().dexItemFactory().getSyntheticNaming());
+  }
+
+  private SyntheticItems(
+      State state,
+      CommittedSyntheticsCollection committed,
+      CommittedSyntheticsCollection finalized,
+      GlobalSyntheticsStrategy globalSyntheticsStrategy,
+      SyntheticNaming naming) {
+    this.state = state;
+    this.committed = committed;
+    this.finalized = finalized;
+    this.naming = naming;
+    this.globalContexts = globalSyntheticsStrategy.getStrategy();
+    this.globalSyntheticsStrategy = globalSyntheticsStrategy;
+  }
+
+  public Map<DexType, Set<DexType>> getFinalGlobalSyntheticContexts(AppView<?> appView) {
+    assert isFinalized();
+    DexItemFactory factory = appView.dexItemFactory();
+    ImmutableMap<DexType, Set<DexType>> committedGlobalContexts = committed.getGlobalContexts();
+    ImmutableMap<DexType, Set<DexType>> finalizedGlobalContexts = finalized.getGlobalContexts();
+    NamingLens namingLens = appView.getNamingLens();
+    Map<DexType, Set<DexType>> rewritten =
+        new IdentityHashMap<>(committedGlobalContexts.size() + finalizedGlobalContexts.size());
+    Iterables.concat(committedGlobalContexts.entrySet(), finalizedGlobalContexts.entrySet())
+        .forEach(
+            entry -> {
+              var global = entry.getKey();
+              var contexts = entry.getValue();
+              Set<DexType> old =
+                  rewritten.put(
+                      namingLens.lookupType(global, factory),
+                      SetUtils.mapIdentityHashSet(
+                          contexts, c -> namingLens.lookupType(c, factory)));
+              assert old == null;
+            });
+    return rewritten;
+  }
+
+  public static void collectSyntheticInputs(AppView<?> appView) {
+    // Nothing to collect in R8 partial.
+    if (appView.options().getR8PartialR8SubCompilationOptions() != null) {
+      return;
+    }
+
+    if (!appView.options().getTestingOptions().collectSyntheticInputs) {
+      appView.appInfo().classes().forEach(DexProgramClass::stripSyntheticInputMarker);
+      return;
+    }
+
+    // Collecting synthetic items must be the very first task after application build.
+    SyntheticItems synthetics = appView.getSyntheticItems();
+    assert synthetics.committed.isEmpty();
+    assert synthetics.finalized.isEmpty();
+    assert synthetics.pending.isEmpty();
+    CommittedSyntheticsCollection.Builder builder = synthetics.committed.builder();
+    if (appView.options().intermediate) {
+      appView
+          .appInfo()
+          .classes()
+          .forEach(
+              clazz -> {
+                SyntheticMarker marker = SyntheticMarker.stripMarkerFromClass(clazz, appView);
+                if (marker.isValidMarker()) {
+                  addSyntheticInput(clazz, marker, marker.getContext(), builder);
+                }
+              });
+    } else {
+      collectSyntheticInputsTransitive(appView, builder);
+    }
+    CommittedSyntheticsCollection committed = builder.collectSyntheticInputs().build();
+    if (committed.isEmpty()) {
+      return;
+    }
+    CommittedItems commit =
+        new CommittedItems(
+            synthetics.state,
+            appView.appInfo().app(),
+            committed,
+            synthetics.finalized,
+            ImmutableList.of(),
+            synthetics.globalSyntheticsStrategy);
+    if (appView.appInfo().hasClassHierarchy()) {
+      appView
+          .withClassHierarchy()
+          .setAppInfo(appView.appInfo().withClassHierarchy().rebuildWithCommittedItems(commit));
+    } else {
+      appView
+          .withoutClassHierarchy()
+          .setAppInfo(appView.appInfo().rebuildWithCommittedItems(commit));
+    }
+  }
+
+  private static void addSyntheticInput(
+      DexProgramClass clazz,
+      SyntheticMarker marker,
+      SynthesizingContext context,
+      CommittedSyntheticsCollection.Builder builder) {
+    if (marker.isSyntheticMethods()) {
+      clazz.forEachProgramMethod(
+          method ->
+              builder.addMethod(new SyntheticMethodDefinition(marker.getKind(), context, method)));
+    } else if (marker.isSyntheticClass()) {
+      builder.addClass(new SyntheticProgramClassDefinition(marker.getKind(), context, clazz));
+    }
+  }
+
+  private static void collectSyntheticInputsTransitive(
+      AppView<?> appView, CommittedSyntheticsCollection.Builder builder) {
+    Map<DexType, SynthesizingContext> cache = new IdentityHashMap<>();
+    appView
+        .appInfo()
+        .classes()
+        .forEach(clazz -> collectSyntheticInputTransitive(clazz, cache, builder, appView));
+  }
+
+  private static SynthesizingContext collectSyntheticInputTransitive(
+      DexProgramClass clazz,
+      Map<DexType, SynthesizingContext> cache,
+      CommittedSyntheticsCollection.Builder builder,
+      AppView<?> appView) {
+    SyntheticMarker marker = SyntheticMarker.stripMarkerFromClass(clazz, appView);
+    if (!marker.isValidMarker()) {
+      return cache.get(clazz.getType());
+    }
+    return cache.computeIfAbsent(
+        clazz.getType(),
+        type -> {
+          SynthesizingContext context =
+              ensureSyntheticInputContext(clazz, marker, cache, builder, appView);
+          addSyntheticInput(clazz, marker, context, builder);
+          return context;
+        });
+  }
+
+  private static SynthesizingContext ensureSyntheticInputContext(
+      DexProgramClass clazz,
+      SyntheticMarker marker,
+      Map<DexType, SynthesizingContext> cache,
+      CommittedSyntheticsCollection.Builder builder,
+      AppView<?> appView) {
+    assert !appView.options().intermediate;
+    // The context should be flattened such that it is not itself a synthetic.
+    DexProgramClass contextClass =
+        DexProgramClass.asProgramClassOrNull(
+            appView
+                .appInfo()
+                .definitionForWithoutExistenceAssert(
+                    marker.getContext().getSynthesizingContextType()));
+    if (contextClass == null) {
+      appView
+          .reporter()
+          .error(
+              new StringDiagnostic(
+                  "Attempt at compiling intermediate artifact without its context",
+                  clazz.getOrigin()));
+      return marker.getContext();
+    } else {
+      SynthesizingContext contextOfContext =
+          collectSyntheticInputTransitive(contextClass, cache, builder, appView);
+      return contextOfContext != null ? contextOfContext : marker.getContext();
+    }
+  }
+
+  // Predicates and accessors.
+  public ClassResolutionResult definitionFor(DexType type, DexApplication app) {
+    ProgramOrClasspathClass programOrClasspathClassNotOnLibrary =
+        app.definitionForProgramOrClasspathClassNotOnLibrary(type);
+    if (programOrClasspathClassNotOnLibrary != null) {
+      assert !isPendingSynthetic(type);
+      return programOrClasspathClassNotOnLibrary;
+    }
+    SyntheticDefinition<?, ?, ?> item = pending.definitions.get(type);
+    if (item != null) {
+      DexClass clazz = item.getHolder();
+      assert clazz.isProgramClass() == item.isProgramDefinition();
+      assert clazz.isClasspathClass() == item.isClasspathDefinition();
+      assert !app.contextIndependentDefinitionForWithResolutionResult(type)
+                  .hasClassResolutionResult()
+              || item.getKind().isMayOverridesNonProgramType()
+          : "Pending synthetic definition also present in the active program: " + type;
+      return clazz;
+    }
+    return app.contextIndependentDefinitionForWithResolutionResult(type);
+  }
+
+  public boolean isFinalized() {
+    return state == State.FINALIZED;
+  }
+
+  public boolean hasPendingSyntheticClasses() {
+    return !pending.isEmpty();
+  }
+
+  public Collection<DexProgramClass> getPendingSyntheticClasses() {
+    return pending.getAllProgramClasses();
+  }
+
+  public Collection<DexClass> getAllPendingSyntheticClasses() {
+    return pending.getAllClasses();
+  }
+
+  public boolean isCommittedSynthetic(DexType type) {
+    return committed.containsType(type);
+  }
+
+  public boolean isFinalizedSynthetic(DexType type) {
+    return finalized.containsType(type);
+  }
+
+  public boolean isPendingSynthetic(DexType type) {
+    return pending.containsType(type);
+  }
+
+  public boolean isSynthetic(DexProgramClass clazz) {
+    return isSynthetic(clazz.type);
+  }
+
+  public boolean isSynthetic(DexType type) {
+    return isCommittedSynthetic(type) || isFinalizedSynthetic(type) || isPendingSynthetic(type);
+  }
+
+  public boolean isSubjectToKeepRules(DexProgramClass clazz) {
+    assert isSyntheticClass(clazz);
+    return isSyntheticInput(clazz);
+  }
+
+  public boolean isSyntheticClass(DexType type) {
+    return isSynthetic(type);
+  }
+
+  public boolean isSyntheticClass(DexProgramClass clazz) {
+    return isSyntheticClass(clazz.type);
+  }
+
+  public boolean isSyntheticMethod(DexProgramClass clazz) {
+    DexType type = clazz.getType();
+    return committed.containsMethod(type)
+        || finalized.containsMethod(type)
+        || pending.containsMethod(type);
+  }
+
+  public boolean isGlobalSyntheticClass(DexType type) {
+    SyntheticDefinition<?, ?, ?> definition = pending.definitions.get(type);
+    if (definition != null) {
+      return definition.getKind().isGlobal();
+    }
+    List<SyntheticProgramClassReference> committedReferences =
+        committed.getClasses().getOrDefault(type, Collections.emptyList());
+    List<SyntheticProgramClassReference> finalizedReferences =
+        finalized.getClasses().getOrDefault(type, Collections.emptyList());
+    SyntheticProgramClassReference singleReference;
+    if (committedReferences.size() + finalizedReferences.size() == 1) {
+      singleReference =
+          committedReferences.size() == 1 ? committedReferences.get(0) : finalizedReferences.get(0);
+    } else {
+      singleReference = null;
+    }
+    if (singleReference != null && singleReference.getKind().isGlobal()) {
+      return true;
+    }
+    assert verifyNoGlobals(committedReferences);
+    assert verifyNoGlobals(finalizedReferences);
+    return false;
+  }
+
+  public boolean isGlobalSyntheticClass(DexProgramClass clazz) {
+    return isGlobalSyntheticClass(clazz.getType());
+  }
+
+  public boolean isGlobalSyntheticClassTransitive(DexProgramClass clazz) {
+    // Fast path the common case where the class is not synthetic at all.
+    if (!isSynthetic(clazz)) {
+      return false;
+    }
+    if (isGlobalSyntheticClass(clazz)) {
+      return true;
+    }
+    DexType type = clazz.getType();
+    for (SyntheticReference<?, ?, ?> reference : committed.getItems(type)) {
+      // Only a single context should exist for a globally derived synthetic, so return early.
+      return isGlobalSyntheticClass(reference.getContext().getSynthesizingContextType());
+    }
+    for (SyntheticReference<?, ?, ?> reference : finalized.getItems(type)) {
+      // Only a single context should exist for a globally derived synthetic, so return early.
+      return isGlobalSyntheticClass(reference.getContext().getSynthesizingContextType());
+    }
+    SyntheticDefinition<?, ?, ?> definition = pending.definitions.get(type);
+    if (definition != null) {
+      return isGlobalSyntheticClass(definition.getContext().getSynthesizingContextType());
+    }
+    return false;
+  }
+
+  private static boolean verifyNoGlobals(List<SyntheticProgramClassReference> references) {
+    for (SyntheticProgramClassReference reference : references) {
+      assert !reference.getKind().isGlobal();
+    }
+    return true;
+  }
+
+  public boolean hasKindThatMatches(
+      DexProgramClass clazz,
+      BiPredicate<? super SyntheticKind, ? super SyntheticNaming> predicate) {
+    return Iterables.any(getSyntheticKinds(clazz.getType()), kind -> predicate.test(kind, naming));
+  }
+
+  public boolean isSyntheticOfKind(DexType type, SyntheticKindSelector kindSelector) {
+    SyntheticKind kind = kindSelector.select(naming);
+    return pending.containsTypeOfKind(type, kind)
+        || committed.containsTypeOfKind(type, kind)
+        || finalized.containsTypeOfKind(type, kind);
+  }
+
+  public Iterable<SyntheticKind> getSyntheticKinds(DexType type) {
+    Iterable<SyntheticKind> references =
+        Iterables.concat(
+            Iterables.transform(committed.getItems(type), SyntheticReference::getKind),
+            Iterables.transform(finalized.getItems(type), SyntheticReference::getKind));
+    SyntheticDefinition<?, ?, ?> definition = pending.definitions.get(type);
+    if (definition != null) {
+      references = Iterables.concat(references, IterableUtils.singleton(definition.getKind()));
+    }
+    return references;
+  }
+
+  boolean isSyntheticInput(DexProgramClass clazz) {
+    return isSyntheticInput(clazz.getType());
+  }
+
+  boolean isSyntheticInput(DexType type) {
+    return committed.containsSyntheticInput(type) || finalized.containsSyntheticInput(type);
+  }
+
+  public FeatureSplit getContextualFeatureSplitOrDefault(DexType type, FeatureSplit defaultValue) {
+    assert isSyntheticClass(type);
+    if (isSyntheticOfKind(type, kinds -> kinds.ENUM_UNBOXING_SHARED_UTILITY_CLASS)) {
+      return FeatureSplit.BASE;
+    }
+    List<SynthesizingContext> contexts = getSynthesizingContexts(type);
+    if (contexts.isEmpty()) {
+      assert false
+          : "Expected synthetic to have at least one synthesizing context: " + type.getTypeName();
+      return defaultValue;
+    }
+    assert verifyAllHaveSameFeature(contexts, SynthesizingContext::getFeatureSplit);
+    return contexts.get(0).getFeatureSplit();
+  }
+
+  private static <T> boolean verifyAllHaveSameFeature(
+      List<T> items, Function<T, FeatureSplit> getter) {
+    assert !items.isEmpty();
+    FeatureSplit featureSplit = getter.apply(items.get(0));
+    for (int i = 1; i < items.size(); i++) {
+      assert featureSplit == getter.apply(items.get(i));
+    }
+    return true;
+  }
+
+  private void forEachSynthesizingContext(DexType type, Consumer<SynthesizingContext> consumer) {
+    for (SyntheticReference<?, ?, ?> reference : committed.getItems(type)) {
+      consumer.accept(reference.getContext());
+    }
+    for (SyntheticReference<?, ?, ?> reference : finalized.getItems(type)) {
+      consumer.accept(reference.getContext());
+    }
+    SyntheticDefinition<?, ?, ?> definition = pending.definitions.get(type);
+    if (definition != null) {
+      consumer.accept(definition.getContext());
+    }
+  }
+
+  private List<SynthesizingContext> getSynthesizingContexts(DexType type) {
+    return ListUtils.newImmutableList(builder -> forEachSynthesizingContext(type, builder));
+  }
+
+  public Collection<DexType> getSynthesizingContextTypes(DexType type) {
+    ImmutableList.Builder<DexType> builder = ImmutableList.builder();
+    forEachSynthesizingContext(
+        type, synthesizingContext -> builder.add(synthesizingContext.getSynthesizingContextType()));
+    return builder.build();
+  }
+
+  // TODO(b/180091213): Implement this and remove client provided the oracle.
+  public Set<DexReference> getSynthesizingContextReferences(
+      DexProgramClass clazz, SynthesizingContextOracle oracle) {
+    assert isSyntheticClass(clazz);
+    return oracle.getSynthesizingContexts(clazz);
+  }
+
+  public Collection<Origin> getSynthesizingOrigin(DexType type) {
+    if (!isSynthetic(type)) {
+      return Collections.emptyList();
+    }
+    ImmutableList.Builder<Origin> builder = ImmutableList.builder();
+    forEachSynthesizingContext(
+        type,
+        context -> {
+          builder.add(context.getInputContextOrigin());
+        });
+    return builder.build();
+  }
+
+  public DexType getSynthesizingInputContext(DexType syntheticType, InternalOptions options) {
+    if (!isSynthetic(syntheticType)) {
+      return null;
+    }
+    Box<DexType> uniqueInputContext = new Box<>(null);
+    forEachSynthesizingContext(
+        syntheticType,
+        context -> {
+          assert uniqueInputContext.get() == null;
+          uniqueInputContext.set(context.getSynthesizingInputContext(options.intermediate));
+        });
+    return uniqueInputContext.get();
+  }
+
+  public interface SynthesizingContextOracle {
+
+    Set<DexReference> getSynthesizingContexts(DexProgramClass clazz);
+  }
+
+  public boolean isSyntheticMethodThatShouldNotBeDoubleProcessed(ProgramMethod method) {
+    for (SyntheticMethodReference reference :
+        committed.getMethods().getOrDefault(method.getHolderType(), Collections.emptyList())) {
+      if (reference.getKind().equals(naming.STATIC_INTERFACE_CALL)) {
+        return true;
+      }
+    }
+    SyntheticDefinition<?, ?, ?> definition = pending.definitions.get(method.getHolderType());
+    if (definition != null) {
+      return definition.getKind().equals(naming.STATIC_INTERFACE_CALL);
+    }
+    return false;
+  }
+
+  // The compiler should not inspect the kind of a synthetic, so this provided only as a assertion
+  // utility.
+  public boolean verifySyntheticLambdaProperty(
+      DexProgramClass clazz,
+      Predicate<DexProgramClass> ifIsLambda,
+      Predicate<DexProgramClass> ifNotLambda) {
+    Iterable<SyntheticReference<?, ?, ?>> references = committed.getItems(clazz.getType());
+    SyntheticDefinition<?, ?, ?> definition = pending.definitions.get(clazz.getType());
+    if (definition != null) {
+      references = Iterables.concat(references, IterableUtils.singleton(definition.toReference()));
+    }
+    if (Iterables.any(references, reference -> reference.getKind().equals(naming.LAMBDA))) {
+      assert ifIsLambda.test(clazz);
+    } else {
+      assert ifNotLambda.test(clazz);
+    }
+    return true;
+  }
+
+  private SynthesizingContext getSynthesizingContext(
+      ProgramDefinition context, AppView<?> appView) {
+    return getSynthesizingContext(context, appView.appInfo().getClassToFeatureSplitMap());
+  }
+
+  /** Used to find the synthesizing context for a new synthetic that is about to be created. */
+  private SynthesizingContext getSynthesizingContext(
+      ProgramDefinition context, ClassToFeatureSplitMap featureSplits) {
+    DexType contextType = context.getContextType();
+    SyntheticDefinition<?, ?, ?> existingDefinition = pending.definitions.get(contextType);
+    if (existingDefinition != null) {
+      return existingDefinition.getContext();
+    }
+    Iterable<SyntheticReference<?, ?, ?>> existingReferences =
+        Iterables.concat(committed.getItems(contextType), finalized.getItems(contextType));
+    if (!Iterables.isEmpty(existingReferences)) {
+      // Use a deterministic synthesizing context from the set of contexts.
+      return IterableUtils.min(
+              existingReferences,
+              (existingReference, other) ->
+                  existingReference.getReference().compareTo(other.getReference()))
+          .getContext();
+    }
+    // This context is not nested in an existing synthetic context so create a new "leaf" context.
+    FeatureSplit featureSplit = featureSplits.getFeatureSplit(context, this);
+    return SynthesizingContext.fromNonSyntheticInputContext(context, featureSplit);
+  }
+
+  // Addition and creation of synthetic items.
+
+  private DexProgramClass internalLookupProgramClass(
+      DexType type, SyntheticKind kind, AppView<?> appView) {
+    DexClass clazz = appView.definitionFor(type);
+    if (clazz == null) {
+      return null;
+    }
+    if (clazz.isProgramClass()) {
+      return clazz.asProgramClass();
+    }
+    if (clazz.isLibraryClass() && kind.isGlobal()) {
+      return null;
+    }
+    errorOnInvalidSyntheticEnsure(clazz, "program", appView);
+    return null;
+  }
+
+  private DexProgramClass internalEnsureFixedProgramClass(
+      SyntheticKind kind,
+      Consumer<SyntheticProgramClassBuilder> classConsumer,
+      Consumer<DexProgramClass> onReferencingContextConsumer,
+      Consumer<DexProgramClass> onCreationConsumer,
+      SynthesizingContext outerContext,
+      AppView<?> appView) {
+    Function<SynthesizingContext, DexType> contextToType =
+        c -> SyntheticNaming.createFixedType(kind, c, appView.dexItemFactory());
+    DexType type = contextToType.apply(outerContext);
+    // Fast path is that the synthetic is already present. If so it must be a program class.
+    DexProgramClass clazz = internalLookupProgramClass(type, kind, appView);
+    if (clazz != null) {
+      onReferencingContextConsumer.accept(clazz);
+      return clazz;
+    }
+    // Slow path creates the class using the context to make it thread safe.
+    synchronized (type) {
+      // Recheck if it is present now the lock is held.
+      clazz = internalLookupProgramClass(type, kind, appView);
+      if (clazz != null) {
+        return clazz;
+      }
+      assert !isSyntheticClass(type);
+      clazz =
+          internalCreateProgramClass(
+              kind,
+              syntheticProgramClassBuilder -> {
+                syntheticProgramClassBuilder.setUseSortedMethodBacking(true);
+                classConsumer.accept(syntheticProgramClassBuilder);
+              },
+              outerContext,
+              type,
+              contextToType,
+              appView);
+      onReferencingContextConsumer.accept(clazz);
+      onCreationConsumer.accept(clazz);
+      return clazz;
+    }
+  }
+
+  private DexProgramClass internalCreateProgramClass(
+      SyntheticKind kind,
+      Consumer<SyntheticProgramClassBuilder> fn,
+      SynthesizingContext outerContext,
+      DexType type,
+      Function<SynthesizingContext, DexType> contextToType,
+      AppView<?> appView) {
+    registerSyntheticTypeRewriting(
+        outerContext,
+        contextToType,
+        type,
+        appView.options().getLibraryDesugaringOptions().getTypeRewriter());
+    SyntheticProgramClassBuilder classBuilder =
+        new SyntheticProgramClassBuilder(type, kind, outerContext, appView.dexItemFactory());
+    fn.accept(classBuilder);
+    DexProgramClass clazz = classBuilder.build();
+    addPendingDefinition(new SyntheticProgramClassDefinition(kind, outerContext, clazz));
+    return clazz;
+  }
+
+  private void registerSyntheticTypeRewriting(
+      SynthesizingContext outerContext,
+      Function<SynthesizingContext, DexType> contextToType,
+      DexType type,
+      DesugaredLibraryTypeRewriter typeRewriter) {
+    DexType rewrittenContextType =
+        typeRewriter.rewrittenContextType(outerContext.getSynthesizingContextType());
+    if (rewrittenContextType == null) {
+      return;
+    }
+    SynthesizingContext synthesizingContext = SynthesizingContext.fromType(rewrittenContextType);
+    DexType rewrittenType = contextToType.apply(synthesizingContext);
+    typeRewriter.rewriteType(type, rewrittenType);
+  }
+
+  public DexProgramClass createClass(
+      SyntheticKindSelector kindSelector, UniqueContext context, AppView<?> appView) {
+    return createClass(kindSelector, context, appView, ConsumerUtils.emptyConsumer());
+  }
+
+  public DexProgramClass createClass(
+      SyntheticKindSelector kindSelector,
+      UniqueContext context,
+      AppView<?> appView,
+      Consumer<SyntheticProgramClassBuilder> fn) {
+    SyntheticKind kind = kindSelector.select(naming);
+    // Obtain the outer synthesizing context in the case the context itself is synthetic.
+    // This is to ensure a flat input-type -> synthetic-item mapping.
+    SynthesizingContext outerContext = getSynthesizingContext(context.getClassContext(), appView);
+    Function<SynthesizingContext, DexType> contextToType =
+        c -> SyntheticNaming.createInternalType(kind, c, context.getSyntheticSuffix(), appView);
+    return internalCreateProgramClass(
+        kind, fn, outerContext, contextToType.apply(outerContext), contextToType, appView);
+  }
+
+  // TODO(b/172194101): Make this take a unique context.
+  public DexProgramClass createFixedClass(
+      SyntheticKindSelector kindSelector,
+      DexProgramClass context,
+      AppView<?> appView,
+      Consumer<SyntheticProgramClassBuilder> fn) {
+    SyntheticKind kind = kindSelector.select(naming);
+    SynthesizingContext outerContext = internalGetOuterContext(context, appView);
+    Function<SynthesizingContext, DexType> contextToType =
+        c -> SyntheticNaming.createFixedType(kind, c, appView.dexItemFactory());
+    return internalCreateProgramClass(
+        kind, fn, outerContext, contextToType.apply(outerContext), contextToType, appView);
+  }
+
+  public DexProgramClass getExistingFixedClass(
+      SyntheticKindSelector kindSelector, DexClass context, AppView<?> appView) {
+    SyntheticKind kind = kindSelector.select(naming);
+    assert kind.isFixedSuffixSynthetic();
+    SynthesizingContext outerContext = internalGetOuterContext(context, appView);
+    DexType type = SyntheticNaming.createFixedType(kind, outerContext, appView.dexItemFactory());
+    DexClass clazz = appView.definitionFor(type);
+    assert clazz != null : "Missing existing fixed class " + type;
+    assert isSyntheticClass(type);
+    assert clazz.isProgramClass();
+    return clazz.asProgramClass();
+  }
+
+  // Obtain the outer synthesizing context in the case the context itself is synthetic.
+  // This is to ensure a flat input-type -> synthetic-item mapping.
+  private SynthesizingContext internalGetOuterContext(DexClass context, AppView<?> appView) {
+    return context.isProgramClass()
+        ? getSynthesizingContext(context.asProgramClass(), appView)
+        : SynthesizingContext.fromNonSyntheticInputContext(context.asClasspathOrLibraryClass());
+  }
+
+  @FunctionalInterface
+  public interface SyntheticKindSelector {
+    SyntheticKind select(SyntheticNaming naming);
+  }
+
+  /**
+   * Ensure that a fixed synthetic class exists.
+   *
+   * <p>This method is thread safe and will synchronize based on the context of the fixed synthetic.
+   */
+  @SuppressWarnings("ArgumentSelectionDefectChecker")
+  public DexProgramClass ensureFixedClass(
+      SyntheticKindSelector kindSelector,
+      DexClass context,
+      AppView<?> appView,
+      Consumer<SyntheticProgramClassBuilder> fn,
+      Consumer<DexProgramClass> onCreationConsumer) {
+    SyntheticKind kind = kindSelector.select(naming);
+    assert kind.isFixedSuffixSynthetic();
+    Consumer<DexProgramClass> onReferencingContextConsumer = ConsumerUtils.emptyConsumer();
+    SynthesizingContext outerContext = internalGetOuterContext(context, appView);
+    return internalEnsureFixedProgramClass(
+        kind, fn, onCreationConsumer, onReferencingContextConsumer, outerContext, appView);
+  }
+
+  public ProgramMethod ensureFixedClassMethod(
+      DexString name,
+      DexProto proto,
+      SyntheticKindSelector kindSelector,
+      ProgramOrClasspathDefinition context,
+      AppView<?> appView,
+      Consumer<SyntheticProgramClassBuilder> buildClassCallback,
+      Consumer<SyntheticMethodBuilder> buildMethodCallback) {
+    return ensureFixedClassMethod(
+        name,
+        proto,
+        kindSelector,
+        context,
+        appView,
+        buildClassCallback,
+        buildMethodCallback,
+        emptyConsumer());
+  }
+
+  public ProgramMethod ensureFixedClassMethod(
+      DexString name,
+      DexProto proto,
+      SyntheticKindSelector kindSelector,
+      ProgramOrClasspathDefinition context,
+      AppView<?> appView,
+      Consumer<SyntheticProgramClassBuilder> buildClassCallback,
+      Consumer<SyntheticMethodBuilder> buildMethodCallback,
+      Consumer<ProgramMethod> newMethodCallback) {
+    SyntheticKind kind = kindSelector.select(naming);
+    DexProgramClass clazz =
+        ensureFixedClass(
+            kindSelector, context.getContextClass(), appView, buildClassCallback, emptyConsumer());
+    DexMethod methodReference = appView.dexItemFactory().createMethod(clazz.getType(), proto, name);
+    DexEncodedMethod methodDefinition =
+        internalEnsureMethod(
+            methodReference, clazz, kind, appView, buildMethodCallback, newMethodCallback);
+    return new ProgramMethod(clazz, methodDefinition);
+  }
+
+  private void errorOnInvalidSyntheticEnsure(DexClass dexClass, String kind, AppView<?> appView) {
+    String classKind =
+        dexClass.isProgramClass()
+            ? "program"
+            : dexClass.isClasspathClass() ? "classpath" : "library";
+    throw appView
+        .reporter()
+        .fatalError(
+            "Cannot ensure "
+                + dexClass.type
+                + " as a synthetic "
+                + kind
+                + " class, because it is already a "
+                + classKind
+                + " class.");
+  }
+
+  private DexClasspathClass internalEnsureFixedClasspathClass(
+      SyntheticKind kind,
+      Consumer<SyntheticClasspathClassBuilder> classConsumer,
+      Consumer<DexClasspathClass> onCreationConsumer,
+      SynthesizingContext outerContext,
+      AppView<?> appView,
+      DesugaredLibraryTypeRewriter typeRewriter) {
+    Function<SynthesizingContext, DexType> contextToType =
+        c -> SyntheticNaming.createFixedType(kind, c, appView.dexItemFactory());
+    DexType type = contextToType.apply(outerContext);
+    synchronized (type) {
+      DexClass clazz = appView.appInfo().definitionForWithoutExistenceAssert(type);
+      if (clazz != null) {
+        if (!clazz.isClasspathClass()) {
+          errorOnInvalidSyntheticEnsure(clazz, "classpath", appView);
+        }
+        return clazz.asClasspathClass();
+      }
+      registerSyntheticTypeRewriting(outerContext, contextToType, type, typeRewriter);
+      SyntheticClasspathClassBuilder classBuilder =
+          new SyntheticClasspathClassBuilder(type, kind, outerContext, appView.dexItemFactory());
+      classConsumer.accept(classBuilder);
+      DexClasspathClass definition = classBuilder.build();
+      addPendingDefinition(new SyntheticClasspathClassDefinition(kind, outerContext, definition));
+      onCreationConsumer.accept(definition);
+      return definition;
+    }
+  }
+
+  public DexClasspathClass ensureFixedClasspathClassFromType(
+      SyntheticKindSelector kindSelector,
+      DexType contextType,
+      AppView<?> appView,
+      Consumer<SyntheticClasspathClassBuilder> classConsumer,
+      Consumer<DexClasspathClass> onCreationConsumer) {
+    SyntheticKind kind = kindSelector.select(naming);
+    SynthesizingContext outerContext = SynthesizingContext.fromType(contextType);
+    return internalEnsureFixedClasspathClass(
+        kind,
+        classConsumer,
+        onCreationConsumer,
+        outerContext,
+        appView,
+        appView.options().getLibraryDesugaringOptions().getTypeRewriter());
+  }
+
+  public DexClasspathClass ensureFixedClasspathClass(
+      SyntheticKindSelector kindSelector,
+      ClasspathOrLibraryClass context,
+      AppView<?> appView,
+      Consumer<SyntheticClasspathClassBuilder> classConsumer,
+      Consumer<DexClasspathClass> onCreationConsumer) {
+    return ensureFixedClasspathClass(
+        kindSelector,
+        context,
+        appView,
+        classConsumer,
+        onCreationConsumer,
+        appView.options().getLibraryDesugaringOptions().getTypeRewriter());
+  }
+
+  public DexClasspathClass ensureFixedClasspathClass(
+      SyntheticKindSelector kindSelector,
+      ClasspathOrLibraryClass context,
+      AppView<?> appView,
+      Consumer<SyntheticClasspathClassBuilder> classConsumer,
+      Consumer<DexClasspathClass> onCreationConsumer,
+      DesugaredLibraryTypeRewriter typeRewriter) {
+    // Obtain the outer synthesizing context in the case the context itself is synthetic.
+    // This is to ensure a flat input-type -> synthetic-item mapping.
+    SynthesizingContext outerContext = SynthesizingContext.fromNonSyntheticInputContext(context);
+    return internalEnsureFixedClasspathClass(
+        kindSelector.select(naming),
+        classConsumer,
+        onCreationConsumer,
+        outerContext,
+        appView,
+        typeRewriter);
+  }
+
+  public ClasspathMethod ensureFixedClasspathMethodFromType(
+      DexString methodName,
+      DexProto methodProto,
+      SyntheticKindSelector kindSelector,
+      DexType contextType,
+      AppView<?> appView,
+      Consumer<SyntheticClasspathClassBuilder> classConsumer,
+      Consumer<DexClasspathClass> onCreationConsumer,
+      Consumer<SyntheticMethodBuilder> buildMethodCallback) {
+    DexClasspathClass clazz =
+        ensureFixedClasspathClassFromType(
+            kindSelector, contextType, appView, classConsumer, onCreationConsumer);
+    return internalEnsureFixedClasspathMethod(
+        methodName, methodProto, kindSelector.select(naming), appView, buildMethodCallback, clazz);
+  }
+
+  public ClasspathMethod ensureFixedClasspathClassMethod(
+      DexString methodName,
+      DexProto methodProto,
+      SyntheticKindSelector kindSelector,
+      ClasspathOrLibraryClass context,
+      AppView<?> appView,
+      Consumer<SyntheticClasspathClassBuilder> buildClassCallback,
+      Consumer<DexClasspathClass> onClassCreationCallback,
+      Consumer<SyntheticMethodBuilder> buildMethodCallback,
+      DesugaredLibraryTypeRewriter typeRewriter) {
+    DexClasspathClass clazz =
+        ensureFixedClasspathClass(
+            kindSelector,
+            context,
+            appView,
+            buildClassCallback,
+            onClassCreationCallback,
+            typeRewriter);
+    return internalEnsureFixedClasspathMethod(
+        methodName, methodProto, kindSelector.select(naming), appView, buildMethodCallback, clazz);
+  }
+
+  private ClasspathMethod internalEnsureFixedClasspathMethod(
+      DexString methodName,
+      DexProto methodProto,
+      SyntheticKind kind,
+      AppView<?> appView,
+      Consumer<SyntheticMethodBuilder> buildMethodCallback,
+      DexClasspathClass clazz) {
+    DexMethod methodReference =
+        appView.dexItemFactory().createMethod(clazz.getType(), methodProto, methodName);
+    DexEncodedMethod methodDefinition =
+        internalEnsureMethod(
+            methodReference,
+            clazz,
+            kind,
+            appView,
+            methodBuilder -> {
+              // For class path classes we always disable api level checks because we never trace
+              // the code and it cannot be inlined.
+              buildMethodCallback.accept(methodBuilder.disableAndroidApiLevelCheck());
+            },
+            emptyConsumer());
+    return new ClasspathMethod(clazz, methodDefinition);
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T extends DexClassAndMethod> DexEncodedMethod internalEnsureMethod(
+      DexMethod methodReference,
+      DexClass clazz,
+      SyntheticKind kind,
+      AppView<?> appView,
+      Consumer<SyntheticMethodBuilder> buildMethodCallback,
+      Consumer<T> newMethodCallback) {
+    MethodCollection methodCollection = clazz.getMethodCollection();
+    synchronized (methodCollection) {
+      DexEncodedMethod methodDefinition = methodCollection.getMethod(methodReference);
+      if (methodDefinition != null) {
+        return methodDefinition;
+      }
+      SyntheticMethodBuilder builder =
+          new SyntheticMethodBuilder(appView.dexItemFactory(), clazz.getType(), kind);
+      builder.setName(methodReference.getName());
+      builder.setProto(methodReference.getProto());
+      buildMethodCallback.accept(builder);
+      methodDefinition = builder.build(clazz.getKind());
+      methodCollection.addMethod(methodDefinition);
+      newMethodCallback.accept((T) DexClassAndMethod.create(clazz, methodDefinition));
+      return methodDefinition;
+    }
+  }
+
+  public DexProgramClass ensureGlobalClass(
+      Supplier<MissingGlobalSyntheticsConsumerDiagnostic> diagnosticSupplier,
+      SyntheticKindSelector kindSelector,
+      DexType globalType,
+      Collection<? extends ProgramDefinition> contexts,
+      AppView<?> appView,
+      Consumer<SyntheticProgramClassBuilder> fn,
+      Consumer<DexProgramClass> onCreationConsumer) {
+    return ensureGlobalClass(
+        diagnosticSupplier,
+        kindSelector,
+        globalType,
+        contexts,
+        appView,
+        fn,
+        onCreationConsumer,
+        ConsumerUtils.emptyConsumer());
+  }
+
+  public DexProgramClass ensureGlobalClass(
+      Supplier<MissingGlobalSyntheticsConsumerDiagnostic> diagnosticSupplier,
+      SyntheticKindSelector kindSelector,
+      DexType globalType,
+      Collection<? extends ProgramDefinition> contexts,
+      AppView<?> appView,
+      Consumer<SyntheticProgramClassBuilder> fn,
+      Consumer<DexProgramClass> onCreationConsumer,
+      Consumer<DexProgramClass> onReferencingContextConsumer) {
+    SyntheticKind kind = kindSelector.select(naming);
+    assert kind.isGlobal();
+    assert !contexts.isEmpty();
+    if (appView.options().intermediate && !appView.options().hasGlobalSyntheticsConsumer()) {
+      throw appView.reporter().fatalError(diagnosticSupplier.get());
+    }
+    // A global type is its own context.
+    SynthesizingContext outerContext = SynthesizingContext.fromType(globalType);
+    DexProgramClass globalSynthetic =
+        internalEnsureFixedProgramClass(
+            kind, fn, onReferencingContextConsumer, onCreationConsumer, outerContext, appView);
+    Consumer<DexProgramClass> globalSyntheticCreatedCallback =
+        appView.options().testing.globalSyntheticCreatedCallback;
+    if (globalSyntheticCreatedCallback != null) {
+      // These are also reported in the writer to ensure transitive classes are reported too.
+      // However, we keep the test reporting here too to fail fast on direct globals.
+      globalSyntheticCreatedCallback.accept(globalSynthetic);
+    }
+    addGlobalContexts(globalSynthetic.getType(), contexts);
+    return globalSynthetic;
+  }
+
+  /** Create a single synthetic method item. */
+  public ProgramMethod createMethod(
+      SyntheticKindSelector kindSelector,
+      UniqueContext context,
+      AppView<?> appView,
+      Consumer<SyntheticMethodBuilder> fn) {
+    return createMethod(
+        kindSelector, context.getClassContext(), appView, fn, context::getSyntheticSuffix);
+  }
+
+  private ProgramMethod createMethod(
+      SyntheticKindSelector kindSelector,
+      ProgramDefinition context,
+      AppView<?> appView,
+      Consumer<SyntheticMethodBuilder> fn,
+      Supplier<String> syntheticIdSupplier) {
+    // Obtain the outer synthesizing context in the case the context itself is synthetic.
+    // This is to ensure a flat input-type -> synthetic-item mapping.
+    SynthesizingContext outerContext = getSynthesizingContext(context, appView);
+    SyntheticKind kind = kindSelector.select(naming);
+    DexType type =
+        SyntheticNaming.createInternalType(kind, outerContext, syntheticIdSupplier.get(), appView);
+
+    SyntheticProgramClassBuilder classBuilder =
+        new SyntheticProgramClassBuilder(type, kind, outerContext, appView.dexItemFactory());
+    DexProgramClass clazz =
+        classBuilder
+            .addMethod(fn.andThen(m -> m.setName(SyntheticNaming.INTERNAL_SYNTHETIC_METHOD_NAME)))
+            .build();
+    ProgramMethod method = new ProgramMethod(clazz, clazz.methods().iterator().next());
+    addPendingDefinition(new SyntheticMethodDefinition(kind, outerContext, method));
+    return method;
+  }
+
+  private void addPendingDefinition(SyntheticDefinition<?, ?, ?> definition) {
+    pending.definitions.put(definition.getHolder().getType(), definition);
+  }
+
+  private void addGlobalContexts(
+      DexType globalType, Collection<? extends ProgramDefinition> contexts) {
+    globalContexts.addGlobalContexts(globalType, contexts);
+  }
+
+  // Commit of the synthetic items to a new fully populated application.
+
+  public CommittedItems commit(DexApplication application, Timing timing) {
+    return commitPrunedItems(PrunedItems.empty(application), timing);
+  }
+
+  public CommittedItems commitPrunedItems(PrunedItems prunedItems, Timing timing) {
+    return commit(
+        prunedItems,
+        pending,
+        globalContexts,
+        committed,
+        finalized,
+        state,
+        globalSyntheticsStrategy,
+        timing);
+  }
+
+  public CommittedItems commitRewrittenWithLens(
+      DexApplication application, NonIdentityGraphLens lens, Timing timing) {
+    timing.begin("Rewrite SyntheticItems");
+    assert pending.verifyNotRewritten(lens);
+    CommittedItems committedItems =
+        commit(
+            PrunedItems.empty(application),
+            pending,
+            globalContexts,
+            committed.rewriteWithLens(lens, timing),
+            finalized.rewriteWithLens(lens, timing),
+            state,
+            globalSyntheticsStrategy,
+            timing);
+    timing.end();
+    return committedItems;
+  }
+
+  private static CommittedItems commit(
+      PrunedItems prunedItems,
+      PendingSynthetics pending,
+      ContextsForGlobalSynthetics globalContexts,
+      CommittedSyntheticsCollection committed,
+      CommittedSyntheticsCollection finalized,
+      State state,
+      GlobalSyntheticsStrategy globalSyntheticsStrategy,
+      Timing timing) {
+    DexApplication application = prunedItems.getPrunedApp();
+    Set<DexType> removedClasses = prunedItems.getRemovedClasses();
+    CommittedSyntheticsCollection.Builder committedBuilder = committed.builder();
+    // Compute the synthetic additions and add them to the application.
+    ImmutableList<DexType> committedProgramTypes;
+    DexApplication amendedApplication;
+    if (pending.isEmpty()) {
+      committedProgramTypes = ImmutableList.of();
+      amendedApplication = application;
+    } else {
+      DexApplication.Builder<?, ?> appBuilder = application.builder();
+      ImmutableList.Builder<DexType> committedProgramTypesBuilder = ImmutableList.builder();
+      for (SyntheticDefinition<?, ?, ?> definition : pending.definitions.values()) {
+        if (!removedClasses.contains(definition.getHolder().getType())) {
+          if (definition.isProgramDefinition()) {
+            committedProgramTypesBuilder.add(definition.getHolder().getType());
+            if (definition.getKind().isMayOverridesNonProgramType()) {
+              appBuilder.addProgramClassPotentiallyOverridingNonProgramClass(
+                  definition.asProgramDefinition().getHolder());
+            } else {
+              appBuilder.addProgramClass(definition.asProgramDefinition().getHolder());
+            }
+          } else {
+            assert definition.isClasspathDefinition();
+            appBuilder.addClasspathClass(definition.asClasspathDefinition().getHolder());
+          }
+          committedBuilder.addItem(definition);
+        }
+      }
+      committedBuilder.addGlobalContexts(globalContexts);
+      committedProgramTypes = committedProgramTypesBuilder.build();
+      amendedApplication = appBuilder.build(timing);
+    }
+    return new CommittedItems(
+        state,
+        amendedApplication,
+        committedBuilder.build().pruneItems(prunedItems),
+        finalized.pruneItems(prunedItems),
+        committedProgramTypes,
+        globalSyntheticsStrategy);
+  }
+
+  public void writeAttributeIfIntermediateSyntheticClass(
+      ClassWriter writer, DexProgramClass clazz, AppView<?> appView) {
+    assert committed.isEmpty();
+    if (appView.options().testing.disableSyntheticMarkerAttributeWriting) {
+      return;
+    }
+    if (!appView.options().intermediate || !appView.options().isGeneratingClassFiles()) {
+      return;
+    }
+    Iterator<SyntheticReference<?, ?, ?>> it = finalized.getItems(clazz.getType()).iterator();
+    if (it.hasNext()) {
+      SyntheticKind kind = it.next().getKind();
+      // When compiling intermediates there should not be any mergings as they may invalidate the
+      // single kind of a synthetic which is required for marking synthetics. This check could be
+      // relaxed to ensure that all kinds are equivalent if merging is possible.
+      assert !it.hasNext();
+      SyntheticMarker.writeMarkerAttribute(writer, kind, appView.getSyntheticItems());
+    }
+  }
+
+  // Finalization of synthetic items.
+
+  Result computeFinalSynthetics(AppView<?> appView, Timing timing) {
+    assert !hasPendingSyntheticClasses();
+    return new SyntheticFinalization(this, committed, finalized)
+        .computeFinalSynthetics(appView, timing);
+  }
+
+  public void reportSyntheticsInformation(SyntheticInfoConsumer consumer) {
+    assert isFinalized();
+    assert committed.isEmpty();
+    Map<DexType, DexType> seen = new IdentityHashMap<>();
+    finalized.forEachItem(
+        ref -> {
+          DexType holder = ref.getHolder();
+          DexType context = ref.getContext().getSynthesizingContextType();
+          DexType old = seen.put(holder, context);
+          assert old == null || old.isIdenticalTo(context);
+          if (old == null) {
+            consumer.acceptSyntheticInfo(new SyntheticInfoConsumerDataImpl(holder, context));
+          }
+        });
+  }
+
+  private static class SyntheticInfoConsumerDataImpl implements SyntheticInfoConsumerData {
+
+    private final DexType holder;
+    private final DexType context;
+
+    public SyntheticInfoConsumerDataImpl(DexType holder, DexType context) {
+      this.holder = holder;
+      this.context = context;
+    }
+
+    @Override
+    public ClassReference getSyntheticClass() {
+      return Reference.classFromDescriptor(holder.toDescriptorString());
+    }
+
+    @Override
+    public ClassReference getSynthesizingContextClass() {
+      return Reference.classFromDescriptor(context.toDescriptorString());
+    }
+  }
+}

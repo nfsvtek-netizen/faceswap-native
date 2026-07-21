@@ -1,0 +1,42 @@
+// Copyright (c) 2026, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.libanalyzer.utils;
+
+import com.android.tools.r8.libanalyzer.proto.LibraryAnalyzerResult;
+import com.android.tools.r8.threading.ThreadingModule;
+import com.android.tools.r8.utils.AndroidApiLevel;
+import com.android.tools.r8.utils.Reporter;
+import java.nio.file.Path;
+import java.util.function.Consumer;
+
+public class LibraryAnalyzerOptions {
+
+  public final Path keepRadiusDataOutputPath;
+  public final AndroidApiLevel minApiLevel;
+  public final Consumer<LibraryAnalyzerResult> outputConsumer;
+  public final Reporter reporter;
+  public final int threadCount;
+
+  private ThreadingModule lazyThreadingModule = null;
+
+  public LibraryAnalyzerOptions(
+      Path keepRadiusDataOutputPath,
+      AndroidApiLevel minApiLevel,
+      Consumer<LibraryAnalyzerResult> outputConsumer,
+      Reporter reporter,
+      int threadCount) {
+    this.keepRadiusDataOutputPath = keepRadiusDataOutputPath;
+    this.minApiLevel = minApiLevel;
+    this.outputConsumer = outputConsumer;
+    this.reporter = reporter;
+    this.threadCount = threadCount;
+  }
+
+  public ThreadingModule getThreadingModule() {
+    if (lazyThreadingModule == null) {
+      lazyThreadingModule = ThreadingModule.Loader.load().create();
+    }
+    return lazyThreadingModule;
+  }
+}

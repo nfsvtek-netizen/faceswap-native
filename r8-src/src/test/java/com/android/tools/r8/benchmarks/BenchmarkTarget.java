@@ -1,0 +1,29 @@
+// Copyright (c) 2022, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.benchmarks;
+
+public enum BenchmarkTarget {
+
+  // Possible dashboard targets on golem.
+  // WARNING: make sure the id-name is 1:1 with tools/run_benchmark.py!
+  D8("d8", "D8"),
+  R8("r8-full", "R8-full"),
+  RETRACE("retrace", "retrace");
+
+  private final String idName;
+  private final String golemName;
+
+  BenchmarkTarget(String idName, String golemName) {
+    this.idName = idName;
+    this.golemName = golemName;
+  }
+
+  public String getGolemName() {
+    return golemName;
+  }
+
+  public String getIdentifierName() {
+    return idName;
+  }
+}

@@ -1,0 +1,97 @@
+// Copyright (c) 2022, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.ir.optimize;
+
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClassAndMethod;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.code.BasicBlock;
+import com.android.tools.r8.ir.code.IRCode;
+import com.android.tools.r8.ir.code.InstructionListIterator;
+import com.android.tools.r8.ir.code.InvokeMethod;
+import com.android.tools.r8.ir.code.Value;
+
+public class CheckNotNullConverter {
+
+  public static void runIfNecessary(AppView<?> appView, IRCode code) {
+    if (appView.enableWholeProgramOptimizations()) {
+      assert code.isConsistentSSA(appView);
+      run(appView.withClassHierarchy(), code);
+      assert code.isConsistentSSA(appView);
+    }
+  }
+
+  /**
+   * Replace all calls to methods marked as a check-not-null method by a call to Object.getClass(),
+   * using the first argument as the receiver for the new call.
+   *
+   * <p>If the invoke has an out-value, the out-value is replaced by the first argument to allow
+   * removing the invoke.
+   */
+  private static void run(AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code) {
+    AffectedValues affectedValues = new AffectedValues();
+    boolean changed = false;
+    for (BasicBlock block : code.getBlocks()) {
+      InstructionListIterator instructionIterator = block.listIterator();
+      while (instructionIterator.hasNext()) {
+        InvokeMethod instruction = instructionIterator.next().asInvokeMethod();
+        if (instruction != null) {
+          if (rewriteInvoke(appView, code, instructionIterator, instruction, affectedValues)) {
+            changed = true;
+          }
+        }
+      }
+    }
+    if (changed) {
+      code.removeRedundantBlocks();
+    }
+    affectedValues.narrowingWithAssumeRemoval(appView, code);
+  }
+
+  static boolean kotlinNullCheckLedgibleForMessageRemoval(
+      AppView<? extends AppInfoWithClassHierarchy> appView, DexMethod method) {
+    return appView
+            .options()
+            .getProguardConfiguration()
+            .getProcessKotlinNullChecks()
+            .isRemoveMessage()
+        && appView.dexItemFactory().kotlin().intrinsics().isNullCheck(method);
+  }
+
+  private static boolean canConvertNullCheck(
+      AppView<? extends AppInfoWithClassHierarchy> appView, DexClassAndMethod singleTarget) {
+    return singleTarget.getOptimizationInfo().isConvertCheckNotNull()
+        || kotlinNullCheckLedgibleForMessageRemoval(appView, singleTarget.getReference());
+  }
+
+  private static boolean rewriteInvoke(
+      AppView<? extends AppInfoWithClassHierarchy> appView,
+      IRCode code,
+      InstructionListIterator instructionIterator,
+      InvokeMethod invoke,
+      AffectedValues affectedValues) {
+    ProgramMethod context = code.context();
+    DexClassAndMethod singleTarget = invoke.lookupSingleTarget(appView, context);
+    if (singleTarget == null || !canConvertNullCheck(appView, singleTarget)) {
+      return false;
+    }
+    Value checkNotNullValue = invoke.getFirstNonReceiverArgument();
+    if (invoke.hasUsedOutValue()) {
+      invoke.outValue().replaceUsers(checkNotNullValue, affectedValues);
+    }
+    if (appView
+            .getAssumeInfoCollection()
+            .getMethod(singleTarget, invoke, context)
+            .isSideEffectFree()
+        || checkNotNullValue.getType().nullability().isDefinitelyNotNull()) {
+      instructionIterator.removeOrReplaceByDebugLocalRead();
+    } else {
+      instructionIterator.replaceCurrentInstructionWithNullCheck(appView, checkNotNullValue);
+    }
+    return true;
+  }
+}

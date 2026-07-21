@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+# Copyright (c) 2025, the R8 project authors. Please see the AUTHORS file
+# for details. All rights reserved. Use of this source code is governed by a
+# BSD-style license that can be found in the LICENSE file.
+
+import argparse
+import os
+import shutil
+import sys
+import utils
+
+KOTLIN_EXTENSION = '.kt'
+
+
+def parse_options():
+    parser = argparse.ArgumentParser(
+        description='Update androidx keep annotations')
+    parser.add_argument('--androidx',
+                        metavar='<path>',
+                        required=True,
+                        help='Path to the androidx checkout')
+    parser.add_argument('--dry-run',
+                        '--dry_run',
+                        help="Don't copy, just print what to copy",
+                        default=False,
+                        action='store_true')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_options()
+
+    source_dir = os.path.join(utils.REPO_ROOT, 'src', 'keepanno', 'java',
+                              'androidx', 'annotation', 'keep')
+    dest_dir = os.path.join(args.androidx, 'frameworks', 'support',
+                            'annotation', 'annotation-keep', 'src',
+                            'commonMain', 'kotlin', 'androidx', 'annotation',
+                            'keep')
+
+    for root, dir_names, filenames in os.walk(source_dir):
+        if root != source_dir:
+            print('Unexpected subdirectory under {source_dir}.'.format(
+                source_dir=source_dir))
+        if len(dir_names) > 0:
+            print('Unexpected subdirectories under {dir_names}.'.format(
+                dir_names=dir_names))
+        for filename in filenames:
+            if not filename.endswith(KOTLIN_EXTENSION):
+                print('Unexpected non Kotlin file {filename}.'.format(
+                    filename=os.path.join(root, filename)))
+                sys.exit(1)
+
+            files = (
+                'UnconditionallyKeep.kt',
+                'Unspecified.kt',
+                'UsesReflectionToAccessField.kt',
+                'UsesReflectionToAccessMethod.kt',
+                'UsesReflectionToConstruct.kt',
+            )
+            if not filename in files:
+                print('Skipping {filename}'.format(filename=filename))
+                continue
+
+            src = os.path.join(root, filename)
+            dest = os.path.join(dest_dir, filename)
+            print("Copying '{src}' to '{dest}'".format(src=src, dest=dest))
+            if not args.dry_run:
+                shutil.copyfile(src, dest)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

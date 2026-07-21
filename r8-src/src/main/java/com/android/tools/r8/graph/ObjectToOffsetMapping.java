@@ -1,0 +1,480 @@
+// Copyright (c) 2016, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.graph;
+
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+
+import com.android.tools.r8.dex.Constants;
+import com.android.tools.r8.dex.VirtualFile;
+import com.android.tools.r8.errors.CompilationError;
+import com.android.tools.r8.graph.lens.GraphLens;
+import com.android.tools.r8.ir.conversion.LensCodeRewriterUtils;
+import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.profile.startup.profile.StartupProfile;
+import com.android.tools.r8.utils.internal.Box;
+import com.android.tools.r8.utils.internal.ConsumerUtils;
+import com.android.tools.r8.utils.structural.CompareToVisitor;
+import com.android.tools.r8.utils.structural.CompareToVisitorWithStringTable;
+import com.android.tools.r8.utils.structural.CompareToVisitorWithTypeTable;
+import com.android.tools.r8.utils.structural.StructuralItem;
+import com.android.tools.r8.utils.timing.Timing;
+import it.unimi.dsi.fastutil.objects.Reference2IntLinkedOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Reference2IntMap;
+import it.unimi.dsi.fastutil.objects.Reference2IntMap.Entry;
+import it.unimi.dsi.fastutil.objects.Reference2IntOpenHashMap;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
+
+public class ObjectToOffsetMapping {
+
+  private final static int NOT_FOUND = -1;
+
+  private final int lazyDexStringsCount;
+  private final AppView<?> appView;
+  private final GraphLens graphLens;
+  private final NamingLens namingLens;
+  private final LensCodeRewriterUtils lensCodeRewriter;
+  private final Map<String, DexString> shortyCache;
+
+  // Sorted collection of objects mapped to their offsets.
+  private final DexProgramClass[] classes;
+  private final Reference2IntLinkedOpenHashMap<DexProto> protos;
+  private final Reference2IntLinkedOpenHashMap<DexType> types;
+  private final Reference2IntLinkedOpenHashMap<DexMethod> methods;
+  private final Reference2IntLinkedOpenHashMap<DexField> fields;
+  // Non-final to support (order consistent) reindexing in case of lazy computed strings.
+  private Reference2IntLinkedOpenHashMap<DexString> strings;
+  private final Reference2IntLinkedOpenHashMap<DexCallSite> callSites;
+  private final Reference2IntLinkedOpenHashMap<DexMethodHandle> methodHandles;
+
+  private DexString firstConstString16;
+  private DexString firstConstString17;
+
+  private final CompareToVisitor compareToVisitor;
+
+  public ObjectToOffsetMapping(
+      AppView<?> appView,
+      ObjectToOffsetMapping sharedMapping,
+      LensCodeRewriterUtils lensCodeRewriter,
+      Set<DexProgramClass> classes,
+      Collection<DexProto> protos,
+      Collection<DexType> types,
+      Collection<DexMethod> methods,
+      Collection<DexField> fields,
+      Collection<DexString> strings,
+      Collection<DexCallSite> callSites,
+      Collection<DexMethodHandle> methodHandles,
+      int lazyDexStringsCount,
+      Map<String, DexString> shortyCache,
+      StartupProfile startupProfile,
+      VirtualFile virtualFile,
+      Timing timing) {
+    assert appView != null;
+    assert classes != null;
+    assert protos != null;
+    assert types != null;
+    assert methods != null;
+    assert fields != null;
+    assert strings != null;
+    assert callSites != null;
+    assert methodHandles != null;
+    this.lazyDexStringsCount = lazyDexStringsCount;
+    this.appView = appView;
+    this.graphLens = appView.graphLens();
+    this.namingLens = appView.getNamingLens();
+    this.lensCodeRewriter = lensCodeRewriter;
+    this.shortyCache = shortyCache;
+    timing.begin("Sort strings");
+    if (sharedMapping == null) {
+      this.strings =
+          createSortedMap(
+              strings,
+              DexString::compareTo,
+              this::setFirstConstString16,
+              this::setFirstConstString17,
+              lazyDexStringsCount);
+    } else {
+      this.strings = sharedMapping.strings;
+      this.firstConstString16 = sharedMapping.firstConstString16;
+      this.firstConstString17 = sharedMapping.firstConstString17;
+    }
+    CompareToVisitor visitor =
+        new CompareToVisitorWithStringTable(namingLens, this.strings::getInt);
+    timing.end();
+    timing.begin("Sort types");
+    this.types = createSortedMap(types, compare(visitor), this::failOnOverflow);
+    visitor =
+        new CompareToVisitorWithTypeTable(namingLens, this.strings::getInt, this.types::getInt);
+    timing.end();
+    timing.begin("Sort classes");
+    this.classes =
+        appView.testing().enableLegacyClassDefOrdering
+            ? sortClassesLegacy(classes, visitor)
+            : sortClasses(classes, startupProfile, virtualFile, visitor);
+    timing.end();
+    timing.begin("Sort protos");
+    this.protos = createSortedMap(protos, compare(visitor), this::failOnOverflow);
+    timing.end();
+    timing.begin("Sort methods");
+    this.methods = createSortedMap(methods, compare(visitor), this::failOnOverflow);
+    timing.end();
+    timing.begin("Sort fields");
+    this.fields = createSortedMap(fields, compare(visitor), this::failOnOverflow);
+    timing.end();
+    timing.begin("Sort call-sites");
+    this.callSites = createSortedMap(callSites, compare(visitor), this::failOnOverflow);
+    timing.end();
+    timing.begin("Sort method handles");
+    this.methodHandles = createSortedMap(methodHandles, compare(visitor), this::failOnOverflow);
+    timing.end();
+
+    ObjectToOffsetMapping mapping = this;
+    compareToVisitor =
+        new CompareToVisitorWithTypeTable(namingLens, this.strings::getInt, this.types::getInt) {
+
+          @Override
+          public int visitDexField(DexField field1, DexField field2) {
+            return Integer.compare(mapping.fields.getInt(field1), mapping.fields.getInt(field2));
+          }
+
+          @Override
+          public int visitDexMethod(DexMethod method1, DexMethod method2) {
+            return Integer.compare(
+                mapping.methods.getInt(method1), mapping.methods.getInt(method2));
+          }
+        };
+  }
+
+  public void computeAndReindexForLazyDexStrings(List<DexString> forcedStrings) {
+    assert lazyDexStringsCount == forcedStrings.size();
+    if (forcedStrings.isEmpty()) {
+      return;
+    }
+    // If there are any lazy strings we need to recompute the offsets, even if the strings
+    // are already in the set as we have shifted the initial offset by the size of lazy strings.
+    for (DexString forcedString : forcedStrings) {
+      // Amend the string table to ensure all strings are now present.
+      if (forcedString != null) {
+        strings.put(forcedString, -1);
+      }
+    }
+    Box<DexString> newConstString16 = new Box<>();
+    Box<DexString> newConstStringJumbo = new Box<>();
+    strings =
+        createSortedMap(
+            strings.keySet(),
+            DexString::compareTo,
+            newConstString16::set,
+            newConstStringJumbo::set,
+            0);
+    // After reindexing it must hold that the new const-string/16 and const-string/jumbo start is on
+    // the same or a larger string. The new string cut-offs are not set as the first determined
+    // strings are still the cut-off point where const-string/16 and const-string/jumbo instructions
+    // are used.
+    assert getFirstConstString16() == null
+        || newConstString16.get().isGreaterThanOrEqualTo(getFirstConstString16());
+    assert getFirstConstString17() == null
+        || newConstStringJumbo.get().isGreaterThanOrEqualTo(getFirstConstString17());
+  }
+
+  public CompareToVisitor getCompareToVisitor() {
+    return compareToVisitor;
+  }
+
+  private <T extends StructuralItem<T>> Comparator<T> compare(CompareToVisitor visitor) {
+    return (a, b) -> a.acceptCompareTo(b, visitor);
+  }
+
+  private void failOnOverflow(DexItem item) {
+    throw new CompilationError("Index overflow for " + item.getClass());
+  }
+
+  private <T> Reference2IntLinkedOpenHashMap<T> createSortedMap(
+      Collection<T> items, Comparator<T> comparator, Consumer<T> onUInt16Overflow) {
+    return createSortedMap(items, comparator, onUInt16Overflow, ConsumerUtils.emptyConsumer(), 0);
+  }
+
+  private <T> Reference2IntLinkedOpenHashMap<T> createSortedMap(
+      Collection<T> items,
+      Comparator<T> comparator,
+      Consumer<T> onUInt16Overflow,
+      Consumer<T> onUInt17Overflow,
+      int reservedIndicesBeforeOverflow) {
+    if (items.isEmpty()) {
+      return new Reference2IntLinkedOpenHashMap<>();
+    }
+    // Sort items and compute the offset mapping for each in sorted order.
+    ArrayList<T> sorted = new ArrayList<>(items);
+    sorted.sort(comparator);
+    Reference2IntLinkedOpenHashMap<T> map = new Reference2IntLinkedOpenHashMap<>(items.size());
+    map.defaultReturnValue(NOT_FOUND);
+    int index = 0;
+    for (T item : sorted) {
+      int offsetIndex = index + reservedIndicesBeforeOverflow;
+      if (offsetIndex == Constants.U16BIT_MAX + 1) {
+        onUInt16Overflow.accept(item);
+      } else if (offsetIndex == Constants.U17BIT_MAX + 1) {
+        onUInt17Overflow.accept(item);
+      }
+      map.put(item, index++);
+    }
+    return map;
+  }
+
+  /**
+   * Here, 'depth' of a program class is an integer one bigger then the maximum depth of its
+   * superclass and implemented interfaces. The depth of classes without any or without known
+   * superclasses and interfaces is 1.
+   */
+  private static class ProgramClassDepthsMemoized {
+
+    private final static int UNKNOWN_DEPTH = -1;
+
+    private final AppInfo appInfo;
+    private final Reference2IntMap<DexProgramClass> depthOfClasses = new Reference2IntOpenHashMap<>();
+
+    ProgramClassDepthsMemoized(AppInfo appInfo) {
+      this.appInfo = appInfo;
+      depthOfClasses.defaultReturnValue(UNKNOWN_DEPTH);
+    }
+
+    int getDepth(DexProgramClass programClass) {
+      int depth = depthOfClasses.getInt(programClass);
+
+      // TODO(b/65536002): use "computeIntIfAbsent" after upgrading to fastutils 8.x.
+      if (depth == UNKNOWN_DEPTH) {
+        // Emulating the algorithm of com.android.dx.merge.SortableType.tryAssignDepth().
+        DexType superType = programClass.superType;
+        int maxDepth;
+        if (superType == null) {
+          maxDepth = 0;
+        } else {
+          maxDepth = 1;
+          DexProgramClass superClass = appInfo.programDefinitionFor(superType, programClass);
+          if (superClass != null) {
+            maxDepth = getDepth(superClass);
+          }
+        }
+        for (DexType inf : programClass.interfaces.values) {
+          DexProgramClass infClass = appInfo.programDefinitionFor(inf, programClass);
+          maxDepth = Math.max(maxDepth, infClass == null ? 1 : getDepth(infClass));
+        }
+        depth = maxDepth + 1;
+        depthOfClasses.put(programClass, depth);
+      }
+
+      return depth;
+    }
+  }
+
+  private DexProgramClass[] sortClassesLegacy(
+      Set<DexProgramClass> classes, CompareToVisitor visitor) {
+    // Collect classes in subtyping order, based on a sorted list of classes to start with.
+    ProgramClassDepthsMemoized classDepths = new ProgramClassDepthsMemoized(appView.appInfo());
+    DexProgramClass[] sortedClasses = classes.toArray(DexProgramClass.EMPTY_ARRAY);
+    Arrays.sort(
+        sortedClasses,
+        (x, y) -> {
+          int dx = classDepths.getDepth(x);
+          int dy = classDepths.getDepth(y);
+          return dx != dy ? dx - dy : visitor.visitDexType(x.type, y.type);
+        });
+    return sortedClasses;
+  }
+
+  private DexProgramClass[] sortClasses(
+      Set<DexProgramClass> classes,
+      StartupProfile startupProfile,
+      VirtualFile virtualFile,
+      CompareToVisitor visitor) {
+    assert startupProfile.isEmpty() || virtualFile.getId() == 0;
+    // First sort the classes using the startup profile.
+    LinkedHashSet<DexProgramClass> sortedClasses = new LinkedHashSet<>(classes.size());
+    addClassesFromStartupProfile(classes, sortedClasses, startupProfile);
+    addRemainingClassesInSortedOrder(classes, sortedClasses, visitor);
+    assert classes.size() == sortedClasses.size();
+    return sortedClasses.toArray(DexProgramClass.EMPTY_ARRAY);
+  }
+
+  private void addClassesFromStartupProfile(
+      Set<DexProgramClass> classes,
+      LinkedHashSet<DexProgramClass> sortedClasses,
+      StartupProfile startupProfile) {
+    startupProfile.forEachRule(
+        rule -> {
+          DexType type = rule.getReference().getContextType().getBaseType();
+          if (type.isPrimitiveType()) {
+            assert false;
+            return;
+          }
+          assert type.isClassType();
+          DexProgramClass clazz = asProgramClassOrNull(appView.definitionFor(type));
+          if (clazz == null || !classes.contains(clazz)) {
+            return;
+          }
+          addClassAfterParentClasses(classes, sortedClasses, clazz);
+        });
+  }
+
+  private void addRemainingClassesInSortedOrder(
+      Set<DexProgramClass> classes,
+      LinkedHashSet<DexProgramClass> sortedClasses,
+      CompareToVisitor visitor) {
+    List<DexProgramClass> remainingClasses = new ArrayList<>(classes.size() - sortedClasses.size());
+    for (DexProgramClass clazz : classes) {
+      if (!sortedClasses.contains(clazz)) {
+        remainingClasses.add(clazz);
+      }
+    }
+    remainingClasses.sort((x, y) -> visitor.visitDexType(x.getType(), y.getType()));
+    remainingClasses.forEach(clazz -> addClassAfterParentClasses(classes, sortedClasses, clazz));
+  }
+
+  private void addClassAfterParentClasses(
+      Set<DexProgramClass> classes,
+      LinkedHashSet<DexProgramClass> sortedClasses,
+      DexProgramClass clazz) {
+    if (sortedClasses.contains(clazz)) {
+      return;
+    }
+    // Add the superclass and all implemented interfaces first, as this is required by the dex
+    // format.
+    clazz.forEachImmediateSuperClassMatching(
+        appView,
+        (supertype, superclass) ->
+            superclass != null
+                && superclass.isProgramClass()
+                && classes.contains(superclass.asProgramClass()),
+        (supertype, superclass) ->
+            addClassAfterParentClasses(classes, sortedClasses, superclass.asProgramClass()));
+    sortedClasses.add(clazz);
+  }
+
+  private static <T> Collection<T> keysOrEmpty(Reference2IntLinkedOpenHashMap<T> map) {
+    // The key-set is deterministic (linked) and inserted in sorted order.
+    return map == null ? Collections.emptyList() : map.keySet();
+  }
+
+  public DexItemFactory dexItemFactory() {
+    return appView.dexItemFactory();
+  }
+
+  public GraphLens getGraphLens() {
+    return graphLens;
+  }
+
+  public NamingLens getNamingLens() {
+    return namingLens;
+  }
+
+  public LensCodeRewriterUtils getLensCodeRewriter() {
+    return lensCodeRewriter;
+  }
+
+  public Collection<DexMethod> getMethods() {
+    return keysOrEmpty(methods);
+  }
+
+  public DexProgramClass[] getClasses() {
+    return classes;
+  }
+
+  public Collection<DexType> getTypes() {
+    return keysOrEmpty(types);
+  }
+
+  public Collection<DexProto> getProtos() {
+    return keysOrEmpty(protos);
+  }
+
+  public Collection<DexField> getFields() {
+    return keysOrEmpty(fields);
+  }
+
+  public Collection<DexString> getStrings() {
+    return keysOrEmpty(strings);
+  }
+
+  public Collection<DexCallSite> getCallSites() {
+    return keysOrEmpty(callSites);
+  }
+
+  public Collection<DexMethodHandle> getMethodHandles() {
+    return keysOrEmpty(methodHandles);
+  }
+
+  public DexString getShorty(DexProto proto) {
+    String shorty = proto.createShortyString();
+    return shortyCache.computeIfAbsent(shorty, appView.dexItemFactory()::createString);
+  }
+
+  public DexString getFirstConstString16() {
+    return firstConstString16;
+  }
+
+  private void setFirstConstString16(DexString string) {
+    assert firstConstString16 == null;
+    firstConstString16 = string;
+  }
+
+  public DexString getFirstConstString17() {
+    return firstConstString17;
+  }
+
+  private void setFirstConstString17(DexString string) {
+    assert firstConstString17 == null;
+    firstConstString17 = string;
+  }
+
+  public DexString getFirstString() {
+    for (Entry<DexString> dexStringEntry : strings.reference2IntEntrySet()) {
+      if (dexStringEntry.getIntValue() == 0) {
+        return dexStringEntry.getKey();
+      }
+    }
+    return null;
+  }
+
+  private <T extends IndexedDexItem> int getOffsetFor(T item, Reference2IntMap<T> map) {
+    int index = map.getInt(item);
+    assert index != NOT_FOUND : "Missing dependency: " + item;
+    return index;
+  }
+
+  public int getOffsetFor(DexProto proto) {
+    return getOffsetFor(proto, protos);
+  }
+
+  public int getOffsetFor(DexField field) {
+    return getOffsetFor(field, fields);
+  }
+
+  public int getOffsetFor(DexMethod method) {
+    return getOffsetFor(method, methods);
+  }
+
+  public int getOffsetFor(DexString string) {
+    return getOffsetFor(string, strings);
+  }
+
+  public int getOffsetFor(DexType type) {
+    return getOffsetFor(type, types);
+  }
+
+  public int getOffsetFor(DexCallSite callSite) {
+    return getOffsetFor(callSite, callSites);
+  }
+
+  public int getOffsetFor(DexMethodHandle methodHandle) {
+    return getOffsetFor(methodHandle, methodHandles);
+  }
+}

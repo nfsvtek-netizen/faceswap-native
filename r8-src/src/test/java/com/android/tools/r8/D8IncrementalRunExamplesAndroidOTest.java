@@ -1,0 +1,415 @@
+// Copyright (c) 2017, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8;
+
+import static com.android.tools.r8.ir.desugar.itf.InterfaceDesugaringForTesting.getCompanionClassNameSuffix;
+import static com.android.tools.r8.utils.internal.FileUtils.JAR_EXTENSION;
+import static org.junit.Assert.assertEquals;
+
+import com.android.tools.r8.Disassemble.DisassembleCommand;
+import com.android.tools.r8.references.ClassReference;
+import com.android.tools.r8.references.Reference;
+import com.android.tools.r8.synthesis.SyntheticItemsTestUtils;
+import com.android.tools.r8.utils.AndroidApiLevel;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.OffOrAuto;
+import com.android.tools.r8.utils.internal.Box;
+import com.android.tools.r8.utils.internal.FileUtils;
+import com.android.tools.r8.utils.internal.StringUtils;
+import com.android.tools.r8.utils.internal.exceptions.Unreachable;
+import com.google.common.collect.Lists;
+import com.google.common.io.ByteStreams;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import org.junit.Assert;
+import org.junit.Assume;
+import org.junit.Test;
+
+public abstract class D8IncrementalRunExamplesAndroidOTest
+    extends RunExamplesAndroidOTest<D8Command.Builder> {
+
+  abstract class D8IncrementalTestRunner extends TestRunner<D8IncrementalTestRunner> {
+
+    private final List<Consumer<D8TestBuilder>> testBuilderConsumers = new ArrayList<>();
+
+    D8IncrementalTestRunner(String testName, String packageName, String mainClass) {
+      super(testName, packageName, mainClass);
+    }
+
+    D8IncrementalTestRunner withBuilder(Consumer<D8TestBuilder> consumer) {
+      testBuilderConsumers.add(consumer);
+      return this;
+    }
+
+    @Override
+    D8IncrementalTestRunner withMinApiLevel(AndroidApiLevel minApiLevel) {
+      return withBuilder(builder -> builder.setMinApi(minApiLevel));
+    }
+
+    @Override
+    void build(
+        Path testJarFile, Path out, Box<SyntheticItemsTestUtils> syntheticItemsBox, OutputMode mode)
+        throws Throwable {
+      assert mode == OutputMode.DexIndexed;
+      Map<String, ProgramResource> files = compileClassesTogether(testJarFile, null);
+      mergeDexFiles(Lists.newArrayList(files.values())).writeToZip(out);
+    }
+
+    // Dex classes separately.
+    SortedMap<String, ProgramResource> compileClassesSeparately(Path testJarFile) throws Throwable {
+      TreeMap<String, ProgramResource> fileToResource = new TreeMap<>();
+      List<String> classFiles = collectClassFiles(testJarFile);
+      for (String classFile : classFiles) {
+        D8TestCompileResult compileResult =
+            compileClassFilesInIntermediate(
+                testJarFile, Collections.singletonList(classFile), null, OutputMode.DexIndexed);
+        assert compileResult.getApp().getDexProgramResourcesForTesting().size() == 1;
+        fileToResource.put(
+            makeRelative(testJarFile, Paths.get(classFile)).toString(),
+            compileResult.getApp().getDexProgramResourcesForTesting().get(0));
+      }
+      return fileToResource;
+    }
+
+    // Dex classes in one D8 invocation.
+    SortedMap<String, ProgramResource> compileClassesTogether(Path testJarFile, Path output)
+        throws Throwable {
+      TreeMap<String, ProgramResource> fileToResource = new TreeMap<>();
+      List<String> classFiles = collectClassFiles(testJarFile);
+      D8TestCompileResult compileResult =
+          compileClassFilesInIntermediate(
+              testJarFile, classFiles, output, OutputMode.DexFilePerClassFile);
+      SyntheticItemsTestUtils syntheticItems = compileResult.getSyntheticItems();
+      for (ProgramResource resource : compileResult.getApp().getDexProgramResourcesForTesting()) {
+        Set<String> descriptors = resource.getClassDescriptors();
+        String mainClassDescriptor = compileResult.getApp().getPrimaryClassDescriptor(resource);
+        Assert.assertNotNull(mainClassDescriptor);
+        for (String descriptor : descriptors) {
+          // classes are either lambda classes used by the main class, companion classes of the main
+          // interface, the main class/interface, or for JDK9, desugaring of try-with-resources.
+          ClassReference reference = Reference.classFromDescriptor(descriptor);
+          Assert.assertTrue(
+              descriptor.endsWith(getCompanionClassNameSuffix() + ";")
+                  || syntheticItems.isExternalApiOutlineClass(reference)
+                  || syntheticItems.isExternalTwrCloseMethod(reference)
+                  || syntheticItems.isMaybeExternalSuppressedExceptionMethod(reference)
+                  || syntheticItems.isExternalLambda(reference)
+                  || syntheticItems.isExternalStaticInterfaceCall(reference)
+                  || descriptor.equals(mainClassDescriptor));
+        }
+        String classDescriptor =
+            DescriptorUtils.getClassBinaryNameFromDescriptor(mainClassDescriptor);
+        String classFilePath = classDescriptor + ".class";
+        if (File.separatorChar != '/') {
+          classFilePath = classFilePath.replace('/', File.separatorChar);
+        }
+        fileToResource.put(classFilePath, resource);
+      }
+      return fileToResource;
+    }
+
+    private Path makeRelative(Path testJarFile, Path classFile) {
+      Path regularParent =
+          testJarFile.getParent().resolve(Paths.get("classes"));
+      Path legacyParent =
+          regularParent.resolve(
+              Paths.get(
+                  ToolHelper.THIRD_PARTY_DIR, regularParent.getFileName().toString() + "Legacy"));
+
+      if (classFile.startsWith(regularParent)) {
+        return regularParent.relativize(classFile);
+      }
+      Assert.assertTrue(classFile.startsWith(legacyParent));
+      return legacyParent.relativize(classFile);
+    }
+
+    private List<String> collectClassFiles(Path testJarFile) {
+      Map<String, String> result = new HashMap<>();
+      // Collect Java 8 classes.
+      visitFiles(
+          getClassesRoot(testJarFile),
+          path -> result.put(path.toFile().getName(), path.toString()));
+      // Collect generated classes, overwrite non-generated files.
+      visitFiles(
+          getGeneratedRoot(testJarFile),
+          path -> result.put(path.toFile().getName(), path.toString()));
+      // Collect legacy classes.
+      visitFiles(
+          getLegacyClassesRoot(testJarFile, packageName),
+          path -> result.put(path.toFile().getName(), path.toString()));
+      List<String> files = new ArrayList<>(result.values());
+      Collections.sort(files);
+      return files;
+    }
+
+    Path getClassesRoot(Path testJarFile) {
+      Path parent = testJarFile.getParent();
+      return parent.resolve(Paths.get("classes", packageName));
+    }
+
+    Path getGeneratedRoot(Path testJarFile) {
+      String sourceSet = testJarFile.getParent().toFile().getName();
+      return Paths.get(ToolHelper.THIRD_PARTY_DIR, sourceSet + "Generated", packageName);
+    }
+
+    D8TestCompileResult compileClassFilesInIntermediate(
+        Path testJarFile, List<String> inputFiles, Path outputPath, OutputMode outputMode)
+        throws Throwable {
+      assert builderTransformations.isEmpty();
+      assert outputMode == OutputMode.DexIndexed || outputMode == OutputMode.DexFilePerClassFile;
+      return testForD8(Backend.DEX)
+          .addProgramFiles(inputFiles.stream().map(Paths::get).collect(Collectors.toList()))
+          .addOptionsModification(this::combinedOptionConsumer)
+          .apply(
+              b -> {
+                for (Consumer<D8TestBuilder> testBuilderConsumer : testBuilderConsumers) {
+                  testBuilderConsumer.accept(b);
+                }
+                addClasspathReference(
+                    testJarFile, b::addClasspathFiles, b::addClasspathResourceProviders);
+                addLibraryReference(
+                    androidJarVersion != null || b.getMinApiLevel() >= 0
+                        ? ToolHelper.getAndroidJar(
+                            androidJarVersion != null
+                                ? androidJarVersion.getLevel()
+                                : b.getMinApiLevel())
+                        : ToolHelper.getMostRecentAndroidJar(),
+                    b::addLibraryFiles,
+                    b::addLibraryResourceProviders);
+                if (outputPath != null) {
+                  assert outputMode == OutputMode.DexFilePerClassFile;
+                  b.setProgramConsumer(
+                      FileUtils.isArchive(outputPath)
+                          ? new DexFilePerClassFileConsumer.ArchiveConsumer(outputPath)
+                          : new DexFilePerClassFileConsumer.DirectoryConsumer(outputPath));
+                } else if (outputMode == OutputMode.DexIndexed) {
+                  b.setProgramConsumer(DexIndexedConsumer.emptyConsumer());
+                } else {
+                  assert outputMode == OutputMode.DexFilePerClassFile;
+                  b.setProgramConsumer(DexFilePerClassFileConsumer.emptyConsumer());
+                }
+              })
+          .collectSyntheticItems()
+          .setIntermediate(true)
+          .compile();
+    }
+
+    D8TestCompileResult mergeDexFiles(List<ProgramResource> dexFiles) throws Throwable {
+      assert builderTransformations.isEmpty();
+      return testForD8()
+          .addProgramDexFileData(
+              dexFiles.stream()
+                  .map(D8IncrementalRunExamplesAndroidOTest::readResource)
+                  .collect(Collectors.toList()))
+          .addOptionsModification(this::combinedOptionConsumer)
+          .apply(
+              b -> {
+                for (Consumer<D8TestBuilder> testBuilderConsumer : testBuilderConsumers) {
+                  testBuilderConsumer.accept(b);
+                }
+              })
+          .compile();
+    }
+
+    abstract void addClasspathReference(
+        Path testJarFile,
+        Consumer<Path> pathConsumer,
+        Consumer<ClassFileResourceProvider> providerConsumer);
+
+    abstract void addLibraryReference(
+        Path location,
+        Consumer<Path> pathConsumer,
+        Consumer<ClassFileResourceProvider> providerConsumer)
+        throws IOException;
+  }
+
+  @Test
+  public void dexPerClassFileNoDesugaring() throws Throwable {
+    String testName = "dexPerClassFileNoDesugaring";
+    String testPackage = "incremental";
+    String mainClass = "IncrementallyCompiled";
+
+    Path inputJarFile = Paths.get(EXAMPLE_DIR, testPackage + JAR_EXTENSION);
+
+    D8IncrementalTestRunner test = test(testName, testPackage, mainClass);
+
+    Map<String, ProgramResource> compiledSeparately = test.compileClassesSeparately(inputJarFile);
+    Map<String, ProgramResource> compiledTogether = test.compileClassesTogether(inputJarFile, null);
+    Assert.assertEquals(compiledSeparately.size(), compiledTogether.size());
+
+    for (Map.Entry<String, ProgramResource> entry : compiledSeparately.entrySet()) {
+      ProgramResource otherResource = compiledTogether.get(entry.getKey());
+      Assert.assertNotNull(otherResource);
+      Assert.assertArrayEquals(readResource(entry.getValue()), readResource(otherResource));
+    }
+
+    D8TestCompileResult mergedFromCompiledSeparately =
+        test.mergeDexFiles(Lists.newArrayList(compiledSeparately.values()));
+    D8TestCompileResult mergedFromCompiledTogether =
+        test.mergeDexFiles(Lists.newArrayList(compiledTogether.values()));
+
+    // TODO(b/123504206): Add a main method and test the output runs.
+
+    Assert.assertArrayEquals(
+        readResource(
+            mergedFromCompiledSeparately.getApp().getDexProgramResourcesForTesting().get(0)),
+        readResource(
+            mergedFromCompiledTogether.getApp().getDexProgramResourcesForTesting().get(0)));
+  }
+
+  @Test
+  public void dexPerClassFileWithDesugaring() throws Throwable {
+    String testName = "dexPerClassFileWithDesugaring";
+    String testPackage = "lambdadesugaringnplus";
+    String mainClass = "LambdasWithStaticAndDefaultMethods";
+
+    Path inputJarFile = Paths.get(EXAMPLE_DIR, testPackage + JAR_EXTENSION);
+
+    D8IncrementalTestRunner test = test(testName, testPackage, mainClass);
+    test.withInterfaceMethodDesugaring(OffOrAuto.Auto);
+
+    D8TestCompileResult mergedFromCompiledSeparately =
+        test.mergeDexFiles(
+            Lists.newArrayList(test.compileClassesSeparately(inputJarFile).values()));
+    D8TestCompileResult mergedFromCompiledTogether =
+        test.mergeDexFiles(
+            Lists.newArrayList(test.compileClassesTogether(inputJarFile, null).values()));
+
+    Path out1 = mergedFromCompiledTogether.writeToZip();
+    ToolHelper.runArtNoVerificationErrors(out1.toString(), testPackage + "." + mainClass);
+
+    Path out2 = mergedFromCompiledSeparately.writeToZip();
+    ToolHelper.runArtNoVerificationErrors(out2.toString(), testPackage + "." + mainClass);
+
+    Path dissasemble1 = temp.newFolder().toPath().resolve("disassemble1.txt");
+    Path dissasemble2 = temp.newFolder().toPath().resolve("disassemble2.txt");
+    Disassemble.disassemble(
+        DisassembleCommand.builder().addProgramFiles(out1).setOutputPath(dissasemble1).build());
+    Disassemble.disassemble(
+        DisassembleCommand.builder().addProgramFiles(out2).setOutputPath(dissasemble2).build());
+    String content1 = StringUtils.join("\n", Files.readAllLines(dissasemble1));
+    String content2 = StringUtils.join("\n", Files.readAllLines(dissasemble2));
+    assertEquals(content1, content2);
+
+    Assert.assertArrayEquals(
+        readResource(
+            mergedFromCompiledSeparately.getApp().getDexProgramResourcesForTesting().get(0)),
+        readResource(
+            mergedFromCompiledTogether.getApp().getDexProgramResourcesForTesting().get(0)));
+  }
+
+  @Test
+  public void dexPerClassFileWithDispatchMethods() throws Throwable {
+    String testName = "dexPerClassFileWithDispatchMethods";
+    String testPackage = "interfacedispatchclasses";
+    String mainClass = "TestInterfaceDispatchClasses";
+
+    Path inputJarFile = Paths.get(EXAMPLE_DIR, testPackage + JAR_EXTENSION);
+
+    D8IncrementalTestRunner test = test(testName, testPackage, mainClass);
+    test.withInterfaceMethodDesugaring(OffOrAuto.Auto);
+
+    D8TestCompileResult mergedFromCompiledSeparately =
+        test.mergeDexFiles(
+            Lists.newArrayList(test.compileClassesSeparately(inputJarFile).values()));
+    D8TestCompileResult mergedFromCompiledTogether =
+        test.mergeDexFiles(
+            Lists.newArrayList(test.compileClassesTogether(inputJarFile, null).values()));
+
+    // TODO(b/123504206): This test throws an index out of bounds exception.
+    // Re-write or verify running fails in the expected way.
+    Assert.assertArrayEquals(
+        readResource(
+            mergedFromCompiledSeparately.getApp().getDexProgramResourcesForTesting().get(0)),
+        readResource(
+            mergedFromCompiledTogether.getApp().getDexProgramResourcesForTesting().get(0)));
+  }
+
+  @Test
+  public void dexPerClassFileOutputFiles() throws Throwable {
+    String testName = "dexPerClassFileNoDesugaring";
+    String testPackage = "incremental";
+    String mainClass = "IncrementallyCompiled";
+
+    Path out = temp.getRoot().toPath();
+
+    Path inputJarFile = Paths.get(EXAMPLE_DIR, testPackage + JAR_EXTENSION);
+
+    D8IncrementalTestRunner test = test(testName, testPackage, mainClass);
+    test.compileClassesTogether(inputJarFile, out);
+
+    String[] topLevelDir = out.toFile().list();
+    assert topLevelDir != null;
+    assertEquals(1, topLevelDir.length);
+    assertEquals("incremental", topLevelDir[0]);
+
+    String[] dexFiles = out.resolve(topLevelDir[0]).toFile().list();
+    assert dexFiles != null;
+    Arrays.sort(dexFiles);
+
+    String[] expectedFileNames = {
+        "IncrementallyCompiled$A$AB.dex",
+        "IncrementallyCompiled$A.dex",
+        "IncrementallyCompiled$B$BA.dex",
+        "IncrementallyCompiled$B.dex",
+        "IncrementallyCompiled$C.dex",
+        "IncrementallyCompiled.dex"
+    };
+    Arrays.sort(expectedFileNames);
+
+    Assert.assertArrayEquals(expectedFileNames, dexFiles);
+  }
+
+  @Override
+  abstract D8IncrementalTestRunner test(String testName, String packageName, String mainClass);
+
+  @Override
+  protected void testIntermediateWithMainDexList(
+      String packageName,
+      Path input,
+      int expectedMainDexListSize,
+      List<String> mainDexClasses,
+      boolean hasLambda) {
+    // Skip those tests.
+    Assume.assumeTrue(false);
+  }
+
+  @Override
+  protected Path buildDexThroughIntermediate(
+      String packageName,
+      Path input,
+      OutputMode outputMode,
+      AndroidApiLevel minApi,
+      List<String> mainDexClasses) {
+    // tests using this should already been skipped.
+    throw new Unreachable();
+  }
+
+  static byte[] readResource(ProgramResource resource) {
+    try (InputStream input = resource.getByteStream()) {
+      return ByteStreams.toByteArray(input);
+    } catch (ResourceException e) {
+      throw new RuntimeException(e);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+}

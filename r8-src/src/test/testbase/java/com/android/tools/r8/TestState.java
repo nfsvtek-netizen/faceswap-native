@@ -1,0 +1,108 @@
+// Copyright (c) 2018, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8;
+
+import com.android.tools.r8.synthesis.SyntheticItemsTestUtils;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Path;
+import java.util.Set;
+import java.util.function.BiFunction;
+import org.junit.rules.TemporaryFolder;
+
+public class TestState {
+
+  private final TemporaryFolder temp;
+  private final TestDiagnosticMessagesImpl messages;
+
+  private Set<String> mainDexClasses;
+
+  private String stdout;
+  private String stderr;
+
+  private SyntheticItemsTestUtils syntheticItems;
+  private boolean headful = false;
+
+  public TestState(TemporaryFolder temp) {
+    this(temp, new TestDiagnosticMessagesImpl());
+  }
+
+  public TestState(TemporaryFolder temp, TestDiagnosticMessagesImpl handler) {
+    this.temp = temp;
+    this.messages = handler;
+  }
+
+  public TemporaryFolder getTempFolder() {
+    return temp;
+  }
+
+  public Path getNewTempFolder() throws IOException {
+    return temp.newFolder().toPath();
+  }
+
+  public Path getNewTempFile(String name) throws IOException {
+    return getNewTempFolder().resolve(name);
+  }
+
+  public Path getNewTempFileUnchecked(String name) {
+    try {
+      return getNewTempFile(name);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  public DiagnosticsHandler getDiagnosticsHandler() {
+    return messages;
+  }
+
+  public TestDiagnosticMessages getDiagnosticsMessages() {
+    return messages;
+  }
+
+  public Set<String> getMainDexClasses() {
+    return mainDexClasses;
+  }
+
+  void setMainDexClasses(Set<String> mainDexClasses) {
+    this.mainDexClasses = mainDexClasses;
+  }
+
+  public String getStdout() {
+    return stdout;
+  }
+
+  void setStdout(String stdout) {
+    this.stdout = stdout;
+  }
+
+  public String getStderr() {
+    return stderr;
+  }
+
+  void setStderr(String stderr) {
+    this.stderr = stderr;
+  }
+
+  public SyntheticItemsTestUtils getSyntheticItems() {
+    return syntheticItems;
+  }
+
+  void setSyntheticItems(SyntheticItemsTestUtils syntheticItems) {
+    this.syntheticItems = syntheticItems;
+  }
+
+  void setDiagnosticsLevelModifier(
+      BiFunction<DiagnosticsLevel, Diagnostic, DiagnosticsLevel> modifier) {
+    messages.setDiagnosticsLevelModifier(modifier);
+  }
+
+  public boolean isHeadful() {
+    return headful;
+  }
+
+  public void setHeadful(boolean headful) {
+    this.headful = headful;
+  }
+}

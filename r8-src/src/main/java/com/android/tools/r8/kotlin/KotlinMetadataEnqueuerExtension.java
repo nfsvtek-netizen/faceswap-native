@@ -1,0 +1,237 @@
+// Copyright (c) 2020, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.kotlin;
+
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+import static com.android.tools.r8.kotlin.KotlinClassMetadataReader.hasKotlinClassMetadataAnnotation;
+import static com.android.tools.r8.kotlin.KotlinMetadataUtils.getNoKotlinInfo;
+
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexEncodedMember;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.EnclosingMethodAttribute;
+import com.android.tools.r8.graph.ProgramDefinition;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.analysis.EnqueuerAnalysisCollection;
+import com.android.tools.r8.graph.analysis.FinishedEnqueuerAnalysis;
+import com.android.tools.r8.graph.analysis.FixpointEnqueuerAnalysis;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackSimple;
+import com.android.tools.r8.shaking.Enqueuer;
+import com.android.tools.r8.shaking.Enqueuer.EnqueuerDefinitionSupplier;
+import com.android.tools.r8.shaking.EnqueuerWorklist;
+import com.android.tools.r8.shaking.KeepClassInfo;
+import com.android.tools.r8.shaking.KeepMethodInfo;
+import com.android.tools.r8.shaking.KeepMethodInfo.Joiner;
+import com.android.tools.r8.shaking.KeepReason;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.timing.Timing;
+import com.google.common.collect.Sets;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class KotlinMetadataEnqueuerExtension
+    implements FinishedEnqueuerAnalysis, FixpointEnqueuerAnalysis {
+
+  private static final OptimizationFeedback feedback = OptimizationFeedbackSimple.getInstance();
+
+  private final AppView<?> appView;
+  private final EnqueuerDefinitionSupplier enqueuerDefinitionSupplier;
+  private final DexItemFactory factory;
+  private final Set<DexType> prunedTypes;
+  private final AtomicBoolean reportedUnknownMetadataVersion = new AtomicBoolean(false);
+
+  public KotlinMetadataEnqueuerExtension(
+      AppView<?> appView,
+      EnqueuerDefinitionSupplier enqueuerDefinitionSupplier,
+      Set<DexType> prunedTypes) {
+    this.appView = appView;
+    this.enqueuerDefinitionSupplier = enqueuerDefinitionSupplier;
+    this.factory = appView.dexItemFactory();
+    this.prunedTypes = prunedTypes;
+  }
+
+  public static void register(
+      AppView<? extends AppInfoWithClassHierarchy> appView,
+      EnqueuerDefinitionSupplier enqueuerDefinitionSupplier,
+      Set<DexType> initialPrunedTypes,
+      EnqueuerAnalysisCollection.Builder builder) {
+    // TODO(b/323816623): This check does not include presence of keep declarations.
+    //  The non-presense of PG config seems like a exeedingly rare corner case so maybe just
+    //  make this conditional on tree shaking and the specific option flag.
+    InternalOptions options = appView.options();
+    if (options.hasProguardConfiguration()) {
+      KotlinMetadataEnqueuerExtension analysis =
+          new KotlinMetadataEnqueuerExtension(
+              appView, enqueuerDefinitionSupplier, initialPrunedTypes);
+      builder.addFixpointAnalysis(analysis);
+      builder.addFinishedAnalysis(analysis);
+    }
+  }
+
+  private KotlinMetadataDefinitionSupplier definitionsForContext(ProgramDefinition context) {
+    return new KotlinMetadataDefinitionSupplier(context, enqueuerDefinitionSupplier, prunedTypes);
+  }
+
+  @Override
+  public void notifyFixpoint(
+      Enqueuer enqueuer, EnqueuerWorklist worklist, ExecutorService executorService, Timing timing)
+      throws ExecutionException {
+    InternalOptions options = appView.options();
+    DexType kotlinMetadataType = factory.kotlinMetadataType;
+    DexProgramClass clazz = asProgramClassOrNull(appView.definitionFor(kotlinMetadataType));
+    if (clazz == null || enqueuer.getKeepInfo(clazz).isShrinkingAllowed(options)) {
+      return;
+    }
+    timing.begin("Process kotlin.Metadata members to keep");
+    for (ProgramMethod method : clazz.virtualProgramMethods()) {
+      KeepMethodInfo methodInfo = enqueuer.getKeepInfo().getMethodInfo(method);
+      if (!(methodInfo.isOptimizationAllowed(options)
+          || methodInfo.isShrinkingAllowed(options)
+          || methodInfo.isMinificationAllowed(options))) {
+        continue;
+      }
+      KeepReason reason = KeepReason.reachableFromLiveType(kotlinMetadataType);
+      Joiner minimumKeepInfo =
+          KeepMethodInfo.newEmptyJoiner()
+              .disallowOptimization()
+              .disallowShrinking()
+              .disallowMinification()
+              .addReason(reason);
+      enqueuer.applyMinimumKeepInfo(method, minimumKeepInfo);
+    }
+    timing.end();
+  }
+
+  @Override
+  @SuppressWarnings("ReferenceEquality")
+  public void done(Enqueuer enqueuer, ExecutorService executorService) {
+    boolean keepKotlinMetadata =
+        KeepClassInfo.isKotlinMetadataClassKept(
+            factory,
+            enqueuer.getKeepInfo(),
+            appView.options(),
+            appView.appInfo()::definitionForWithoutExistenceAssert);
+    // In the first round of tree shaking build up all metadata such that it can be traced later.
+    if (enqueuer.getMode().isInitialTreeShaking()) {
+      Set<DexMethod> keepByteCodeFunctions = Sets.newIdentityHashSet();
+      Set<DexProgramClass> localOrAnonymousClasses = Sets.newIdentityHashSet();
+      enqueuer.forAllLiveClasses(
+          clazz -> {
+            assert clazz.getKotlinInfo().isNoKotlinInformation();
+            if (enqueuer
+                .getKeepInfo(clazz)
+                .isKotlinMetadataRemovalAllowed(appView.options(), keepKotlinMetadata)) {
+              if (KotlinClassMetadataReader.isLambda(
+                      appView, clazz, () -> reportedUnknownMetadataVersion.getAndSet(true))
+                  && clazz.hasClassInitializer()) {
+                feedback.classInitializerMayBePostponed(clazz.getClassInitializer());
+              }
+              clazz.clearKotlinInfo();
+              clazz.removeAnnotations(
+                  annotation ->
+                      annotation.getAnnotationType().isIdenticalTo(factory.kotlinMetadataType));
+            } else {
+              clazz.setKotlinInfo(
+                  KotlinClassMetadataReader.getKotlinInfo(
+                      appView,
+                      clazz,
+                      method -> keepByteCodeFunctions.add(method.getReference()),
+                      () -> reportedUnknownMetadataVersion.getAndSet(true)));
+              if (clazz.getEnclosingMethodAttribute() != null
+                  && clazz.getEnclosingMethodAttribute().getEnclosingMethod() != null) {
+                localOrAnonymousClasses.add(clazz);
+              }
+            }
+          });
+      for (DexProgramClass localOrAnonymousClass : localOrAnonymousClasses) {
+        EnclosingMethodAttribute enclosingAttribute =
+            localOrAnonymousClass.getEnclosingMethodAttribute();
+        DexClass holder =
+            enqueuerDefinitionSupplier.definitionFor(
+                enclosingAttribute.getEnclosingMethod().getHolderType(), localOrAnonymousClass);
+        if (holder == null) {
+          continue;
+        }
+        DexEncodedMethod method = holder.lookupMethod(enclosingAttribute.getEnclosingMethod());
+        // If we cannot lookup the method, the conservative choice is keep the byte code.
+        if (method == null
+            || (method.getKotlinInfo().isFunction()
+                && method.getKotlinInfo().asFunction().hasCrossInlineParameter())) {
+          localOrAnonymousClass.forEachProgramMethod(
+              m -> keepByteCodeFunctions.add(m.getReference()));
+        }
+      }
+      if (appView.options().enableCfByteCodePassThrough) {
+        appView.setCfByteCodePassThrough(keepByteCodeFunctions);
+      }
+    } else {
+      assert enqueuer.getMode().isFinalTreeShaking();
+      enqueuer.forAllLiveClasses(
+          clazz -> {
+            if (enqueuer
+                .getKeepInfo(clazz)
+                .isKotlinMetadataRemovalAllowed(appView.options(), keepKotlinMetadata)) {
+              clazz.clearKotlinInfo();
+              clazz.members().forEach(DexEncodedMember::clearKotlinInfo);
+              clazz.removeAnnotations(
+                  annotation ->
+                      annotation.getAnnotationType().isIdenticalTo(factory.kotlinMetadataType));
+            } else {
+              // Use the concrete getNoKotlinInfo() instead of isNoKotlinInformation() to handle
+              // invalid kotlin info as well.
+              assert hasKotlinClassMetadataAnnotation(clazz, factory)
+                      == (clazz.getKotlinInfo() != getNoKotlinInfo())
+                  : clazz.toSourceString()
+                      + " "
+                      + (clazz.getKotlinInfo() == getNoKotlinInfo() ? "no info" : "has info");
+            }
+          });
+    }
+    // Trace through the modeled kotlin metadata.
+    enqueuer.forAllLiveClasses(
+        clazz -> {
+          clazz.getKotlinInfo().trace(definitionsForContext(clazz));
+          clazz.forEachProgramMember(
+              member ->
+                  member.getDefinition().getKotlinInfo().trace(definitionsForContext(member)));
+        });
+  }
+
+  private static class KotlinMetadataDefinitionSupplier implements KotlinMetadataUseRegistry {
+
+    private final ProgramDefinition context;
+    private final EnqueuerDefinitionSupplier enqueuerDefinitionSupplier;
+    private final Set<DexType> prunedTypes;
+
+    private KotlinMetadataDefinitionSupplier(
+        ProgramDefinition context,
+        EnqueuerDefinitionSupplier enqueuerDefinitionSupplier,
+        Set<DexType> prunedTypes) {
+      this.context = context;
+      this.enqueuerDefinitionSupplier = enqueuerDefinitionSupplier;
+      this.prunedTypes = prunedTypes;
+    }
+
+    @Override
+    public void registerType(DexType type) {
+      // TODO(b/157700128) Metadata cannot at this point keep anything alive. Therefore, if a type
+      //  has been pruned it may still be referenced, so we do an early check here to ensure it will
+      //  not end up as. Ideally, those types should be removed by a pass on the modeled data.
+      if (prunedTypes != null && prunedTypes.contains(type)) {
+        return;
+      }
+      enqueuerDefinitionSupplier.definitionFor(type, context);
+    }
+  }
+}

@@ -1,0 +1,710 @@
+// Copyright (c) 2022, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.desugar.desugaredlibrary.test;
+
+import static com.android.tools.r8.utils.internal.ConsumerUtils.emptyConsumer;
+import static com.android.tools.r8.utils.internal.ConsumerUtils.emptyThrowingConsumer;
+
+import com.android.tools.r8.ClassFileResourceProvider;
+import com.android.tools.r8.CompilationFailedException;
+import com.android.tools.r8.CompilationMode;
+import com.android.tools.r8.D8TestBuilder;
+import com.android.tools.r8.D8TestCompileResult;
+import com.android.tools.r8.L8TestBuilder;
+import com.android.tools.r8.L8TestCompileResult;
+import com.android.tools.r8.LibraryDesugaringTestConfiguration;
+import com.android.tools.r8.R8PartialTestBuilder;
+import com.android.tools.r8.R8TestBuilder;
+import com.android.tools.r8.SingleTestRunResult;
+import com.android.tools.r8.StringResource;
+import com.android.tools.r8.TestBase.Backend;
+import com.android.tools.r8.TestCompileResult;
+import com.android.tools.r8.TestCompilerBuilder;
+import com.android.tools.r8.TestCompilerBuilder.DiagnosticsConsumer;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestRuntime;
+import com.android.tools.r8.TestShrinkerBuilder;
+import com.android.tools.r8.desugar.desugaredlibrary.DesugaredLibraryTestBase;
+import com.android.tools.r8.ir.desugar.desugaredlibrary.DesugaredLibrarySpecificationParser;
+import com.android.tools.r8.partial.R8PartialCompilationConfiguration.Builder;
+import com.android.tools.r8.profile.art.ArtProfileConsumer;
+import com.android.tools.r8.profile.art.ArtProfileForRewriting;
+import com.android.tools.r8.profile.art.ArtProfileProvider;
+import com.android.tools.r8.profile.art.model.ExternalArtProfile;
+import com.android.tools.r8.profile.art.utils.ArtProfileTestingUtils;
+import com.android.tools.r8.tracereferences.TraceReferences;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.codeinspector.VerticallyMergedClassesInspector;
+import com.android.tools.r8.utils.internal.FileUtils;
+import com.android.tools.r8.utils.internal.StringUtils;
+import com.android.tools.r8.utils.internal.ThrowingConsumer;
+import com.google.common.base.Charsets;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Consumer;
+
+public class DesugaredLibraryTestBuilder<T extends DesugaredLibraryTestBase> {
+
+  private final T test;
+  private final TestParameters parameters;
+  private final LibraryDesugaringSpecification libraryDesugaringSpecification;
+  private final CompilationSpecification compilationSpecification;
+  private final TestCompilerBuilder<?, ?, ?, ? extends SingleTestRunResult<?>, ?> builder;
+  private final List<ArtProfileForRewriting> l8ArtProfilesForRewriting = new ArrayList<>();
+  private final List<String> l8ExtraKeepRules = new ArrayList<>();
+  private Consumer<L8TestBuilder> l8TestBuilderConsumer = emptyConsumer();
+  private Consumer<InternalOptions> l8OptionModifier = emptyConsumer();
+  private boolean l8FinalPrefixVerification = true;
+  private boolean overrideDefaultLibrary = false;
+  private CustomLibrarySpecification customLibrarySpecification = null;
+  private final List<ExternalArtProfile> l8ResidualArtProfiles = new ArrayList<>();
+  private boolean managedPostPrefix = false;
+
+  public DesugaredLibraryTestBuilder(
+      T test,
+      TestParameters parameters,
+      LibraryDesugaringSpecification libraryDesugaringSpecification,
+      CompilationSpecification runSpecification) {
+    this.test = test;
+    this.parameters = parameters;
+    this.libraryDesugaringSpecification = libraryDesugaringSpecification;
+    this.compilationSpecification = runSpecification;
+    this.builder = generateBuilder();
+    setUp();
+  }
+
+  private void setUp() {
+    builder.setMinApi(parameters).setMode(compilationSpecification.getProgramCompilationMode());
+    LibraryDesugaringTestConfiguration.Builder libraryConfBuilder =
+        LibraryDesugaringTestConfiguration.builder()
+            .addDesugaredLibraryConfiguration(
+                StringResource.fromFile(libraryDesugaringSpecification.getSpecification()));
+    builder.enableCoreLibraryDesugaring(libraryConfBuilder.build());
+  }
+
+  private TestCompilerBuilder<?, ?, ?, ? extends SingleTestRunResult<?>, ?> generateBuilder() {
+    if (compilationSpecification.isCfToCf()) {
+      assert !compilationSpecification.isProgramShrink();
+      if (compilationSpecification.isL8Shrink()) {
+        // L8 with Cf backend and shrinking is not a supported pipeline.
+        parameters.assumeDexRuntime();
+      }
+      return test.testForD8(Backend.CF);
+    }
+    // Cf back-end is only allowed in Cf to cf compilations.
+    parameters.assumeDexRuntime();
+    if (compilationSpecification.isProgramShrink()) {
+      if (compilationSpecification.isProgramShrinkWithPartial()) {
+        parameters.assumeCanUseR8Partial();
+        return test.testForR8Partial(parameters.getBackend())
+            .setR8PartialConfiguration(Builder::includeAll);
+      } else {
+        return test.testForR8(parameters.getBackend());
+      }
+    } else {
+      if (compilationSpecification.isNotProgramShrinkWithPartial()) {
+        parameters.assumeCanUseR8Partial();
+        return test.testForR8Partial(parameters.getBackend())
+            .setR8PartialConfiguration(Builder::excludeAll);
+      } else {
+        return test.testForD8(parameters.getBackend());
+      }
+    }
+  }
+
+  public DesugaredLibraryTestBuilder<T> setCustomLibrarySpecification(
+      CustomLibrarySpecification customLibrarySpecification) {
+    this.customLibrarySpecification = customLibrarySpecification;
+    customLibrarySpecification.addLibraryClasses(builder);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<?> setForceInlineApiConversions(
+      boolean forceInlineApiConversions) {
+    return addLibraryDesugaringOptionsModification(
+        options -> options.testing.forceInlineApiConversions = forceInlineApiConversions);
+  }
+
+  public DesugaredLibraryTestBuilder<?> setTrackDesugaredApiConversions() {
+    return addLibraryDesugaringOptionsModification(
+        options -> options.testing.trackDesugaredApiConversions = true);
+  }
+
+  public DesugaredLibraryTestBuilder<T> addL8OptionsModification(
+      Consumer<InternalOptions> optionModifier) {
+    l8OptionModifier = l8OptionModifier.andThen(optionModifier);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addOptionsModification(
+      Consumer<InternalOptions> optionModifier) {
+    builder.addOptionsModification(optionModifier);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addR8OptionsModification(
+      Consumer<InternalOptions> optionModifier) {
+    return applyIfR8PartialTestBuilder(
+        builder -> builder.addR8PartialR8OptionsModification(optionModifier),
+        builder.isR8TestBuilder(),
+        builder -> builder.addOptionsModification(optionModifier));
+  }
+
+  public DesugaredLibraryTestBuilder<T> addLibraryDesugaringOptionsModification(
+      Consumer<InternalOptions> optionModifier) {
+    return applyIfR8PartialTestBuilder(
+        builder -> builder.addR8PartialR8OptionsModification(optionModifier),
+        builder -> builder.addOptionsModification(optionModifier));
+  }
+
+  public DesugaredLibraryTestBuilder<T> addProgramClassesAndInnerClasses(Class<?>... clazz)
+      throws IOException {
+    builder.addProgramClassesAndInnerClasses(clazz);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addInnerClasses(Class<?>... clazz) throws IOException {
+    builder.addInnerClasses(clazz);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addInnerClassesAndStrippedOuter(Class<?> clazz)
+      throws IOException {
+    builder.addInnerClassesAndStrippedOuter(clazz);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addClasspathClasses(Class<?>... clazz) {
+    builder.addClasspathClasses(clazz);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addProgramClasses(Class<?>... clazz) {
+    builder.addProgramClasses(clazz);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addProgramClasses(Collection<Class<?>> clazz) {
+    builder.addProgramClasses(clazz);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addProgramFiles(Path... files) {
+    builder.addProgramFiles(files);
+    return this;
+  }
+
+  /**
+   * By default the compilation uses as library libraryDesugaringSpecification.getLibraryFiles(),
+   * which is android.jar at the required compilation api level. Use this Api to set different
+   * library files.
+   */
+  public DesugaredLibraryTestBuilder<T> overrideLibraryFiles(Path... files) {
+    overrideDefaultLibrary = true;
+    builder.addLibraryFiles(files);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> overrideLibraryProvider(
+      ClassFileResourceProvider provider) {
+    overrideDefaultLibrary = true;
+    builder.addLibraryProvider(provider);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addProgramFiles(Collection<Path> files) {
+    builder.addProgramFiles(files);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> setL8PostPrefix(String postPrefix) {
+    System.setProperty("com.android.tools.r8.desugaredLibraryPostPrefix", postPrefix);
+    this.managedPostPrefix = true;
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> ignoreL8FinalPrefixVerification() {
+    l8FinalPrefixVerification = false;
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addProgramClassFileData(byte[]... classes) {
+    return addProgramClassFileData(Arrays.asList(classes));
+  }
+
+  public DesugaredLibraryTestBuilder<T> addProgramClassFileData(
+      Collection<byte[]> programClassFileData) {
+    builder.addProgramClassFileData(programClassFileData);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addRunClasspathFiles(Path... files) {
+    builder.addRunClasspathFiles(files);
+    return this;
+  }
+
+  /**
+   * By default the compilation uses libraryDesugaringSpecification.getProgramCompilationMode()
+   * which maps to the studio set-up: D8-debug, D8-release and R8-release. Use this Api to set a
+   * different compilation mode.
+   */
+  public DesugaredLibraryTestBuilder<T> overrideCompilationMode(CompilationMode mode) {
+    builder.setMode(mode);
+    return this;
+  }
+
+  private void withD8TestBuilder(Consumer<D8TestBuilder> consumer) {
+    if (builder.isD8TestBuilder()) {
+      consumer.accept((D8TestBuilder) builder);
+    }
+  }
+
+  private <E extends Throwable> void withR8TestBuilder(
+      ThrowingConsumer<R8TestBuilder<?, ?, ?>, E> consumer) throws E {
+    if (builder.isTestShrinkerBuilder()) {
+      consumer.accept((R8TestBuilder<?, ?, ?>) builder);
+    }
+  }
+
+  private <E extends Throwable> void withR8PartialTestBuilder(
+      ThrowingConsumer<R8PartialTestBuilder, E> consumer) throws E {
+    if (builder.isR8PartialTestBuilder()) {
+      consumer.accept((R8PartialTestBuilder) builder);
+    }
+  }
+
+  public DesugaredLibraryTestBuilder<T> allowUnusedDontWarnPatterns() {
+    withR8TestBuilder(R8TestBuilder::allowUnusedDontWarnPatterns);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> allowUnusedProguardConfigurationRules() {
+    withR8TestBuilder(R8TestBuilder::allowUnusedProguardConfigurationRules);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> allowDiagnosticMessages() {
+    withR8TestBuilder(R8TestBuilder::allowDiagnosticMessages);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> allowDiagnosticInfoMessages() {
+    withR8TestBuilder(R8TestBuilder::allowDiagnosticInfoMessages);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> applyIfD8TestBuilder(Consumer<D8TestBuilder> consumer) {
+    withD8TestBuilder(consumer);
+    return this;
+  }
+
+  public <E extends Throwable> DesugaredLibraryTestBuilder<T> applyIfR8TestBuilder(
+      ThrowingConsumer<R8TestBuilder<?, ?, ?>, E> consumer) throws E {
+    withR8TestBuilder(consumer);
+    return this;
+  }
+
+  public <E1 extends Throwable, E2 extends Throwable>
+      DesugaredLibraryTestBuilder<T> applyIfR8PartialTestBuilder(
+          ThrowingConsumer<R8PartialTestBuilder, E1> thenConsumer) throws E1, E2 {
+    return applyIfR8PartialTestBuilder(thenConsumer, emptyThrowingConsumer());
+  }
+
+  public <E1 extends Throwable, E2 extends Throwable>
+      DesugaredLibraryTestBuilder<T> applyIfR8PartialTestBuilder(
+          ThrowingConsumer<R8PartialTestBuilder, E1> thenConsumer,
+          ThrowingConsumer<DesugaredLibraryTestBuilder<T>, E2> elseConsumer)
+          throws E1, E2 {
+    if (builder.isR8PartialTestBuilder()) {
+      withR8PartialTestBuilder(thenConsumer);
+    } else {
+      elseConsumer.accept(this);
+    }
+    return this;
+  }
+
+  public <E1 extends Throwable, E2 extends Throwable>
+      DesugaredLibraryTestBuilder<T> applyIfR8PartialTestBuilder(
+          ThrowingConsumer<R8PartialTestBuilder, E1> thenConsumer,
+          boolean elseCondition,
+          ThrowingConsumer<DesugaredLibraryTestBuilder<T>, E2> elseConsumer)
+          throws E1, E2 {
+    if (builder.isR8PartialTestBuilder()) {
+      withR8PartialTestBuilder(thenConsumer);
+    } else if (elseCondition) {
+      elseConsumer.accept(this);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> allowDiagnosticWarningMessages() {
+    withR8TestBuilder(R8TestBuilder::allowDiagnosticWarningMessages);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> allowDiagnosticWarningMessages(boolean condition) {
+    withR8TestBuilder(b -> b.allowDiagnosticWarningMessages(condition));
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addKeepRules(String... keepRules) {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(b -> b.addKeepRules(keepRules));
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addL8KeepRules(String... keepRules) {
+    if (compilationSpecification.isL8Shrink()) {
+      Collections.addAll(l8ExtraKeepRules, keepRules);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addKeepClassAndMembersRules(Class<?>... clazz) {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(b -> b.addKeepClassAndMembersRules(clazz));
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addKeepAttributes(String... attributes) {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(b -> b.addKeepAttributes(attributes));
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addKeepAllClassesRuleWithAllowObfuscation() {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(TestShrinkerBuilder::addKeepAllClassesRuleWithAllowObfuscation);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addKeepAllClassesRule() {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(TestShrinkerBuilder::addKeepAllClassesRule);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addKeepMainRule(Class<?> clazz) {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(b -> b.addKeepMainRule(clazz));
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addKeepMainRule(String mainClass) {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(b -> b.addKeepMainRule(mainClass));
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addKeepRuleFiles(Path... files) {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(b -> b.addKeepRuleFiles(files));
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addFeatureSplit(Class<?>... classes) throws IOException {
+    withR8TestBuilder(b -> b.addFeatureSplit(classes));
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> enableNeverClassInliningAnnotations() {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(R8TestBuilder::enableNeverClassInliningAnnotations);
+    } else {
+      withR8TestBuilder(R8TestBuilder::addNeverClassInliningAnnotations);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> enableInliningAnnotations() {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(R8TestBuilder::enableInliningAnnotations);
+    } else {
+      withR8TestBuilder(R8TestBuilder::addInliningAnnotations);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> enableNoVerticalClassMergingAnnotations() {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(R8TestBuilder::enableNoVerticalClassMergingAnnotations);
+    } else {
+      withR8TestBuilder(R8TestBuilder::addNoVerticalClassMergingAnnotations);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addVerticallyMergedClassesInspector(
+      Consumer<VerticallyMergedClassesInspector> inspector) {
+    withR8TestBuilder(b -> b.addVerticallyMergedClassesInspector(inspector));
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> noMinification() {
+    withR8TestBuilder(R8TestBuilder::addDontObfuscate);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> enableConstantArgumentAnnotations() {
+    if (compilationSpecification.isProgramShrink()) {
+      withR8TestBuilder(R8TestBuilder::enableConstantArgumentAnnotations);
+    } else {
+      withR8TestBuilder(R8TestBuilder::addConstantArgumentAnnotations);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> applyOnBuilder(
+      Consumer<TestCompilerBuilder<?, ?, ?, ?, ?>> consumer) {
+    consumer.accept(builder);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> apply(
+      Consumer<? super DesugaredLibraryTestBuilder<T>> consumer) {
+    consumer.accept(this);
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> applyIf(
+      boolean condition, Consumer<DesugaredLibraryTestBuilder<T>> consumer) {
+    return applyIf(condition, consumer, emptyConsumer());
+  }
+
+  public DesugaredLibraryTestBuilder<T> applyIf(
+      boolean condition,
+      Consumer<DesugaredLibraryTestBuilder<T>> thenConsumer,
+      Consumer<DesugaredLibraryTestBuilder<T>> elseConsumer) {
+    if (condition) {
+      thenConsumer.accept(this);
+    } else {
+      elseConsumer.accept(this);
+    }
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> disableL8AnnotationRemoval() {
+    l8OptionModifier =
+        l8OptionModifier.andThen(options -> options.disableL8AnnotationRemoval = true);
+    return this;
+  }
+
+  private void prepareCompilation() {
+    if (overrideDefaultLibrary) {
+      return;
+    }
+    builder.addLibraryFiles(libraryDesugaringSpecification.getLibraryFiles());
+  }
+
+  public DesugaredLibraryTestCompileResult<T> compile()
+      throws CompilationFailedException, IOException, ExecutionException {
+    prepareCompilation();
+    TestCompileResult<?, ? extends SingleTestRunResult<?>> compile = builder.compile();
+    return internalCompile(compile);
+  }
+
+  public DesugaredLibraryTestCompileResult<T> compileWithExpectedDiagnostics(
+      DiagnosticsConsumer consumer)
+      throws CompilationFailedException, IOException, ExecutionException {
+    prepareCompilation();
+    TestCompileResult<?, ? extends SingleTestRunResult<?>> compile =
+        builder.compileWithExpectedDiagnostics(consumer);
+    return internalCompile(compile);
+  }
+
+  private DesugaredLibraryTestCompileResult<T> internalCompile(
+      TestCompileResult<?, ? extends SingleTestRunResult<?>> compile)
+      throws CompilationFailedException, IOException {
+    L8TestCompileResult l8Compile = compileDesugaredLibrary(compile);
+    D8TestCompileResult customLibCompile = compileCustomLib();
+    if (managedPostPrefix) {
+      System.clearProperty("com.android.tools.r8.desugaredLibraryPostPrefix");
+    }
+    return new DesugaredLibraryTestCompileResult<>(
+        test,
+        compile,
+        parameters,
+        compilationSpecification,
+        customLibCompile,
+        l8Compile,
+        l8ResidualArtProfiles);
+  }
+
+  private D8TestCompileResult compileCustomLib() throws CompilationFailedException {
+    if (customLibrarySpecification == null) {
+      return null;
+    }
+    return customLibrarySpecification.compileCustomLibrary(test.testForD8(parameters.getBackend()));
+  }
+
+  private L8TestCompileResult compileDesugaredLibrary(
+      TestCompileResult<?, ? extends SingleTestRunResult<?>> compile)
+      throws CompilationFailedException, IOException {
+    if (!compilationSpecification.isL8Shrink()) {
+      return internalCompileDesugaredLibrary(null);
+    }
+    L8TestCompileResult nonShrunk =
+        test.testForL8(parameters.getApiLevel(), Backend.CF)
+            .apply(libraryDesugaringSpecification::configureL8TestBuilder)
+            .apply(b -> configure(b, Backend.CF))
+            .compile();
+    String keepRules = collectKeepRulesWithTraceReferences(compile, nonShrunk);
+    return internalCompileDesugaredLibrary(keepRules);
+  }
+
+  private L8TestCompileResult internalCompileDesugaredLibrary(String keepRule)
+      throws CompilationFailedException, IOException {
+    assert !compilationSpecification.isL8Shrink() || keepRule != null;
+    return test.testForL8(parameters.getApiLevel(), parameters.getBackend())
+        .apply(
+            b ->
+                libraryDesugaringSpecification.configureL8TestBuilder(
+                    b, compilationSpecification.isL8Shrink(), keepRule))
+        .apply(b -> configure(b, parameters.getBackend()))
+        .compile();
+  }
+
+  private void configure(L8TestBuilder l8Builder, Backend backend) {
+    l8Builder.applyIf(!l8FinalPrefixVerification, L8TestBuilder::ignoreFinalPrefixVerification);
+    if (backend.isDex()) {
+      l8Builder
+          .applyIf(
+              compilationSpecification.isL8Shrink() && !l8ExtraKeepRules.isEmpty(),
+              b -> b.addKeepRules(StringUtils.lines(l8ExtraKeepRules)))
+          .addOptionsModifier(l8OptionModifier);
+      for (ArtProfileForRewriting artProfileForRewriting : l8ArtProfilesForRewriting) {
+        l8Builder.addArtProfileForRewriting(
+            artProfileForRewriting.getArtProfileProvider(),
+            artProfileForRewriting.getResidualArtProfileConsumer());
+      }
+    }
+    l8TestBuilderConsumer.accept(l8Builder);
+  }
+
+  public String collectKeepRulesWithTraceReferences(
+      TestCompileResult<?, ? extends SingleTestRunResult<?>> compileResult,
+      L8TestCompileResult l8TestCompileResult)
+      throws CompilationFailedException, IOException {
+    Path generatedKeepRules = test.temp.newFile().toPath();
+    ArrayList<String> args = new ArrayList<>();
+    args.add("--keep-rules");
+    for (Path libraryFile : libraryDesugaringSpecification.getLibraryFiles()) {
+      args.add("--lib");
+      args.add(libraryFile.toString());
+    }
+    args.add("--target");
+    args.add(l8TestCompileResult.writeToZip().toString());
+    args.add("--source");
+    args.add(compileResult.writeToZip().toString());
+    List<Path> features = Collections.emptyList();
+    if (compileResult.isR8CompileResult()) {
+      features = compileResult.asR8CompileResult().getFeatures();
+    } else if (compileResult.isR8PartialCompileResult()) {
+      features = compileResult.asR8PartialCompileResult().getFeatures();
+    }
+    for (Path feature : features) {
+      args.add("--source");
+      args.add(feature.toString());
+    }
+    args.add("--output");
+    args.add(generatedKeepRules.toString());
+    args.add("--map-diagnostics");
+    args.add("error");
+    args.add("info");
+    TraceReferences.run(args.toArray(new String[0]));
+    return FileUtils.readTextFile(generatedKeepRules, Charsets.UTF_8);
+  }
+
+  public DesugaredLibraryTestBuilder<T> collectSyntheticItems() {
+    builder.collectSyntheticItems();
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> collectL8SyntheticItems() {
+    l8TestBuilderConsumer = l8TestBuilderConsumer.andThen(L8TestBuilder::collectSyntheticItems);
+    return this;
+  }
+
+  public SingleTestRunResult<?> run(TestRuntime runtime, Class<?> mainClass, String... args)
+      throws ExecutionException, IOException, CompilationFailedException {
+    return compile().run(runtime, mainClass.getTypeName(), args);
+  }
+
+  public SingleTestRunResult<?> run(TestRuntime runtime, String mainClass, String... args)
+      throws ExecutionException, IOException, CompilationFailedException {
+    return compile().run(runtime, mainClass, args);
+  }
+
+  public DesugaredLibraryTestBuilder<T> supportAllCallbacksFromLibrary(
+      boolean supportAllCallbacksFromLibrary) {
+    return addL8OptionsModification(
+            supportLibraryCallbackConsumer(supportAllCallbacksFromLibrary, true))
+        .addLibraryDesugaringOptionsModification(
+            supportLibraryCallbackConsumer(supportAllCallbacksFromLibrary, false));
+  }
+
+  private Consumer<InternalOptions> supportLibraryCallbackConsumer(
+      boolean supportAllCallbacksFromLibrary, boolean libraryCompilation) {
+    return opt ->
+        opt.getLibraryDesugaringOptions()
+            .configureDesugaredLibrary(
+                DesugaredLibrarySpecificationParser.parseDesugaredLibrarySpecificationforTesting(
+                    StringResource.fromFile(libraryDesugaringSpecification.getSpecification()),
+                    opt.dexItemFactory(),
+                    opt.reporter,
+                    libraryCompilation,
+                    parameters.getApiLevel().getLevel(),
+                    builder ->
+                        builder.setSupportAllCallbacksFromLibrary(supportAllCallbacksFromLibrary)),
+                opt.getLibraryDesugaringOptions().getSynthesizedClassPrefix());
+  }
+
+  public DesugaredLibraryTestBuilder<T> addAndroidBuildVersion() {
+    builder.addAndroidBuildVersion();
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> disableDesugaring() {
+    builder.disableDesugaring();
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> addL8ArtProfileForRewriting(
+      ArtProfileProvider artProfileProvider) {
+    return addL8ArtProfileForRewriting(
+        artProfileProvider,
+        ArtProfileTestingUtils.createResidualArtProfileConsumer(l8ResidualArtProfiles::add));
+  }
+
+  public DesugaredLibraryTestBuilder<T> addL8ArtProfileForRewriting(ExternalArtProfile artProfile) {
+    return addL8ArtProfileForRewriting(ArtProfileTestingUtils.createArtProfileProvider(artProfile));
+  }
+
+  public DesugaredLibraryTestBuilder<T> addL8ArtProfileForRewriting(
+      ArtProfileProvider artProfileProvider, ArtProfileConsumer residualArtProfileConsumer) {
+    l8ArtProfilesForRewriting.add(
+        new ArtProfileForRewriting(artProfileProvider, residualArtProfileConsumer));
+    return this;
+  }
+
+  public DesugaredLibraryTestBuilder<T> enableServiceLoader() {
+    withD8TestBuilder(D8TestBuilder::enableServiceLoader);
+    return this;
+  }
+}

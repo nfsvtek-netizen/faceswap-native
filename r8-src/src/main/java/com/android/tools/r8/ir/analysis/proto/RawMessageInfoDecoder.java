@@ -1,0 +1,302 @@
+// Copyright (c) 2019, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+package com.android.tools.r8.ir.analysis.proto;
+
+import static com.android.tools.r8.ir.analysis.proto.ProtoUtils.getInfoValueFromMessageInfoConstructionInvoke;
+import static com.android.tools.r8.ir.analysis.proto.ProtoUtils.getObjectsArrayValuesFromMessageInfoConstructionInvoke;
+
+import com.android.tools.r8.errors.CompilationError;
+import com.android.tools.r8.graph.DexEncodedField;
+import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexReference;
+import com.android.tools.r8.graph.DexString;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.proto.schema.DeadProtoFieldObject;
+import com.android.tools.r8.ir.analysis.proto.schema.LiveProtoFieldObject;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoFieldInfo;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoFieldType;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoFieldTypeFactory;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoMessageInfo;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoMessageInfo.ProtoMessageInfoBuilderException;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoObject;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoObjectFromInvokeStatic;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoObjectFromStaticGet;
+import com.android.tools.r8.ir.analysis.proto.schema.ProtoTypeObject;
+import com.android.tools.r8.ir.code.ConstClass;
+import com.android.tools.r8.ir.code.ConstString;
+import com.android.tools.r8.ir.code.DexItemBasedConstString;
+import com.android.tools.r8.ir.code.Instruction;
+import com.android.tools.r8.ir.code.InvokeMethod;
+import com.android.tools.r8.ir.code.InvokeStatic;
+import com.android.tools.r8.ir.code.StaticGet;
+import com.android.tools.r8.ir.code.Value;
+import com.android.tools.r8.naming.dexitembasedstring.NameComputationInfo;
+import com.android.tools.r8.utils.internal.ThrowingCharIterator;
+import com.android.tools.r8.utils.internal.ThrowingIntIterator;
+import com.android.tools.r8.utils.internal.ThrowingIterator;
+import com.android.tools.r8.utils.ValueUtils.ArrayValues;
+import java.io.UTFDataFormatException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.OptionalInt;
+
+/**
+ * The generated class for a protobuf message will have a dynamicMethod(), where the schema of the
+ * protobuf message is encoded:
+ *
+ * <pre>
+ *   class SomeMessage {
+ *     ...
+ *     Object dynamicMethod(MethodToInvoke method) {
+ *       switch (method) {
+ *         ...
+ *         case BUILD_MESSAGE_INFO:
+ *           Object[] objects = new Object[] { ... };
+ *           String info = "...";
+ *           return newMessageInfo(DEFAULT_INSTANCE, info, objects);
+ *         ...
+ *       }
+ *     }
+ *   }
+ * </pre>
+ *
+ * This class can be used to decode the encoded schema, given the values `objects` and `info`.
+ */
+public class RawMessageInfoDecoder {
+
+  private final ProtoFieldTypeFactory factory;
+  private final ProtoReferences references;
+
+  RawMessageInfoDecoder(ProtoFieldTypeFactory factory, ProtoReferences references) {
+    this.factory = factory;
+    this.references = references;
+  }
+
+  public ProtoMessageInfo run(ProgramMethod dynamicMethod, InvokeMethod invoke) {
+    assert references.isMessageInfoConstruction(invoke);
+    Value infoValue = getInfoValueFromMessageInfoConstructionInvoke(invoke, references);
+    ArrayValues objectsValues =
+        getObjectsArrayValuesFromMessageInfoConstructionInvoke(invoke, references);
+    return run(dynamicMethod, infoValue, objectsValues);
+  }
+
+  public ProtoMessageInfo run(
+      ProgramMethod dynamicMethod, Value infoValue, ArrayValues objectsValues) {
+    try {
+      ProtoMessageInfo.Builder builder = ProtoMessageInfo.builder(dynamicMethod);
+      ThrowingIntIterator<InvalidRawMessageInfoException> infoIterator =
+          createInfoIterator(infoValue);
+
+      // flags := info[0].
+      int flags = infoIterator.nextIntComputeIfAbsent(this::invalidInfoFailure);
+      builder.setFlags(flags);
+
+      // fieldCount := info[1].
+      int fieldCount = infoIterator.nextIntComputeIfAbsent(this::invalidInfoFailure);
+      if (fieldCount == 0) {
+        return builder.build();
+      }
+
+      // numberOfOneOfObjects := info[2].
+      int numberOfOneOfObjects = infoIterator.nextIntComputeIfAbsent(this::invalidInfoFailure);
+
+      // numberOfHasBitsObjects := info[3].
+      int numberOfHasBitsObjects = infoIterator.nextIntComputeIfAbsent(this::invalidInfoFailure);
+
+      // minFieldNumber     := info[4].
+      // maxFieldNumber     := info[5].
+      // entryCount         := info[6].
+      // mapFieldCount      := info[7].
+      // repeatedFieldCount := info[8].
+      // checkInitialized   := info[9].
+      for (int i = 4; i < 10; i++) {
+        // No need to store these values, since they can be computed from the rest (and need to be
+        // recomputed if the proto is changed).
+        infoIterator.nextIntComputeIfAbsent(this::invalidInfoFailure);
+      }
+
+      if (objectsValues == null) {
+        throw new InvalidRawMessageInfoException();
+      }
+      ThrowingIterator<Value, InvalidRawMessageInfoException> objectIterator =
+          ThrowingIterator.fromIterator(objectsValues.getElementValues().iterator());
+
+      for (int i = 0; i < numberOfOneOfObjects; i++) {
+        ProtoObject oneOfObject =
+            createProtoObject(
+                objectIterator.computeNextIfAbsent(this::invalidObjectsFailure), dynamicMethod);
+        if (!oneOfObject.isProtoFieldObject()) {
+          throw new InvalidRawMessageInfoException();
+        }
+        ProtoObject oneOfCaseObject =
+            createProtoObject(
+                objectIterator.computeNextIfAbsent(this::invalidObjectsFailure), dynamicMethod);
+        if (!oneOfCaseObject.isProtoFieldObject()) {
+          throw new InvalidRawMessageInfoException();
+        }
+        builder.addOneOfObject(
+            oneOfObject.asProtoFieldObject(), oneOfCaseObject.asProtoFieldObject());
+      }
+
+      for (int i = 0; i < numberOfHasBitsObjects; i++) {
+        ProtoObject hasBitsObject =
+            createProtoObject(
+                objectIterator.computeNextIfAbsent(this::invalidObjectsFailure), dynamicMethod);
+        if (!hasBitsObject.isProtoFieldObject()) {
+          throw new InvalidRawMessageInfoException();
+        }
+        builder.addHasBitsObject(hasBitsObject.asProtoFieldObject());
+      }
+
+      boolean isProto2 = ProtoUtils.isProto2(flags);
+      for (int i = 0; i < fieldCount; i++) {
+        // Extract field-specific portion of "info" string.
+        int fieldNumber = infoIterator.nextIntComputeIfAbsent(this::invalidInfoFailure);
+        int fieldTypeWithExtraBits = infoIterator.nextIntComputeIfAbsent(this::invalidInfoFailure);
+        ProtoFieldType fieldType = factory.createField(fieldTypeWithExtraBits);
+        if (fieldType.serialize() != fieldTypeWithExtraBits) {
+          throw new CompilationError(
+              "Unexpected proto field type `" + fieldTypeWithExtraBits + "`");
+        }
+
+        OptionalInt auxData;
+        if (fieldType.hasAuxData(isProto2)) {
+          auxData = OptionalInt.of(infoIterator.nextIntComputeIfAbsent(this::invalidInfoFailure));
+        } else {
+          auxData = OptionalInt.empty();
+        }
+
+        // Extract field-specific portion of "objects" array.
+        int numberOfObjects = fieldType.numberOfObjects(isProto2, factory);
+        try {
+          List<ProtoObject> objects = new ArrayList<>(numberOfObjects);
+          for (Value value : objectIterator.take(numberOfObjects)) {
+            objects.add(createProtoObject(value, dynamicMethod));
+          }
+          builder.addField(new ProtoFieldInfo(fieldNumber, fieldType, auxData, objects));
+        } catch (NoSuchElementException e) {
+          throw new InvalidRawMessageInfoException();
+        }
+      }
+
+      // Verify that the input was fully consumed.
+      if (infoIterator.hasNext() || objectIterator.hasNext()) {
+        throw new InvalidRawMessageInfoException();
+      }
+
+      return builder.build();
+    } catch (InvalidRawMessageInfoException | ProtoMessageInfoBuilderException e) {
+      // This should generally not happen, so leave an assert here just in case.
+      assert false;
+      return null;
+    }
+  }
+
+  private ProtoObject createProtoObject(Value value, ProgramMethod context)
+      throws InvalidRawMessageInfoException {
+    Value root = value.getAliasedValue();
+    if (!root.isPhi()) {
+      Instruction definition = root.definition;
+      if (definition.isConstClass()) {
+        ConstClass constClass = definition.asConstClass();
+        return new ProtoTypeObject(constClass.getType());
+      } else if (definition.isConstString()) {
+        ConstString constString = definition.asConstString();
+        DexEncodedField field =
+            context.getHolder().lookupUniqueInstanceFieldWithName(constString.getValue());
+        if (field != null) {
+          return new LiveProtoFieldObject(field.getReference());
+        }
+        // This const-string refers to a field that no longer exists. In this case, we create a
+        // special dead-object instead of failing with an InvalidRawMessageInfoException below.
+        return new DeadProtoFieldObject(context.getHolderType(), constString.getValue());
+      } else if (definition.isDexItemBasedConstString()) {
+        DexItemBasedConstString constString = definition.asDexItemBasedConstString();
+        DexReference reference = constString.getItem();
+        NameComputationInfo<?> nameComputationInfo = constString.getNameComputationInfo();
+        if (reference.isDexField() && nameComputationInfo.isFieldNameComputationInfo()) {
+          DexField field = reference.asDexField();
+          DexEncodedField encodedField = context.getHolder().lookupInstanceField(field);
+          if (encodedField != null) {
+            return new LiveProtoFieldObject(field);
+          }
+          // This const-string refers to a field that no longer exists. In this case, we create a
+          // special dead-object instead of failing with an InvalidRawMessageInfoException below.
+          return new DeadProtoFieldObject(context.getHolderType(), field.name);
+        }
+      } else if (definition.isInvokeStatic()) {
+        InvokeStatic invoke = definition.asInvokeStatic();
+        if (invoke.arguments().isEmpty()) {
+          return new ProtoObjectFromInvokeStatic(invoke.getInvokedMethod());
+        }
+      } else if (definition.isStaticGet()) {
+        StaticGet staticGet = definition.asStaticGet();
+        return new ProtoObjectFromStaticGet(staticGet.getField());
+      }
+    }
+    throw new InvalidRawMessageInfoException();
+  }
+
+  private int invalidInfoFailure() throws InvalidRawMessageInfoException {
+    throw new InvalidRawMessageInfoException();
+  }
+
+  private Value invalidObjectsFailure() throws InvalidRawMessageInfoException {
+    throw new InvalidRawMessageInfoException();
+  }
+
+  public static ThrowingIntIterator<InvalidRawMessageInfoException> createInfoIterator(
+      Value infoValue) throws InvalidRawMessageInfoException {
+    if (!infoValue.isPhi() && infoValue.definition.isConstString()) {
+      return createInfoIterator(infoValue.definition.asConstString().getValue());
+    }
+    throw new InvalidRawMessageInfoException();
+  }
+
+  /** Returns an iterator that yields the integers that results from decoding the given string. */
+  private static ThrowingIntIterator<InvalidRawMessageInfoException> createInfoIterator(
+      DexString info) {
+    return new ThrowingIntIterator<InvalidRawMessageInfoException>() {
+
+      private final ThrowingCharIterator<UTFDataFormatException> charIterator = info.iterator();
+
+      @Override
+      public boolean hasNext() {
+        return charIterator.hasNext();
+      }
+
+      @Override
+      public int nextInt() throws InvalidRawMessageInfoException {
+        if (!hasNext()) {
+          throw new NoSuchElementException();
+        }
+        int value = 0;
+        int shift = 0;
+        while (true) {
+          char c;
+          try {
+            c = charIterator.nextChar();
+          } catch (UTFDataFormatException e) {
+            throw new InvalidRawMessageInfoException();
+          }
+          if (c >= 0xD800 && c < 0xE000) {
+            throw new InvalidRawMessageInfoException();
+          }
+          if (c < 0xD800) {
+            return value | (c << shift);
+          }
+          value |= (c & 0x1FFF) << shift;
+          shift += 13;
+          if (!hasNext()) {
+            throw new InvalidRawMessageInfoException();
+          }
+        }
+      }
+    };
+  }
+
+  private static class InvalidRawMessageInfoException extends Exception {}
+}

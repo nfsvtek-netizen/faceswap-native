@@ -1,0 +1,159 @@
+// Copyright (c) 2023, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.examples;
+
+import static org.junit.Assume.assumeFalse;
+
+import com.android.tools.r8.R8FullTestBuilder;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
+import com.android.tools.r8.TestRuntime.CfRuntime;
+import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.ToolHelper.DexVm.Version;
+import com.android.tools.r8.debug.CfDebugTestConfig;
+import com.android.tools.r8.debug.DebugStreamComparator;
+import com.android.tools.r8.debug.DebugTestBase;
+import com.android.tools.r8.debug.DebugTestConfig;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.function.Consumer;
+import org.junit.Assume;
+import org.junit.Test;
+import org.junit.runners.Parameterized.Parameters;
+
+public abstract class ExamplesTestBase extends DebugTestBase {
+
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters()
+        .withAllRuntimesAndApiLevels()
+        .withPartialCompilation()
+        .enableApiLevelsForCf()
+        .build();
+  }
+
+  public final TestParameters parameters;
+
+  public ExamplesTestBase(TestParameters parameters) {
+    this.parameters = parameters;
+  }
+
+  @Test
+  public void testDesugaring() throws Exception {
+    runTestDesugaring();
+  }
+
+  @Test
+  public void testR8() throws Exception {
+    runTestR8();
+  }
+
+  @Test
+  public void testDebug() throws Exception {
+    runTestDebugComparator();
+  }
+
+  public abstract String getExpected();
+
+  public abstract Class<?> getMainClass();
+
+  public List<Class<?>> getTestClasses() throws Exception {
+    return Collections.singletonList(getMainClass());
+  }
+
+  /**
+   * Returns a list of extra program files (JARs or directories containing class files) to be
+   * included in the test. These files will be added to the program files for compilation (D8/R8)
+   * and to the classpath for JVM execution.
+   */
+  protected List<Path> getExtraProgramFiles() throws Exception {
+    return Collections.emptyList();
+  }
+
+  public void runTestDesugaring() throws Exception {
+    testForDesugaring(parameters)
+        .addProgramClasses(getTestClasses())
+        .addProgramFiles(getExtraProgramFiles())
+        .run(parameters.getRuntime(), getMainClass())
+        .assertSuccessWithOutput(getExpected());
+  }
+
+  public void runTestR8() throws Exception {
+    runTestR8(unused -> {});
+  }
+
+  public void runTestR8(Consumer<R8FullTestBuilder> modifier) throws Exception {
+    parameters.assumeR8TestParameters();
+    parameters.assumeNoPartialCompilation("TODO");
+    testForR8(parameters.getBackend())
+        .addOptionsModification(o -> o.testing.roundtripThroughLir = true)
+        .setMinApi(parameters)
+        .addProgramClasses(getTestClasses())
+        .addProgramFiles(getExtraProgramFiles())
+        .addKeepMainRule(getMainClass())
+        .apply(modifier::accept)
+        .run(parameters.getRuntime(), getMainClass())
+        .assertSuccessWithOutput(getExpected());
+  }
+
+  public void runTestDebugComparator() throws Exception {
+    assumeFalse(ToolHelper.isWindows());
+    assumeFalse("Debugging not enabled in 12.0.0", parameters.isDexRuntimeVersion(Version.V12_0_0));
+    Assume.assumeTrue(
+        "Streaming on Dalvik DEX runtimes has some unknown interference issue",
+        parameters.isCfRuntime() || parameters.isDexRuntimeVersionNewerThanOrEqual(Version.V6_0_1));
+    parameters.assumeNoPartialCompilation("TODO");
+
+    String mainTypeName = getMainClass().getTypeName();
+    DebugStreamComparator comparator =
+        new DebugStreamComparator()
+            .add("JVM", streamDebugTest(getJvmConfig(), mainTypeName, ANDROID_FILTER))
+            .add("D8", streamDebugTest(getD8Config(), mainTypeName, ANDROID_FILTER))
+            .setFilter(
+                state -> state.getClassName().startsWith(getMainClass().getPackage().getName()));
+
+    // Only add R8 on the representative config.
+    if (parameters.isR8TestParameters()) {
+      comparator.add("R8", streamDebugTest(getR8Config(), mainTypeName, ANDROID_FILTER));
+    }
+
+    comparator.compare();
+  }
+
+  private CfDebugTestConfig getJvmConfig() throws Exception {
+    // We can't use `testForJvm` as we want to build the reference even for non-representative API.
+    CfRuntime cfRuntime =
+        parameters.isCfRuntime() ? parameters.asCfRuntime() : CfRuntime.getDefaultCfRuntime();
+    Path jar = temp.newFolder().toPath().resolve("out.jar");
+    writeClassesToJar(jar, getTestClasses());
+    List<Path> paths = new ArrayList<>();
+    paths.add(jar);
+    paths.addAll(getExtraProgramFiles());
+    return new CfDebugTestConfig(cfRuntime, paths);
+  }
+
+  private DebugTestConfig getD8Config() throws Exception {
+    return testForD8(parameters.getBackend())
+        .addProgramClasses(getTestClasses())
+        .addProgramFiles(getExtraProgramFiles())
+        .setMinApi(parameters)
+        .compile()
+        .debugConfig(parameters.getRuntime());
+  }
+
+  private DebugTestConfig getR8Config() throws Exception {
+    return testForR8(parameters.getBackend())
+        .setMinApi(parameters)
+        .addProgramClasses(getTestClasses())
+        .addProgramFiles(getExtraProgramFiles())
+        .addKeepMainRule(getMainClass())
+        .addKeepRules("-keep,allowshrinking class *")
+        .addKeepAllAttributes()
+        .debug()
+        .compile()
+        .debugConfig(parameters.getRuntime());
+  }
+}

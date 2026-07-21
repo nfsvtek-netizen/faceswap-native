@@ -1,0 +1,647 @@
+// Copyright (c) 2023, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+import java.nio.file.Paths
+
+plugins {
+  `java-library`
+  id("dependencies-plugin")
+}
+
+java {
+  sourceCompatibility = JvmCompatibility.sourceCompatibility
+  targetCompatibility = JvmCompatibility.targetCompatibility
+  toolchain { languageVersion = JavaLanguageVersion.of(JvmCompatibility.release) }
+}
+
+val testJarsScope by configurations.dependencyScope("testJarsScope")
+val testJars by configurations.resolvable("testJars") { extendsFrom(testJarsScope) }
+
+val testbaseTestJarsScope by configurations.dependencyScope("testbaseTestJarsScope")
+val testbaseTestJars by
+  configurations.resolvable("testbaseTestJars") { extendsFrom(testbaseTestJarsScope) }
+
+val testDepsJarsScope by configurations.dependencyScope("testDepsJarsScope")
+val testDepsJars by configurations.resolvable("testDepsJars") { extendsFrom(testDepsJarsScope) }
+
+val mainDepsJarFilesScope by configurations.dependencyScope("mainDepsJarFilesScope")
+val mainDepsJarFilesConfig by
+  configurations.resolvable("mainDepsJarFilesConfig") { extendsFrom(mainDepsJarFilesScope) }
+
+val mainSourcesScope by configurations.dependencyScope("mainSourcesScope")
+val mainSourcesConfig by
+  configurations.resolvable("mainSourcesConfig") { extendsFrom(mainSourcesScope) }
+
+val assistantJarScope by configurations.dependencyScope("assistantJarScope")
+val assistantJarConfig by
+  configurations.resolvable("assistantJarConfig") { extendsFrom(assistantJarScope) }
+val keepRadiusSourcesScope by configurations.dependencyScope("keepRadiusSourcesScope")
+val keepRadiusSourcesConfig by
+  configurations.resolvable("keepRadiusSourcesConfig") { extendsFrom(keepRadiusSourcesScope) }
+val keepAnnoAndroidXAnnotationsJarScope by
+  configurations.dependencyScope("keepAnnoAndroidXAnnotationsJarScope")
+val keepAnnoAndroidXAnnotationsJarConfig by
+  configurations.resolvable("keepAnnoAndroidXAnnotationsJarConfig") {
+    extendsFrom(keepAnnoAndroidXAnnotationsJarScope)
+  }
+val keepAnnoDepsJarOnlyAsmScope by configurations.dependencyScope("keepAnnoDepsJarOnlyAsmScope")
+val keepAnnoDepsJarOnlyAsmConfig by
+  configurations.resolvable("keepAnnoDepsJarOnlyAsmConfig") {
+    extendsFrom(keepAnnoDepsJarOnlyAsmScope)
+  }
+val keepAnnoSourcesScope by configurations.dependencyScope("keepAnnoSourcesScope")
+val keepAnnoSourcesConfig by
+  configurations.resolvable("keepAnnoSourcesConfig") { extendsFrom(keepAnnoSourcesScope) }
+val keepAnnoClassesScope by configurations.dependencyScope("keepAnnoClassesScope")
+val keepAnnoClassesConfig by
+  configurations.resolvable("keepAnnoClassesConfig") { extendsFrom(keepAnnoClassesScope) }
+
+val resourceShrinkerSourcesScope by configurations.dependencyScope("resourceShrinkerSourcesScope")
+val resourceShrinkerSourcesConfig by
+  configurations.resolvable("resourceShrinkerSourcesConfig") {
+    extendsFrom(resourceShrinkerSourcesScope)
+  }
+
+val sharedDepsScope by configurations.dependencyScope("sharedDepsScope")
+val sharedDepsConfig by
+  configurations.resolvable("sharedDepsConfig") { extendsFrom(sharedDepsScope) }
+
+val sharedTestDepsScope by configurations.dependencyScope("sharedTestDepsScope")
+val sharedTestDepsConfig by
+  configurations.resolvable("sharedTestDepsConfig") { extendsFrom(sharedTestDepsScope) }
+
+val sharedDepsInternalScope by configurations.dependencyScope("sharedDepsInternalScope")
+val sharedDepsInternalConfig by
+  configurations.resolvable("sharedDepsInternalConfig") { extendsFrom(sharedDepsInternalScope) }
+
+val sharedTestDepsInternalScope by configurations.dependencyScope("sharedTestDepsInternalScope")
+val sharedTestDepsInternalConfig by
+  configurations.resolvable("sharedTestDepsInternalConfig") {
+    extendsFrom(sharedTestDepsInternalScope)
+  }
+
+dependencies {
+  sharedDepsScope(project(":third_party", "sharedDepsFiles"))
+  sharedTestDepsScope(project(":third_party", "sharedTestDepsFiles"))
+  sharedDepsInternalScope(project(":third_party", "sharedDepsInternalFiles"))
+  sharedTestDepsInternalScope(project(":third_party", "sharedTestDepsInternalFiles"))
+  assistantJarScope(project(":assistant", "assistantJar"))
+  keepRadiusSourcesScope(project(":keepradius", "keepradiusSources"))
+  keepAnnoAndroidXAnnotationsJarScope(project(":keepanno", "keepannoAndroidXAnnotationsJar"))
+  keepAnnoDepsJarOnlyAsmScope(project(":keepanno", "keepannoDepsJarOnlyAsm"))
+  keepAnnoSourcesScope(project(":keepanno", "keepannoSources"))
+  keepAnnoClassesScope(project(":keepanno", "keepannoClasses"))
+  testJarsScope(project(":tests_java_8", "testJar"))
+  testJarsScope(project(":tests_java_11", "testJar"))
+  testJarsScope(project(":tests_java_17", "testJar"))
+  testJarsScope(project(":tests_java_21", "testJar"))
+  testJarsScope(project(":tests_java_25", "testJar"))
+  testJarsScope(project(":tests_bootstrap", "testJar"))
+  testbaseTestJarsScope(project(":testbase", "testJar"))
+  testDepsJarsScope(project(":tests_bootstrap", "depsJar"))
+  testDepsJarsScope(project(":testbase", "depsJar"))
+  mainDepsJarFilesScope(project(":dist", "depsJarFiles"))
+  mainSourcesScope(project(":main", "mainSources"))
+  resourceShrinkerSourcesScope(project(":resourceshrinker", "resourceshrinkerSources"))
+}
+
+val libanalyzerSourcesScope by configurations.dependencyScope("libanalyzerSourcesScope")
+val libanalyzerSourcesConfig by
+  configurations.resolvable("libanalyzerSourcesConfig") { extendsFrom(libanalyzerSourcesScope) }
+
+dependencies { libanalyzerSourcesScope(project(":libanalyzer", "libanalyzer-sources-jar")) }
+
+val mainProtoJarTask = project(":dist").tasks.getByName("protoJar")
+val mainDepsJarTask = project(":dist").tasks.getByName("depsJar")
+val swissArmyKnifeTask = project(":dist").tasks.getByName("swissArmyKnife")
+val processKeepRulesLibWithRelocatedDepsTask =
+  project(":dist").tasks.getByName("processKeepRulesLibWithRelocatedDeps")
+val r8WithRelocatedDepsTask = project(":dist").tasks.getByName("r8WithRelocatedDeps")
+val keepAnnoToolsWithRelocatedDepsTask =
+  project(":dist").tasks.getByName("keepAnnoToolsWithRelocatedDeps")
+
+tasks {
+  withType<Exec> { doFirst { println("Executing command: ${commandLine.joinToString(" ")}") } }
+
+  "clean" {
+    dependsOn(":testbase:clean")
+    dependsOn(":tests_bootstrap:clean")
+    dependsOn(":tests_java_8:clean")
+    dependsOn(":tests_java_11:clean")
+    dependsOn(":tests_java_17:clean")
+    dependsOn(":tests_java_21:clean")
+    dependsOn(":tests_java_25:clean")
+  }
+
+  val packageTests by
+    registering(Jar::class) {
+      from(testJars.elements.map { it.map { zipTree(it) } })
+      exclude("META-INF/*.kotlin_module", "**/*.kotlin_metadata")
+      destinationDirectory.set(getRoot().resolveAll("build", "libs"))
+      archiveFileName.set("r8tests.jar")
+    }
+
+  val packageTestDeps by
+    registering(Jar::class) {
+      dependsOn(keepAnnoAndroidXAnnotationsJarConfig)
+      from(testDepsJars.elements.map { it.map { zipTree(it) } })
+      from(keepAnnoAndroidXAnnotationsJarConfig.map(::zipTree))
+      exclude("META-INF/*.kotlin_module", "**/*.kotlin_metadata", "org/jspecify/**", "org/jspecify")
+      duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+      destinationDirectory.set(getRoot().resolveAll("build", "libs"))
+      archiveFileName.set("test_deps_all.jar")
+    }
+
+  val packageTestBase by
+    registering(Jar::class) {
+      from(testbaseTestJars.elements.map { it.map { zipTree(it) } })
+      exclude("META-INF/*.kotlin_module", "**/*.kotlin_metadata")
+      destinationDirectory.set(getRoot().resolveAll("build", "libs"))
+      archiveFileName.set("r8test_base.jar")
+    }
+
+  val packageTestBaseExcludeKeep by
+    registering(Jar::class) {
+      dependsOn(packageTestBase)
+      from(zipTree(packageTestBase.getSingleOutputFile()))
+      // TODO(b/328353718): we have com.android.tools.r8.Keep in both test_base and main
+      exclude("com/android/tools/r8/Keep.class")
+      archiveFileName.set("r8test_base_no_keep.jar")
+    }
+
+  fun Exec.executeRelocator(jarProvider: TaskProvider<*>, artifactName: String) {
+    dependsOn(r8WithRelocatedDepsTask, jarProvider)
+    val outputJar = file(Paths.get("build", "libs", artifactName))
+    outputs.file(outputJar)
+    val r8WithRelocatedDepsJar = r8WithRelocatedDepsTask.getSingleOutputFile()
+    val testJar = jarProvider.getSingleOutputFile()
+    inputs.files(r8WithRelocatedDepsJar, testJar)
+    commandLine =
+      baseCompilerCommandLine(
+        r8WithRelocatedDepsJar,
+        "relocator",
+        listOf(
+          "--input",
+          "$testJar",
+          "--output",
+          "$outputJar",
+          "--map",
+          "kotlin.metadata.**->com.android.tools.r8.jetbrains.kotlin.metadata",
+        ),
+      )
+  }
+
+  // When testing R8 lib with relocated deps we must relocate kotlin.metadata in the tests, since
+  // types from kotlin.metadata are used on the R8 main/R8 test boundary.
+  //
+  // This is not needed when testing R8 lib excluding deps since we simply include the deps on the
+  // classpath at runtime.
+  val relocateTestsForR8LibWithRelocatedDeps by
+    registering(Exec::class) { executeRelocator(packageTests, "r8tests-relocated.jar") }
+
+  val relocateTestBaseForR8LibWithRelocatedDeps by
+    registering(Exec::class) { executeRelocator(packageTestBase, "r8testbase-relocated.jar") }
+
+  fun Exec.generateKeepRulesForR8Lib(
+    targetJarProviders: List<Task>,
+    testJarProviders: List<TaskProvider<*>>,
+    artifactName: String,
+  ) {
+    dependsOn(mainDepsJarFilesConfig, packageTestDeps, r8WithRelocatedDepsTask)
+    targetJarProviders.forEach(::dependsOn)
+    testJarProviders.forEach(::dependsOn)
+    val r8WithRelocatedDepsJar = r8WithRelocatedDepsTask.getSingleOutputFile()
+    val testDepsJar = packageTestDeps.getSingleOutputFile()
+    inputs.files(r8WithRelocatedDepsJar, testDepsJar)
+    inputs.files(mainDepsJarFilesConfig)
+    inputs.files(targetJarProviders.map { it.getSingleOutputFile() })
+    inputs.files(testJarProviders.map { it.getSingleOutputFile() })
+    val output = file(Paths.get("build", "libs", artifactName))
+    outputs.file(output)
+    val argList =
+      mutableListOf(
+        "--keep-rules",
+        "--allowobfuscation",
+        "--lib",
+        "${getJavaHome(Jdk.JDK_25)}",
+        "--lib",
+        "$testDepsJar",
+        "--output",
+        "$output",
+      )
+    mainDepsJarFilesConfig.forEach {
+      argList.add("--lib")
+      argList.add("$it")
+    }
+    targetJarProviders.forEach {
+      argList.add("--target")
+      argList.add("${it.getSingleOutputFile()}")
+    }
+    testJarProviders.forEach {
+      argList.add("--source")
+      argList.add("${it.getSingleOutputFile()}")
+    }
+    commandLine =
+      baseCompilerCommandLine(
+        listOf("-Dcom.android.tools.r8.tracereferences.obfuscateAllEnums"),
+        r8WithRelocatedDepsJar,
+        "tracereferences",
+        argList,
+      )
+  }
+
+  val generateKeepRulesForR8LibWithRelocatedDeps by
+    registering(Exec::class) {
+      generateKeepRulesForR8Lib(
+        listOf(r8WithRelocatedDepsTask),
+        listOf(relocateTestsForR8LibWithRelocatedDeps, relocateTestBaseForR8LibWithRelocatedDeps),
+        "generated-keep-rules-r8lib.txt",
+      )
+    }
+
+  val generateKeepRulesForR8LibNoDeps by
+    registering(Exec::class) {
+      generateKeepRulesForR8Lib(
+        listOf(swissArmyKnifeTask, mainProtoJarTask),
+        listOf(packageTests, packageTestBase),
+        "generated-keep-rules-r8lib-exclude-deps.txt",
+      )
+    }
+
+  fun Exec.assembleR8Lib(
+    inputJarProvider: Task,
+    generatedKeepRulesProvider: TaskProvider<Exec>,
+    classpath: List<File>,
+    artifactName: String,
+  ) {
+    dependsOn(
+      generatedKeepRulesProvider,
+      inputJarProvider,
+      r8WithRelocatedDepsTask,
+      assistantJarConfig,
+    )
+    dependOnPythonScripts()
+    val inputJar = inputJarProvider.getSingleOutputFile()
+    val r8WithRelocatedDepsJar = r8WithRelocatedDepsTask.getSingleOutputFile()
+    val assistantJar = assistantJarConfig.singleFile
+    val keepRuleFiles =
+      listOf(
+        getRoot().resolveAll("src", "main", "keep.txt"),
+        getRoot().resolveAll("src", "main", "discard.txt"),
+        generatedKeepRulesProvider.getSingleOutputFile(),
+        // TODO(b/294351878): Remove once enum issue is fixed
+        getRoot().resolveAll("src", "main", "keep_r8resourceshrinker.txt"),
+      )
+    inputs.files(listOf(r8WithRelocatedDepsJar, inputJar).union(keepRuleFiles).union(classpath))
+    val outputJar = getRoot().resolveAll("build", "libs", artifactName)
+    outputs.file(outputJar)
+    commandLine =
+      createR8LibCommandLine(
+        r8WithRelocatedDepsJar,
+        inputJar,
+        outputJar,
+        keepRuleFiles,
+        excludingDepsVariant = classpath.isNotEmpty(),
+        debugVariant = false,
+        classpath = classpath,
+        replaceFromJar = assistantJar,
+        enableHorizontalClassMerging = true,
+      )
+  }
+
+  val assembleR8LibNoDeps by
+    registering(Exec::class) {
+      dependsOn(mainDepsJarTask, mainProtoJarTask)
+      val mainDepsJar = mainDepsJarTask.getSingleOutputFile()
+      val mainProtoJar = mainProtoJarTask.getSingleOutputFile()
+      assembleR8Lib(
+        swissArmyKnifeTask,
+        generateKeepRulesForR8LibNoDeps,
+        listOf(mainDepsJar, mainProtoJar),
+        "r8lib-exclude-deps.jar",
+      )
+    }
+
+  val assembleR8LibWithRelocatedDeps by
+    registering(Exec::class) {
+      assembleR8Lib(
+        r8WithRelocatedDepsTask,
+        generateKeepRulesForR8LibWithRelocatedDeps,
+        listOf(),
+        "r8lib.jar",
+      )
+    }
+
+  val keepAnnoToolsLib by
+    registering(Exec::class) {
+      dependsOn(r8WithRelocatedDepsTask)
+      dependsOn(keepAnnoToolsWithRelocatedDepsTask)
+      dependsOn(keepAnnoDepsJarOnlyAsmConfig)
+      dependOnPythonScripts()
+      val inputJar = keepAnnoToolsWithRelocatedDepsTask.getSingleOutputFile()
+      val r8WithRelocatedDepsJar = r8WithRelocatedDepsTask.getSingleOutputFile()
+      val keepRuleFiles = listOf(getRoot().resolveAll("src", "keepanno", "keep.txt"))
+      inputs.files(listOf(r8WithRelocatedDepsJar, inputJar).union(keepRuleFiles))
+      val outputJar = getRoot().resolveAll("build", "libs", "keepanno-toolslib.jar")
+      outputs.file(outputJar)
+      commandLine =
+        createR8LibCommandLine(
+          r8WithRelocatedDepsJar,
+          inputJar,
+          outputJar,
+          keepRuleFiles,
+          excludingDepsVariant = false,
+          debugVariant = false,
+          classpath = listOf(keepAnnoDepsJarOnlyAsmConfig.singleFile),
+          versionJar = r8WithRelocatedDepsJar,
+        )
+    }
+
+  fun Task.generateTestKeepRulesForR8Lib(
+    r8LibJarProvider: TaskProvider<Exec>,
+    artifactName: String,
+  ) {
+    dependsOn(r8LibJarProvider)
+    val r8LibJar = r8LibJarProvider.getSingleOutputFile()
+    inputs.files(r8LibJar)
+    val output = rootProject.layout.buildDirectory.get().asFile.resolveAll("libs", artifactName)
+    outputs.files(output)
+    doLast {
+      // TODO(b/299065371): We should be able to take in the partition map output.
+      output.writeText(
+        """-keep class ** { *; }
+-dontshrink
+-dontoptimize
+-keepattributes *
+-applymapping $r8LibJar.map
+"""
+      )
+    }
+  }
+
+  val generateTestKeepRulesR8LibWithRelocatedDeps by registering {
+    generateTestKeepRulesForR8Lib(assembleR8LibWithRelocatedDeps, "r8lib-tests-keep.txt")
+  }
+
+  val generateTestKeepRulesR8LibNoDeps by registering {
+    generateTestKeepRulesForR8Lib(assembleR8LibNoDeps, "r8lib-exclude-deps-tests-keep.txt")
+  }
+
+  fun Exec.rewriteTestsForR8Lib(
+    keepRulesFileProvider: TaskProvider<Task>,
+    r8JarProvider: Task,
+    testJarProvider: TaskProvider<*>,
+    artifactName: String,
+    addTestBaseClasspath: Boolean,
+  ) {
+    dependsOn(
+      keepRulesFileProvider,
+      packageTestDeps,
+      relocateTestsForR8LibWithRelocatedDeps,
+      r8JarProvider,
+      r8WithRelocatedDepsTask,
+      testJarProvider,
+      packageTestBaseExcludeKeep,
+    )
+    val keepRulesFile = keepRulesFileProvider.getSingleOutputFile()
+    val r8Jar = r8JarProvider.getSingleOutputFile()
+    val r8WithRelocatedDepsJar = r8WithRelocatedDepsTask.getSingleOutputFile()
+    val testBaseJar = packageTestBaseExcludeKeep.getSingleOutputFile()
+    val testDepsJar = packageTestDeps.getSingleOutputFile()
+    val testJar = testJarProvider.getSingleOutputFile()
+    inputs.files(keepRulesFile, r8Jar, r8WithRelocatedDepsJar, testDepsJar, testJar)
+    val outputJar = getRoot().resolveAll("build", "libs", artifactName)
+    outputs.file(outputJar)
+    val args =
+      mutableListOf(
+        "--classfile",
+        "--debug",
+        "--lib",
+        "${getJavaHome(Jdk.JDK_25)}",
+        "--classpath",
+        "$r8Jar",
+        "--classpath",
+        "$testDepsJar",
+        "--output",
+        "$outputJar",
+        "--pg-conf",
+        "$keepRulesFile",
+        "$testJar",
+      )
+    if (addTestBaseClasspath) {
+      args.add("--classpath")
+      args.add("$testBaseJar")
+    }
+    commandLine =
+      baseCompilerCommandLine(
+        listOf("-Dcom.android.tools.r8.tracereferences.obfuscateAllEnums"),
+        r8WithRelocatedDepsJar,
+        "r8",
+        args,
+      )
+  }
+
+  val rewriteTestsForR8LibWithRelocatedDeps by
+    registering(Exec::class) {
+      rewriteTestsForR8Lib(
+        generateTestKeepRulesR8LibWithRelocatedDeps,
+        r8WithRelocatedDepsTask,
+        relocateTestsForR8LibWithRelocatedDeps,
+        "r8libtestdeps-cf.jar",
+        true,
+      )
+    }
+
+  val rewriteTestBaseForR8LibWithRelocatedDeps by
+    registering(Exec::class) {
+      rewriteTestsForR8Lib(
+        generateTestKeepRulesR8LibWithRelocatedDeps,
+        r8WithRelocatedDepsTask,
+        relocateTestBaseForR8LibWithRelocatedDeps,
+        "r8libtestbase-cf.jar",
+        false,
+      )
+    }
+
+  val rewriteTestsForR8LibNoDeps by
+    registering(Exec::class) {
+      rewriteTestsForR8Lib(
+        generateTestKeepRulesR8LibNoDeps,
+        swissArmyKnifeTask,
+        packageTests,
+        "r8lib-exclude-deps-testdeps-cf.jar",
+        true,
+      )
+    }
+
+  val cleanUnzipTests by
+    registering(Delete::class) {
+      dependsOn(packageTests)
+      val outputDir = layout.buildDirectory.dir("unpacked/test")
+      setDelete(outputDir)
+    }
+
+  val unzipTests by
+    registering(Copy::class) {
+      dependsOn(cleanUnzipTests, packageTests)
+      val outputDir = layout.buildDirectory.dir("unpacked/test")
+      from(zipTree(packageTests.getSingleOutputFile()))
+      into(outputDir)
+    }
+
+  val unzipTestBase by
+    registering(Copy::class) {
+      dependsOn(cleanUnzipTests, packageTestBase)
+      val outputDir = layout.buildDirectory.dir("unpacked/testbase")
+      from(zipTree(packageTestBase.getSingleOutputFile()))
+      into(outputDir)
+    }
+
+  fun Copy.unzipRewrittenTestsForR8Lib(
+    rewrittenTestJarProvider: TaskProvider<Exec>,
+    outDirName: String,
+  ) {
+    dependsOn(rewrittenTestJarProvider)
+    val outputDir = layout.buildDirectory.dir("unpacked/$outDirName")
+    val rewrittenTestJar = rewrittenTestJarProvider.getSingleOutputFile()
+    from(zipTree(rewrittenTestJar))
+    into(outputDir)
+  }
+
+  val cleanUnzipRewrittenTestsForR8LibWithRelocatedDeps by
+    registering(Delete::class) {
+      val outputDir = layout.buildDirectory.dir("unpacked/rewrittentests-r8lib")
+      setDelete(outputDir)
+    }
+
+  val unzipRewrittenTestsForR8LibWithRelocatedDeps by
+    registering(Copy::class) {
+      dependsOn(cleanUnzipRewrittenTestsForR8LibWithRelocatedDeps)
+      unzipRewrittenTestsForR8Lib(rewriteTestsForR8LibWithRelocatedDeps, "rewrittentests-r8lib")
+    }
+
+  val cleanUnzipRewrittenTestsForR8LibNoDeps by
+    registering(Delete::class) {
+      val outputDir = layout.buildDirectory.dir("unpacked/rewrittentests-r8lib-exclude-deps")
+      setDelete(outputDir)
+    }
+
+  val unzipRewrittenTestsForR8LibNoDeps by
+    registering(Copy::class) {
+      dependsOn(cleanUnzipRewrittenTestsForR8LibNoDeps)
+      unzipRewrittenTestsForR8Lib(rewriteTestsForR8LibNoDeps, "rewrittentests-r8lib-exclude-deps")
+    }
+
+  fun Test.testR8Lib(r8Lib: TaskProvider<Exec>, unzipRewrittenTests: TaskProvider<Copy>) {
+    logger.info("NOTE: Number of processors " + Runtime.getRuntime().availableProcessors())
+    logger.info("NOTE: Max parallel forks " + maxParallelForks)
+    dependsOn(
+      packageTestDeps,
+      processKeepRulesLibWithRelocatedDepsTask,
+      r8Lib,
+      r8WithRelocatedDepsTask,
+      swissArmyKnifeTask,
+      assembleR8LibNoDeps,
+      rewriteTestBaseForR8LibWithRelocatedDeps,
+      unzipRewrittenTests,
+      unzipTests,
+      unzipTestBase,
+    )
+    val processKeepRulesLibJar = processKeepRulesLibWithRelocatedDepsTask.getSingleOutputFile()
+    val r8LibJar = r8Lib.getSingleOutputFile()
+    val r8LibPartitionMapFile = file(r8LibJar.toString() + "_map.zip")
+    val r8WithRelocatedDepsJar = r8WithRelocatedDepsTask.getSingleOutputFile()
+    val swissArmyKnifeJar = swissArmyKnifeTask.getSingleOutputFile()
+    configure(
+      isR8Lib = true,
+      r8Jar = r8WithRelocatedDepsJar,
+      r8LibPartitionMapFile = r8LibPartitionMapFile,
+    )
+
+    // R8lib should be used instead of the main output and all the tests in r8 should be mapped and
+    // exists in r8LibTestPath.
+    classpath =
+      files(
+        packageTestDeps.get().getOutputs().getFiles(),
+        r8LibJar,
+        unzipRewrittenTests.get().getOutputs().getFiles(),
+        rewriteTestBaseForR8LibWithRelocatedDeps.getSingleOutputFile(),
+      )
+    testClassesDirs = unzipRewrittenTests.get().getOutputs().getFiles()
+    systemProperty("TEST_DATA_LOCATION", unzipTests.getSingleOutputFile())
+    systemProperty("TESTBASE_DATA_LOCATION", unzipTestBase.getSingleOutputFile())
+
+    systemProperty(
+      "BUILD_PROP_KEEPANNO_RUNTIME_PATH",
+      extractClassesPaths("keepanno" + File.separator, keepAnnoClassesConfig.asPath),
+    )
+    systemProperty("BUILD_PROP_PROCESS_KEEP_RULES_RUNTIME_PATH", processKeepRulesLibJar)
+    systemProperty("BUILD_PROP_R8_RUNTIME_PATH", r8LibJar)
+    systemProperty("R8_DEPS", mainDepsJarFilesConfig.asPath)
+    systemProperty("com.android.tools.r8.artprofilerewritingcompletenesscheck", "true")
+    systemProperty("R8_SWISS_ARMY_KNIFE", swissArmyKnifeJar)
+    systemProperty("R8_WITH_RELOCATED_DEPS", r8WithRelocatedDepsJar)
+
+    javaLauncher = getJavaLauncher(Jdk.JDK_25)
+
+    reports.junitXml.outputLocation.set(getRoot().resolveAll("build", "test-results", "test"))
+    reports.html.outputLocation.set(getRoot().resolveAll("build", "reports", "tests", "test"))
+  }
+
+  val testR8LibWithRelocatedDeps by
+    registering(Test::class) {
+      testR8Lib(assembleR8LibWithRelocatedDeps, unzipRewrittenTestsForR8LibWithRelocatedDeps)
+    }
+
+  val testR8LibNoDeps by
+    registering(Test::class) { testR8Lib(assembleR8LibNoDeps, unzipRewrittenTestsForR8LibNoDeps) }
+
+  val packageSources by
+    registering(Jar::class) {
+      dependsOn(keepRadiusSourcesConfig)
+      dependsOn(keepAnnoSourcesConfig)
+      dependsOn(libanalyzerSourcesConfig)
+      dependsOn(resourceShrinkerSourcesConfig)
+      dependsOn(mainSourcesConfig)
+      from(keepRadiusSourcesConfig.map(::zipTree))
+      from(keepAnnoSourcesConfig.map(::zipTree))
+      from(libanalyzerSourcesConfig.map(::zipTree))
+      from(mainSourcesConfig.map(::zipTree))
+      from(resourceShrinkerSourcesConfig.map(::zipTree))
+      archiveClassifier.set("sources")
+      archiveFileName.set("r8-src.jar")
+      destinationDirectory.set(getRoot().resolveAll("build", "libs"))
+    }
+
+  test {
+    dependsOn(sharedDepsConfig)
+    dependsOn(sharedTestDepsConfig)
+    if (!project.hasProperty("no_internal")) {
+      dependsOn(sharedDepsInternalConfig)
+      dependsOn(sharedTestDepsInternalConfig)
+    }
+    // Build processkeepruleslib.jar when running with --only_internal.
+    if (project.hasProperty("only_internal")) {
+      dependsOn(processKeepRulesLibWithRelocatedDepsTask)
+    }
+    if (project.hasProperty("r8lib")) {
+      dependsOn(testR8LibWithRelocatedDeps)
+    } else if (project.hasProperty("r8lib_no_deps")) {
+      dependsOn(testR8LibNoDeps)
+    } else {
+      dependsOn(":tests_java_8:testAll")
+      dependsOn(":tests_java_11:test")
+      dependsOn(":tests_java_17:test")
+      dependsOn(":tests_java_21:test")
+      dependsOn(":tests_java_25:test")
+      dependsOn(":tests_bootstrap:test")
+    }
+  }
+}
+
+fun Task.getSingleOutputFile(): File = getOutputs().getSingleOutputFile()
+
+fun TaskOutputs.getSingleOutputFile(): File = getFiles().getSingleFile()
+
+fun TaskProvider<*>.getSingleOutputFile(): File = get().getSingleOutputFile()

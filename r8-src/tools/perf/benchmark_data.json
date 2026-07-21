@@ -1,0 +1,60 @@
+[{
+  "author": "Christoffer Adamsen",
+  "hash": "e6a33325a4a4bac599ffce1f75cab8505a35d02a",
+  "submitted": "Thu Jun 06 13:07:44 2024 +0200",
+  "title": "Allow compiling CompileDumpCompatR8 in isolation",
+  "benchmarks": {
+    "NowInAndroidApp": {
+      "benchmark_name": "NowInAndroidApp",
+      "results": [
+        {
+          "code_size": 1,
+          "instruction_code_size": 2,
+          "composable_code_size": 3,
+          "oat_code_size": 4,
+          "resource_size": 5,
+          "runtime": 1
+        },
+        {
+          "code_size": 1,
+          "instruction_code_size": 2,
+          "composable_code_size": 3,
+          "oat_code_size": 4,
+          "resource_size": 5,
+          "runtime": 1
+        },
+        {
+          "code_size": 1,
+          "instruction_code_size": 2,
+          "composable_code_size": 3,
+          "oat_code_size": 4,
+          "resource_size": 5,
+          "runtime": 1
+        }
+      ]
+    },
+    "TiviApp": {
+      "benchmark_name": "TiviApp",
+      "results": [
+        {
+          "code_size": 1,
+          "instruction_code_size": 2,
+          "composable_code_size": 3,
+          "oat_code_size": 4,
+          "resource_size": 5,
+          "runtime": 1
+        },
+        {
+        },
+        {
+          "code_size": 1,
+          "instruction_code_size": 2,
+          "composable_code_size": 3,
+          "oat_code_size": 4,
+          "resource_size": 5,
+          "runtime": 1
+        }
+      ]
+    }
+  }
+}]

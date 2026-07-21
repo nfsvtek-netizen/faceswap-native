@@ -1,0 +1,513 @@
+// Copyright (c) 2017, the R8 project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+package com.android.tools.r8.shaking;
+
+import static com.google.common.base.Predicates.alwaysTrue;
+
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.utils.internal.IterableUtils;
+import com.android.tools.r8.utils.internal.ListUtils;
+import com.android.tools.r8.utils.internal.TraversalContinuation;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Sets;
+import it.unimi.dsi.fastutil.objects.Object2BooleanArrayMap;
+import it.unimi.dsi.fastutil.objects.Object2BooleanMap.Entry;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+public abstract class ProguardClassNameList {
+
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  public static ProguardClassNameList emptyList() {
+    return new EmptyClassNameList();
+  }
+
+  public static ProguardClassNameList singletonList(ProguardTypeMatcher matcher) {
+    return new SingleClassNameList(matcher);
+  }
+
+  public abstract ProguardTypeMatcherAndNegation getLast();
+
+  public abstract boolean isMatchAnyClassPattern();
+
+  public abstract int size();
+
+  public static class Builder {
+
+    /** Map used to store pairs of patterns and whether they are negated. */
+    private final Object2BooleanArrayMap<ProguardTypeMatcher> matchers =
+        new Object2BooleanArrayMap<>();
+
+    private Builder() {
+    }
+
+    public Builder addClassName(boolean isNegated, ProguardTypeMatcher className) {
+      matchers.put(className, isNegated);
+      return this;
+    }
+
+    public ProguardClassNameList build() {
+      if (matchers.containsValue(true)) {
+        // At least one pattern is negated.
+        return new MixedClassNameList(matchers);
+      } else {
+        if (matchers.size() == 1) {
+          return new SingleClassNameList(Iterables.getOnlyElement(matchers.keySet()));
+        } else {
+          return new PositiveClassNameList(matchers.keySet());
+        }
+      }
+    }
+
+  }
+
+  public abstract void writeTo(StringBuilder builder);
+
+  @Override
+  public String toString() {
+    StringBuilder builder = new StringBuilder();
+    writeTo(builder);
+    return builder.toString();
+  }
+
+  @Override
+  public abstract boolean equals(Object o);
+
+  @Override
+  public abstract int hashCode();
+
+  public abstract boolean hasSingleSpecificType();
+
+  public DexType getSingleSpecificType() {
+    return null;
+  }
+
+  public abstract boolean hasSpecificTypes();
+
+  public Set<DexType> getSpecificTypes() {
+    return null;
+  }
+
+  public abstract boolean matches(DexType type);
+
+  protected final Iterable<ProguardWildcard> getWildcards() {
+    return getWildcardsThatMatches(alwaysTrue());
+  }
+
+  protected <T extends ProguardWildcard> Iterable<T> getWildcardsThatMatches(
+      Predicate<? super ProguardWildcard> predicate) {
+    return IterableUtils.empty();
+  }
+
+  public boolean hasWildcards() {
+    return getWildcards().iterator().hasNext();
+  }
+
+  static <T extends ProguardWildcard> Iterable<T> getWildcardsThatMatchesOrEmpty(
+      ProguardClassNameList nameList, Predicate<? super ProguardWildcard> predicate) {
+    return nameList != null ? nameList.getWildcardsThatMatches(predicate) : IterableUtils.empty();
+  }
+
+  protected ProguardClassNameList materialize(DexItemFactory dexItemFactory) {
+    return this;
+  }
+
+  public abstract TraversalContinuation<?, ?> traverseTypeMatchers(
+      Function<ProguardTypeMatcherAndNegation, TraversalContinuation<?, ?>> fn);
+
+  private static class EmptyClassNameList extends ProguardClassNameList {
+
+    private EmptyClassNameList() {
+    }
+
+    @Override
+    public ProguardTypeMatcherAndNegation getLast() {
+      throw new IndexOutOfBoundsException();
+    }
+
+    @Override
+    public boolean isMatchAnyClassPattern() {
+      return false;
+    }
+
+    @Override
+    public int size() {
+      return 0;
+    }
+
+    @Override
+    public void writeTo(StringBuilder builder) {
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      return o instanceof EmptyClassNameList;
+    }
+
+    @Override
+    public int hashCode() {
+      return 7;
+    }
+
+    @Override
+    public boolean hasSingleSpecificType() {
+      return false;
+    }
+
+    @Override
+    public boolean hasSpecificTypes() {
+      return false;
+    }
+
+    @Override
+    public boolean matches(DexType type) {
+      return false;
+    }
+
+    @Override
+    public TraversalContinuation<?, ?> traverseTypeMatchers(
+        Function<ProguardTypeMatcherAndNegation, TraversalContinuation<?, ?>> fn) {
+      return TraversalContinuation.doContinue();
+    }
+  }
+
+  static class SingleClassNameList extends ProguardClassNameList {
+
+    final ProguardTypeMatcher className;
+
+    private SingleClassNameList(ProguardTypeMatcher className) {
+      this.className = className;
+    }
+
+    @Override
+    public ProguardTypeMatcherAndNegation getLast() {
+      return new ProguardTypeMatcherAndNegation(className);
+    }
+
+    @Override
+    public boolean isMatchAnyClassPattern() {
+      return className.isMatchAnyClassPattern();
+    }
+
+    @Override
+    public int size() {
+      return 1;
+    }
+
+    @Override
+    public void writeTo(StringBuilder builder) {
+      builder.append(className.toString());
+    }
+
+    @Override
+    @SuppressWarnings("EqualsGetClass")
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      SingleClassNameList that = (SingleClassNameList) o;
+      return Objects.equals(className, that.className);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hashCode(className);
+    }
+
+    @Override
+    public boolean hasSingleSpecificType() {
+      return className.hasSpecificType();
+    }
+
+    @Override
+    public DexType getSingleSpecificType() {
+      return className.getSpecificType();
+    }
+
+    @Override
+    public boolean hasSpecificTypes() {
+      return className.hasSpecificType() || className.hasSpecificTypes();
+    }
+
+    @Override
+    public Set<DexType> getSpecificTypes() {
+      if (className.hasSpecificType()) {
+        return Collections.singleton(className.getSpecificType());
+      }
+      if (className.hasSpecificTypes()) {
+        return className.getSpecificTypes();
+      }
+      return null;
+    }
+
+    @Override
+    public boolean matches(DexType type) {
+      return className.matches(type);
+    }
+
+    @Override
+    protected <T extends ProguardWildcard> Iterable<T> getWildcardsThatMatches(
+        Predicate<? super ProguardWildcard> predicate) {
+      return className.getWildcardsThatMatches(predicate);
+    }
+
+    @Override
+    protected SingleClassNameList materialize(DexItemFactory dexItemFactory) {
+      return new SingleClassNameList(className.materialize(dexItemFactory));
+    }
+
+    @Override
+    public TraversalContinuation<?, ?> traverseTypeMatchers(
+        Function<ProguardTypeMatcherAndNegation, TraversalContinuation<?, ?>> fn) {
+      return fn.apply(new ProguardTypeMatcherAndNegation(className));
+    }
+  }
+
+  private static class PositiveClassNameList extends ProguardClassNameList {
+
+    private final ImmutableList<ProguardTypeMatcher> classNames;
+
+    private Set<DexType> specificTypes;
+
+    private PositiveClassNameList(Collection<ProguardTypeMatcher> classNames) {
+      this.classNames = ImmutableList.copyOf(classNames);
+      assert !hasSpecificTypes() || getSpecificTypes().size() > 1;
+    }
+
+    @Override
+    public ProguardTypeMatcherAndNegation getLast() {
+      ProguardTypeMatcher last = ListUtils.last(classNames);
+      return new ProguardTypeMatcherAndNegation(last);
+    }
+
+    @Override
+    public boolean isMatchAnyClassPattern() {
+      return false;
+    }
+
+    @Override
+    public int size() {
+      return classNames.size();
+    }
+
+    @Override
+    public void writeTo(StringBuilder builder) {
+      boolean first = true;
+      for (ProguardTypeMatcher className : classNames) {
+        if (!first) {
+          builder.append(',');
+        }
+        builder.append(className);
+        first = false;
+      }
+    }
+
+    @Override
+    @SuppressWarnings("EqualsGetClass")
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      PositiveClassNameList that = (PositiveClassNameList) o;
+      return Objects.equals(classNames, that.classNames);
+    }
+
+    @Override
+    public int hashCode() {
+      return classNames.hashCode();
+    }
+
+    @Override
+    public boolean hasSingleSpecificType() {
+      return false;
+    }
+
+    @Override
+    public boolean hasSpecificTypes() {
+      return getSpecificTypes() != null;
+    }
+
+    @Override
+    public Set<DexType> getSpecificTypes() {
+      if (specificTypes == null) {
+        if (Iterables.all(
+            classNames, className -> className.hasSpecificType() || className.hasSpecificTypes())) {
+          specificTypes = Sets.newIdentityHashSet();
+          for (var className : classNames) {
+            if (className.hasSpecificType()) {
+              specificTypes.add(className.getSpecificType());
+            } else {
+              assert className.hasSpecificTypes();
+              specificTypes.addAll(className.getSpecificTypes());
+            }
+          }
+        } else {
+          specificTypes = Collections.emptySet();
+        }
+      }
+      return specificTypes.isEmpty() ? null : specificTypes;
+    }
+
+
+    @Override
+    public boolean matches(DexType type) {
+      return Iterables.any(classNames, name -> name.matches(type));
+    }
+
+    @Override
+    protected <T extends ProguardWildcard> Iterable<T> getWildcardsThatMatches(
+        Predicate<? super ProguardWildcard> predicate) {
+      return IterableUtils.flatMap(
+          classNames, className -> className.getWildcardsThatMatches(predicate));
+    }
+
+    @Override
+    protected PositiveClassNameList materialize(DexItemFactory dexItemFactory) {
+      return new PositiveClassNameList(
+          classNames.stream()
+              .map(className -> className.materialize(dexItemFactory))
+              .collect(Collectors.toList()));
+    }
+
+    @Override
+    public TraversalContinuation<?, ?> traverseTypeMatchers(
+        Function<ProguardTypeMatcherAndNegation, TraversalContinuation<?, ?>> fn) {
+      for (ProguardTypeMatcher matcher : classNames) {
+        if (fn.apply(new ProguardTypeMatcherAndNegation(matcher)).shouldBreak()) {
+          return TraversalContinuation.doBreak();
+        }
+      }
+      return TraversalContinuation.doContinue();
+    }
+  }
+
+  private static class MixedClassNameList extends ProguardClassNameList {
+
+    private final Object2BooleanArrayMap<ProguardTypeMatcher> classNames;
+
+    private MixedClassNameList(Object2BooleanArrayMap<ProguardTypeMatcher> classNames) {
+      assert classNames != null;
+      this.classNames = classNames;
+    }
+
+    @Override
+    public ProguardTypeMatcherAndNegation getLast() {
+      if (classNames.isEmpty()) {
+        throw new IndexOutOfBoundsException();
+      }
+      var last = Iterators.getLast(classNames.object2BooleanEntrySet().fastIterator());
+      return new ProguardTypeMatcherAndNegation(last.getKey(), last.getBooleanValue());
+    }
+
+    @Override
+    public boolean isMatchAnyClassPattern() {
+      return false;
+    }
+
+    @Override
+    public int size() {
+      return classNames.size();
+    }
+
+    @Override
+    public void writeTo(StringBuilder builder) {
+      boolean first = true;
+      for (Entry<ProguardTypeMatcher> className : classNames.object2BooleanEntrySet()) {
+        if (!first) {
+          builder.append(',');
+        }
+        if (className.getBooleanValue()) {
+          builder.append('!');
+        }
+        builder.append(className.getKey().toString());
+        first = false;
+      }
+    }
+
+    @Override
+    @SuppressWarnings("EqualsGetClass")
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      MixedClassNameList that = (MixedClassNameList) o;
+      return Objects.equals(classNames, that.classNames);
+    }
+
+    @Override
+    public int hashCode() {
+      return classNames.hashCode();
+    }
+
+    @Override
+    public boolean hasSingleSpecificType() {
+      return false;
+    }
+
+    @Override
+    public boolean hasSpecificTypes() {
+      return false;
+    }
+
+    @Override
+    public boolean matches(DexType type) {
+      boolean lastWasNegated = false;
+      for (Entry<ProguardTypeMatcher> className : classNames.object2BooleanEntrySet()) {
+        if (className.getKey().matches(type)) {
+          // If we match a negation, abort as non-match. If we match a positive, return true.
+          return !className.getBooleanValue();
+        }
+        lastWasNegated = className.getBooleanValue();
+      }
+      return lastWasNegated;
+    }
+
+    @Override
+    protected <T extends ProguardWildcard> Iterable<T> getWildcardsThatMatches(
+        Predicate<? super ProguardWildcard> predicate) {
+      return IterableUtils.flatMap(
+          classNames.keySet(), className -> className.getWildcardsThatMatches(predicate));
+    }
+
+    @Override
+    protected ProguardClassNameList materialize(DexItemFactory dexItemFactory) {
+      Builder builder = builder();
+      classNames.forEach(
+          (m, negated) -> builder.addClassName(negated, m.materialize(dexItemFactory)));
+      return builder.build();
+    }
+
+    @Override
+    public TraversalContinuation<?, ?> traverseTypeMatchers(
+        Function<ProguardTypeMatcherAndNegation, TraversalContinuation<?, ?>> fn) {
+      for (var entry : classNames.object2BooleanEntrySet()) {
+        var matcher = new ProguardTypeMatcherAndNegation(entry.getKey(), entry.getBooleanValue());
+        if (fn.apply(matcher).shouldBreak()) {
+          return TraversalContinuation.doBreak();
+        }
+      }
+      return TraversalContinuation.doContinue();
+    }
+  }
+}
