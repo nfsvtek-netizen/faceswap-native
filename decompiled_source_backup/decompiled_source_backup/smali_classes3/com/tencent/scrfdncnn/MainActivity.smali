@@ -45,6 +45,8 @@
 
 .field private rgbaBuffer:[B
 
+.field private scrfdInitialized:Z
+
 
 # direct methods
 .method public constructor <init>()V
@@ -85,6 +87,10 @@
     .line 57
     const/4 v0, 0x0
     iput-boolean v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->mWarpActive:Z
+
+    .line 58
+    const/4 v0, 0x0
+    iput-boolean v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdInitialized:Z
 
     .line 60
     new-instance v0, Lcom/yourcompany/app/FaceWarpEngine;
@@ -341,12 +347,18 @@
 .end method
 
 .method public onDestroy()V
-    .locals 1
+    .locals 2
 
     .line 188
     iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->modelExecutor:Ljava/util/concurrent/ExecutorService;
 
     invoke-interface {v0}, Ljava/util/concurrent/ExecutorService;->shutdownNow()Ljava/util/List;
+
+    # ---- Teardown: destroy the new SCRFD Vulkan detector ----
+    iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->faceWarpEngine:Lcom/yourcompany/app/FaceWarpEngine;
+    if-eqz v0, :L_skip_scrfd_destroy
+    invoke-virtual {v0}, Lcom/yourcompany/app/FaceWarpEngine;->cleanupScrfdDetector()V
+:L_skip_scrfd_destroy
 
     .line 189
     invoke-super {p0}, Landroid/app/Activity;->onDestroy()V
@@ -436,13 +448,59 @@
     iput p3, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewWidth:I
     iput p4, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewHeight:I
 
+    # ---- Wire: init FaceWarpEngine + createScrfdDetector + loadScrfdModel ----
     iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->faceWarpEngine:Lcom/yourcompany/app/FaceWarpEngine;
     if-eqz v0, :L_end_init_engine
+
+    # init() returns native handle (old pipeline, still needed for warp)
     iget v1, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewWidth:I
     iget v2, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewHeight:I
     invoke-virtual {v0, v1, v2}, Lcom/yourcompany/app/FaceWarpEngine;->init(II)J
     move-result-wide v3
     invoke-virtual {v0, v3, v4}, Lcom/yourcompany/app/FaceWarpEngine;->setNativeHandle(J)V
+
+    # ---- Create SCRFD detector (skip every 10th frame) ----
+    iget-boolean v1, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdInitialized:Z
+    if-nez v1, :L_already_init
+
+    # createScrfdDetector(skipInterval=10) -> long handle
+    # Registers: v0=engine, v1=skipInterval
+    const/16 v1, 0xa
+    invoke-virtual {v0, v1}, Lcom/yourcompany/app/FaceWarpEngine;->createScrfdDetector(I)J
+    move-result-wide v1
+    invoke-virtual {v0, v1, v2}, Lcom/yourcompany/app/FaceWarpEngine;->setScrfdHandle(J)V
+
+    # ---- Load SCRFD model from assets ----
+    # loadScrfdModel(long handle, AssetManager am, String param, String bin)
+    # Need: instance + handle(long, 2 regs) + assetManager + paramPath + binPath = 6 regs
+    # => invoke-virtual/range {v0 .. v5}
+    #
+    # v0 = faceWarpEngine (instance)
+    # v1/v2 = scrfdHandle (long pair)
+    # v3 = AssetManager
+    # v4 = paramPath (String)
+    # v5 = binPath (String)
+
+    invoke-virtual {p0}, Lcom/tencent/scrfdncnn/MainActivity;->getAssets()Landroid/content/res/AssetManager;
+    move-result-object v3
+
+    iget-wide v1, p0, Lcom/yourcompany/app/FaceWarpEngine;->mScrfdHandle:J
+    # v0 = engine (from earlier iget-object)
+    # v1/v2 = scrfdHandle (long)
+    # v3 = assetManager
+
+    const-string v4, "scrfd_2.5g_bnkps_640x640.param"
+    const-string v5, "scrfd_2.5g_bnkps_640x640.bin"
+
+    invoke-virtual/range {v0 .. v5}, Lcom/yourcompany/app/FaceWarpEngine;->loadScrfdModel(JLandroid/content/res/AssetManager;Ljava/lang/String;Ljava/lang/String;)I
+
+    move-result v1
+
+    if-ltz v1, :L_already_init
+    const/4 v1, 0x1
+    iput-boolean v1, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdInitialized:Z
+
+:L_already_init
 :L_end_init_engine
 
     return-void
@@ -465,27 +523,19 @@
 .end method
 
 # ============================================================
-# CAMERA PREVIEW CALLBACK HOOK
-# ============================================================
+# CAMERA PREVIEW CALLBACK HOOK — REWRITTEN
+# Uses new detectFace() JNI instead of old SCRFDNcnn pipeline.
+#
 # Dalvik register layout for onPreviewFrame(byte[] data, Camera camera):
 #   p0 = this           (Lcom/tencent/scrfdncnn/MainActivity;)
 #   p1 = data           ([B  NV21 frame from camera hardware)
 #   p2 = camera         (Landroid/hardware/Camera;)
-#
-# Local registers v0..v6 (7 total):
-#   v0 = frameLength    (I, size of NV21 buffer)
-#   v1 = srcCopy        ([B, copy of frame for warp source)
-#   v2 = handleHi       (I, upper 32-bit of mNativeHandle)
-#   v3 = handleLo       (I, lower 32-bit of mNativeHandle)
-#   v4 = scratchInt     (I, temp)
-#   v5 = scratchWideHi  (I, temp for wide long comparison)
-#   v6 = scratchWideLo  (I, temp for wide long comparison)
 # ============================================================
 
 .method public onPreviewFrame([BLandroid/hardware/Camera;)V
     .locals 10
     .param p1, "data"    # [B
-    .param p2, "camera"    # Landroid/hardware/Camera;
+    .param p2, "camera"  # Landroid/hardware/Camera;
 
     .line 200
 
@@ -514,6 +564,18 @@
 
 :L_handle_ok
     # ------------------------------------------------------------------
+    # Guard 4: SCRFD detector must be initialized
+    # ------------------------------------------------------------------
+    iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->faceWarpEngine:Lcom/yourcompany/app/FaceWarpEngine;
+    invoke-virtual {v0}, Lcom/yourcompany/app/FaceWarpEngine;->getScrfdHandle()J
+    move-result-wide v0
+    const-wide/16 v2, 0x0L
+    cmp-long v4, v0, v2
+    if-nez v4, :L_scrfd_ok
+    goto :end_method
+
+:L_scrfd_ok
+    # ------------------------------------------------------------------
     # Get camera dimensions from parameters
     # ------------------------------------------------------------------
     invoke-virtual {p2}, Landroid/hardware/Camera;->getParameters()Landroid/hardware/Camera$Parameters;
@@ -527,82 +589,108 @@
     iput v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewHeight:I
 
     # ------------------------------------------------------------------
-    # NV21 to RGBA conversion (DELETED - Moved to Native)
+    # STEP 1: Convert NV21 to RGBA using native processFrame
+    #
+    # processFrame(byte[] nv21Data, byte[] rgbaData, byte[] outputBuffer)
+    # invoke-virtual/range {v0, v1, v2, v3} where:
+    #   v0 = faceWarpEngine (instance)
+    #   v1 = nv21Data
+    #   v2 = rgbaData
+    #   v3 = outputBuffer (warpOutBuffer)
+    #
+    # v0 = p0 = this (already available)
+    # We need v0 = faceWarpEngine. Use v5 for that.
     # ------------------------------------------------------------------
+
     iget v4, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewWidth:I
     iget v5, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewHeight:I
     mul-int v7, v4, v5
     mul-int/lit8 v9, v7, 0x4
 
+    # Allocate RGBA buffer if needed
     iget-object v6, p0, Lcom/tencent/scrfdncnn/MainActivity;->rgbaBuffer:[B
     if-eqz v6, :L_alloc_rgba
     array-length v0, v6
-    if-ge v0, v9, :L_call_process_frame_native
+    if-ge v0, v9, :L_run_convert
+
 :L_alloc_rgba
     new-array v6, v9, [B
     iput-object v6, p0, Lcom/tencent/scrfdncnn/MainActivity;->rgbaBuffer:[B
-:L_call_process_frame_native
-    # Native conversion will happen inside processFrame
 
-
-    # ------------------------------------------------------------------
-    # Call FaceWarpEngine.processFrame(byte[] nv21Data, byte[] rgbaData, byte[] outputBuffer)
-    #   p0 = this (Lcom/tencent/scrfdncnn/MainActivity;)
-    #   v0 = faceWarpEngine (Lcom/yourcompany/app/FaceWarpEngine;)
-    #   v1 = nv21Data (p1)
-    #   v2 = rgbaData (v6)
-    #   v3 = outputBuffer (warpOutBuffer)
-    #   v4 = previewWidth
-    #   v5 = previewHeight
-    #   v6 = rgbaBuffer
-    #   v7 = yBufferLength
-    #   v8 = uvBufferLength
-    #   v9 = rgbaBufferLength
-    #
-    # Registers for invoke-virtual/range: {instance, arg1, arg2, arg3, arg4, arg5}
-    #   {v0, p1, v6, v3}
-    #   v0 = faceWarpEngine
-    #   p1 = NV21 data
-    #   v6 = RGBA data
-    #   v3 = warpOutBuffer
-    #
-    # We need to ensure contiguous registers for the call.
-    # Let's use v0-v5 for the call, where v0 is the instance.
-    # v0 = faceWarpEngine
-    # v1 = p1 (nv21Data)
-    # v2 = v6 (rgbaData)
-    # v3 = warpOutBuffer
-    # ------------------------------------------------------------------
-
-    iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->faceWarpEngine:Lcom/yourcompany/app/FaceWarpEngine;
-    iget-object v3, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
-
-    # Ensure warpOutBuffer is allocated and sized correctly
-    if-eqz v3, :L_alloc_warp_out
-    array-length v1, v3
-    if-ge v1, v9, :L_call_process_frame
+:L_run_convert
+    # Allocate warpOutBuffer if needed
+    iget-object v8, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
+    if-eqz v8, :L_alloc_warp_out
+    array-length v0, v8
+    if-ge v0, v9, :L_do_convert
 
 :L_alloc_warp_out
-    new-array v3, v9, [B
-    iput-object v3, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
+    new-array v8, v9, [B
+    iput-object v8, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
 
-:L_call_process_frame
-    # Registers: v0 (faceWarpEngine), p1 (nv21Data), v6 (rgbaData), v3 (warpOutBuffer)
-    # Need to map to v0-v3 for invoke-virtual/range
-    # v0 = faceWarpEngine
-    # v1 = p1 (nv21Data)
-    # v2 = v6 (rgbaData)
-    # v3 = warpOutBuffer
-
+:L_do_convert
+    # v5 = faceWarpEngine instance
+    iget-object v5, p0, Lcom/tencent/scrfdncnn/MainActivity;->faceWarpEngine:Lcom/yourcompany/app/FaceWarpEngine;
+    # v6 = rgbaData (already set above)
+    # v8 = warpOutBuffer
+    # Need: invoke-virtual/range {v5, p1, v6, v8}
+    # These are NOT contiguous. Map to contiguous range.
+    #
+    # Use v0-v3 as temporary contiguous mapping:
+    #   v0 = v5 (faceWarpEngine)
+    #   v1 = p1 (nv21Data)
+    #   v2 = v6 (rgbaData)
+    #   v3 = v8 (warpOutBuffer)
+    move-object v0, v5
     move-object v1, p1
     move-object v2, v6
+    move-object v3, v8
 
     invoke-virtual/range {v0 .. v3}, Lcom/yourcompany/app/FaceWarpEngine;->processFrame([B[B[B)I
 
     move-result v0
 
     # ------------------------------------------------------------------
-    # If warp succeeded (ret >= 0), push warped buffer to display
+    # STEP 2: Run detectFace(scrfdHandle, rgbaData, width, height) -> int
+    #
+    # Java sig: native int detectFace(long handle, byte[] rgbaData, int w, int h)
+    #
+    # Dalvik register layout:
+    #   p0 = this
+    #   p1 = nv21 data (original, now unused)
+    #   p2 = camera (unused)
+    #   v0..v9 = locals
+    #
+    # invoke-virtual/range requires contiguous registers.
+    # We need: instance + long(2 regs) + byte[] + int + int = 6 regs
+    #
+    # Target register map:
+    #   v0 = instance (faceWarpEngine)
+    #   v1/v2 = scrfdHandle (long pair)
+    #   v3 = rgbaData ([B])
+    #   v4 = width (I)
+    #   v5 = height (I)
+    # ------------------------------------------------------------------
+
+    iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->faceWarpEngine:Lcom/yourcompany/app/FaceWarpEngine;
+    invoke-virtual {v0}, Lcom/yourcompany/app/FaceWarpEngine;->getScrfdHandle()J
+    move-result-wide v1
+
+    # v0 = faceWarpEngine instance
+    # v1/v2 = scrfdHandle (long pair, wide consumes v1 and v2)
+    # v3 = rgbaData
+    move-object v3, v6
+    # v4 = width
+    iget v4, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewWidth:I
+    # v5 = height
+    iget v5, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewHeight:I
+
+    invoke-virtual/range {v0 .. v5}, Lcom/yourcompany/app/FaceWarpEngine;->detectFace(J[BII)I
+
+    move-result v0
+
+    # ------------------------------------------------------------------
+    # If detectFace returned >= 0 (face detected), push frame to display
     # ------------------------------------------------------------------
     if-ltz v0, :end_method
 
@@ -610,9 +698,9 @@
     if-eqz v1, :end_method
 
     .line 210
-    iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdncnn:Lcom/tencent/scrfdncnn/SCRFDNcnn;
-    iget-object v1, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
-    invoke-virtual {v0, v1}, Lcom/tencent/scrfdncnn/SCRFDNcnn;->pushFrameBuffer([B)V
+    iget-object v2, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdncnn:Lcom/tencent/scrfdncnn/SCRFDNcnn;
+    iget-object v3, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
+    invoke-virtual {v2, v3}, Lcom/tencent/scrfdncnn/SCRFDNcnn;->pushFrameBuffer([B)V
 
     :end_method
     return-void
