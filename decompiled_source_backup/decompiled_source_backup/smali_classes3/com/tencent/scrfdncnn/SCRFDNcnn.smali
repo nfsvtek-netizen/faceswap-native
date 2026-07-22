@@ -13,6 +13,10 @@
     invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
 
     .line 29
+    const-string v0, "facewarp"
+
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+
     return-void
 .end method
 
@@ -37,4 +41,10 @@
 .end method
 
 .method public native setOutputWindow(Landroid/view/Surface;)Z
+.end method
+
+.method private native executeWarp(J[B[B[B)I
+.end method
+
+.method private native pushFrameBuffer([B)V
 .end method

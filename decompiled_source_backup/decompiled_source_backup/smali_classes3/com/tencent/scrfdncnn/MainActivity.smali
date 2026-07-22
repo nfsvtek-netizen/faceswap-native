@@ -4,6 +4,7 @@
 
 # interfaces
 .implements Landroid/view/SurfaceHolder$Callback;
+.implements Landroid/hardware/Camera$PreviewCallback;
 
 
 # static fields
@@ -23,11 +24,17 @@
 
 .field private final modelExecutor:Ljava/util/concurrent/ExecutorService;
 
+.field private mNativeHandle:J
+
+.field private mWarpActive:Z
+
 .field private scrfdncnn:Lcom/tencent/scrfdncnn/SCRFDNcnn;
 
 .field private spinnerCPUGPU:Landroid/widget/Spinner;
 
 .field private spinnerModel:Landroid/widget/Spinner;
+
+.field private warpOutBuffer:[B
 
 
 # direct methods
@@ -61,6 +68,14 @@
     move-result-object v0
 
     iput-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->modelExecutor:Ljava/util/concurrent/ExecutorService;
+
+    .line 56
+    const-wide/16 v0, 0x0L
+    iput-wide v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->mNativeHandle:J
+
+    .line 57
+    const/4 v0, 0x0
+    iput-boolean v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->mWarpActive:Z
 
     return-void
 .end method
@@ -399,19 +414,6 @@
 
     invoke-virtual {v0, v1}, Lcom/tencent/scrfdncnn/SCRFDNcnn;->setOutputWindow(Landroid/view/Surface;)Z
 
-    .line 152
-    invoke-virtual {p0}, Lcom/tencent/scrfdncnn/MainActivity;->getWindowManager()Landroid/view/WindowManager;
-    move-result-object v0
-    invoke-interface {v0}, Landroid/view/WindowManager;->getDefaultDisplay()Landroid/view/Display;
-    move-result-object v0
-    invoke-virtual {v0}, Landroid/view/Display;->getWidth()I
-    move-result v1
-    invoke-virtual {v0}, Landroid/view/Display;->getHeight()I
-    move-result v2
-
-    const/4 v0, 0x0
-    invoke-static {v0, v1, v2}, Lcom/tencent/scrfdncnn/FaceWarper;->drawOverlay(Landroid/graphics/Canvas;II)V
-
     .line 153
     return-void
 .end method
@@ -429,5 +431,147 @@
     .param p1, "holder"    # Landroid/view/SurfaceHolder;
 
     .line 162
+    return-void
+.end method
+
+# ============================================================
+# CAMERA PREVIEW CALLBACK HOOK
+# ============================================================
+# Dalvik register layout for onPreviewFrame(byte[] data, Camera camera):
+#   p0 = this           (Lcom/tencent/scrfdncnn/MainActivity;)
+#   p1 = data           ([B  NV21 frame from camera hardware)
+#   p2 = camera         (Landroid/hardware/Camera;)
+#
+# Local registers v0..v6 (7 total):
+#   v0 = frameLength    (I, size of NV21 buffer)
+#   v1 = srcCopy        ([B, copy of frame for warp source)
+#   v2 = handleHi       (I, upper 32-bit of mNativeHandle)
+#   v3 = handleLo       (I, lower 32-bit of mNativeHandle)
+#   v4 = scratchInt     (I, temp)
+#   v5 = scratchWideHi  (I, temp for wide long comparison)
+#   v6 = scratchWideLo  (I, temp for wide long comparison)
+# ============================================================
+
+.method public onPreviewFrame([BLandroid/hardware/Camera;)V
+    .locals 7
+    .param p1, "data"    # [B
+    .param p2, "camera"    # Landroid/hardware/Camera;
+
+    .line 200
+
+    # ------------------------------------------------------------------
+    # Guard 1: warp pipeline not yet activated
+    # ------------------------------------------------------------------
+    iget-boolean v4, p0, Lcom/tencent/scrfdncnn/MainActivity;->mWarpActive:Z
+    if-nez v4, :end_method
+
+    # ------------------------------------------------------------------
+    # Guard 2: SCRFD instance must be valid
+    # ------------------------------------------------------------------
+    iget-object v4, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdncnn:Lcom/tencent/scrfdncnn/SCRFDNcnn;
+    if-eqz v4, :end_method
+
+    # ------------------------------------------------------------------
+    # Guard 3: native handle must be non-zero (positive)
+    #   Use wide long compare:
+    #   v5/v6 = mNativeHandle (wide pair) -- these are the handle for the call
+    #   v3/v4 = scratch wide for comparison (NOT v5/v6 to avoid corruption)
+    # ------------------------------------------------------------------
+    iget-wide v5, p0, Lcom/tencent/scrfdncnn/MainActivity;->mNativeHandle:J
+    const-wide/16 v3, 0x0L
+    cmp-long v4, v5, v3
+    if-lez v4, :end_method
+
+    # ------------------------------------------------------------------
+    # At this point (safe -- v5/v6 handle pair was NOT corrupted):
+    #   v5 = handleHi (upper 32-bit of long)
+    #   v6 = handleLo (lower 32-bit of long)
+    #   v4 = cmp result (positive, not needed further)
+    #   v3 = scratch (reusable)
+    #
+    # Now v5/v6 hold the wide handle for the JNI call.
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # v0 = frame length
+    # ------------------------------------------------------------------
+    array-length v0, p1
+
+    # ------------------------------------------------------------------
+    # v1 = src copy (new byte array + arraycopy)
+    # ------------------------------------------------------------------
+    new-array v1, v0, [B
+    const/4 v3, 0x0
+    invoke-static {p1, v3, v1, v3, v0}, Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V
+
+    # ------------------------------------------------------------------
+    # At this point register state:
+    #   v0 = frameLength (I)
+    #   v1 = srcCopy     ([B)
+    #   v3 = scratch     (I) -- safe to reuse
+    #   v5 = handleHi    (I)  -- wide long part 1
+    #   v6 = handleLo    (I)  -- wide long part 2
+    #   p1 = original data ([B)
+    #
+    # We need to call:
+    #   executeWarp(long handle, byte[] src, byte[] tgt, byte[] out)
+    #
+    # invoke-virtual {receiver, handleHi, handleLo, src, tgt, out}
+    # ------------------------------------------------------------------
+
+    # v3 = reload SCRFDNcnn receiver (needed for invoke-virtual)
+    iget-object v3, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdncnn:Lcom/tencent/scrfdncnn/SCRFDNcnn;
+
+    # ------------------------------------------------------------------
+    # Allocate/reuse output buffer into v2
+    # ------------------------------------------------------------------
+    iget-object v2, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
+    if-eqz v2, :alloc_out
+    array-length v4, v2
+    if-ge v4, v0, :alloc_out
+    goto :got_out
+
+    :alloc_out
+    new-array v2, v0, [B
+    iput-object v2, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
+
+    :got_out
+    iget-object v2, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
+
+    # ------------------------------------------------------------------
+    # Final register state before invoke-virtual:
+    #   v3 = SCRFD recv  (obj)  --> receiver
+    #   v5 = handleHi    (I)   --> handle part 1 (wide)
+    #   v6 = handleLo    (I)   --> handle part 2 (wide)
+    #   v1 = srcCopy     ([B)  --> maps to 'src' param
+    #   v1 = srcCopy     ([B)  --> maps to 'tgt' param (passthrough)
+    #   v2 = outBuffer   ([B)  --> maps to 'out' param
+    #
+    # invoke-virtual {v3, v5, v6, v1, v1, v2}
+    #   v3 = receiver (SCRFDNcnn)
+    #   v5 = handleHi (long part 1)
+    #   v6 = handleLo (long part 2)
+    #   v1 = src ([B)
+    #   v1 = tgt ([B) -- same as src for passthrough
+    #   v2 = out ([B)
+    # ------------------------------------------------------------------
+    invoke-virtual {v3, v5, v6, v1, v1, v2}, Lcom/tencent/scrfdncnn/SCRFDNcnn;->executeWarp(J[B[B[B)I
+
+    move-result v3
+
+    # ------------------------------------------------------------------
+    # If warp succeeded (ret >= 0), push warped buffer to display
+    # ------------------------------------------------------------------
+    if-ltz v3, :end_method
+
+    iget-object v4, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
+    if-eqz v4, :end_method
+
+    .line 210
+    iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdncnn:Lcom/tencent/scrfdncnn/SCRFDNcnn;
+    iget-object v1, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
+    invoke-virtual {v0, v1}, Lcom/tencent/scrfdncnn/SCRFDNcnn;->pushFrameBuffer([B)V
+
+    :end_method
     return-void
 .end method
