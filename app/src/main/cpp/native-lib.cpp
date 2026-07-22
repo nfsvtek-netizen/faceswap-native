@@ -84,9 +84,12 @@ void nv21_to_rgba_neon(const uint8_t* __restrict nv21, uint8_t* __restrict rgba,
 JNIEXPORT jint JNICALL
 Java_com_yourcompany_app_FaceWarpEngine_processFrame(JNIEnv *env, jobject thiz, jbyteArray nv21_data,
                                                    jbyteArray rgba_data, jbyteArray output_buffer) {
-    jbyte* nv21 = env->GetByteArrayElements(nv21_data, NULL);
-    jbyte* rgba = env->GetByteArrayElements(rgba_data, NULL);
-    jbyte* out = env->GetByteArrayElements(output_buffer, NULL);
+    jboolean isCopy_nv21;
+    jboolean isCopy_rgba;
+    jboolean isCopy_out;
+    jbyte* nv21 = (jbyte*)env->GetPrimitiveArrayCritical(nv21_data, &isCopy_nv21);
+    jbyte* rgba = (jbyte*)env->GetPrimitiveArrayCritical(rgba_data, &isCopy_rgba);
+    jbyte* out = (jbyte*)env->GetPrimitiveArrayCritical(output_buffer, &isCopy_out);
 
     jclass clazz = env->GetObjectClass(thiz);
     jfieldID fidWidth = env->GetFieldID(clazz, "previewWidth", "I");
@@ -102,9 +105,9 @@ Java_com_yourcompany_app_FaceWarpEngine_processFrame(JNIEnv *env, jobject thiz, 
     // Mock face warping - in real scenario, this calls the engine
     memcpy(out, rgba, width * height * 4);
 
-    env->ReleaseByteArrayElements(nv21_data, nv21, JNI_ABORT);
-    env->ReleaseByteArrayElements(rgba_data, rgba, 0);
-    env->ReleaseByteArrayElements(output_buffer, out, 0);
+    env->ReleasePrimitiveArrayCritical(nv21_data, nv21, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(rgba_data, rgba, 0);
+    env->ReleasePrimitiveArrayCritical(output_buffer, out, 0);
 
     return 0;
 }
