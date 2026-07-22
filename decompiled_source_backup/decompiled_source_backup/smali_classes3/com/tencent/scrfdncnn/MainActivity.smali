@@ -527,56 +527,23 @@
     iput v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewHeight:I
 
     # ------------------------------------------------------------------
-    # NV21 to RGBA conversion
-    #   v4 = previewWidth
-    #   v5 = previewHeight
-    #   v6 = rgbaBuffer
-    #   v7 = yBufferLength
-    #   v8 = uvBufferLength
-    #   v9 = rgbaBufferLength
+    # NV21 to RGBA conversion (DELETED - Moved to Native)
     # ------------------------------------------------------------------
     iget v4, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewWidth:I
     iget v5, p0, Lcom/tencent/scrfdncnn/MainActivity;->previewHeight:I
-
     mul-int v7, v4, v5
-    div-int/lit8 v8, v7, 0x4
     mul-int/lit8 v9, v7, 0x4
 
     iget-object v6, p0, Lcom/tencent/scrfdncnn/MainActivity;->rgbaBuffer:[B
     if-eqz v6, :L_alloc_rgba
     array-length v0, v6
-    if-ge v0, v9, :L_convert_nv21
-
+    if-ge v0, v9, :L_call_process_frame_native
 :L_alloc_rgba
     new-array v6, v9, [B
     iput-object v6, p0, Lcom/tencent/scrfdncnn/MainActivity;->rgbaBuffer:[B
+:L_call_process_frame_native
+    # Native conversion will happen inside processFrame
 
-:L_convert_nv21
-    # Call NV21 to RGBA conversion (simplified, actual implementation would be more complex)
-    # For demonstration, we'll just copy the Y plane to R, G, B and set A to 255
-    # In a real scenario, this would be a native call or a more complex Java routine.
-    # Since the problem asks for a Java/Smali routine, we'll simulate it.
-
-    const/4 v0, 0x0
-    :L_loop_y_plane
-    if-ge v0, v7, :L_end_loop_y_plane
-    aget-byte v1, p1, v0
-    and-int/lit16 v1, v1, 0xff
-    mul-int/lit8 v2, v0, 0x4
-    int-to-byte v3, v1
-    aput-byte v3, v6, v2
-    add-int/lit8 v3, v2, 0x1
-    int-to-byte v1, v1
-    aput-byte v1, v6, v3
-    add-int/lit8 v1, v2, 0x2
-    int-to-byte v3, v1
-    aput-byte v3, v6, v1
-    add-int/lit8 v1, v2, 0x3
-    const/16 v3, 0xff
-    aput-byte v3, v6, v1
-    add-int/lit8 v0, v0, 0x1
-    goto :L_loop_y_plane
-:L_end_loop_y_plane
 
     # ------------------------------------------------------------------
     # Call FaceWarpEngine.processFrame(byte[] nv21Data, byte[] rgbaData, byte[] outputBuffer)
