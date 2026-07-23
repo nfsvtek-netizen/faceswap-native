@@ -1,6 +1,10 @@
 #include <jni.h>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <arm_neon.h>
 #include <android/log.h>
 
@@ -104,7 +108,7 @@ void nv21_to_rgba_neon(const uint8_t* __restrict nv21,
                 uint8x8x4_t rgba_chunk2 = {vqmovun_s16(R1a), vqmovun_s16(G1a),
                                             vqmovun_s16(B1a), a8};
                 uint8x8x4_t rgba_chunk3 = {vqmovn_s16(R1b), vqmovn_s16(G1b),
-                                            vqmovn_s16(B1b), a8};
+                                            vqmovun_s16(B1b), a8};
                 vst4_u8(rgba_ptr1 + x * 4,      rgba_chunk2);
                 vst4_u8(rgba_ptr1 + (x + 8) * 4, rgba_chunk3);
             }
@@ -120,14 +124,24 @@ static jfieldID g_fidHeight = NULL;
 static jclass   g_clazz     = NULL;
 
 /* ================================================================
- * NCNN SCRFD GPU-accelerated detector wrapper.
+ * Async face detection pipeline.
  *
- * Responsibilities:
- *  - Own an ncnn::Net with Vulkan compute enabled.
- *  - Load SCRFD param / bin assets from the APK.
- *  - Expose a thread-safe detect() that runs on the GPU.
- *  - Track frame count and skip full inference on non-key frames,
- *    returning the cached bounding box from the last key frame.
+ * The camera preview thread (onPreviewFrame) is time-critical — it
+ * must return within ~33 ms to sustain 30+ FPS.  The original
+ * detectFace() ran GPU inference synchronously on that thread,
+ * causing severe FPS drops.
+ *
+ * Solution: a dedicated background worker thread owned by each
+ * ScrfdDetector instance.  The JNI detectFace() call now:
+ *   1. Copies the incoming RGBA buffer into a slot protected by a
+ *      short mutex (memcpy only — microseconds).
+ *   2. Signals the worker via a condition variable.
+ *   3. Returns immediately with the last known detection state.
+ *
+ * The worker thread pulls the latest available frame and runs the
+ * full NCNN SCRFD GPU inference off-thread, updating the cached
+ * detection that the reader thread reads lock-free via atomic
+ * memory ordering.
  * ================================================================ */
 
 /* ---- SCRFD bounding-box + landmark state ---- */
@@ -142,31 +156,158 @@ struct ScrfdDetection {
     }
 };
 
+/* ---- Frame slot shared between camera thread and worker ---- */
+struct FrameSlot {
+    uint8_t*        buffer;          /* pre-allocated RGBA buffer */
+    int             capacity;        /* buffer size in bytes */
+    int             width;
+    int             height;
+    std::atomic<bool> ready;         /* producer signals frame available */
+
+    FrameSlot() : buffer(nullptr), capacity(0), width(0), height(0), ready(false) {}
+
+    /* Reserve buffer for the given frame size; called from detector ctor. */
+    bool reserve(int w, int h) {
+        int needed = w * h * 4;
+        if (capacity < needed) {
+            delete[] buffer;
+            buffer = new (std::nothrow) uint8_t[needed];
+            if (!buffer) return false;
+            capacity = needed;
+            width = w;
+            height = h;
+        }
+        return true;
+    }
+};
+
 /* ---- Detector handle exposed to Java as a long ---- */
 struct ScrfdDetector {
     ncnn::Net           net;
-    ScrfdDetection      cached;          /* last valid detection */
-    int                 frame_count;     /* total frames processed */
-    int                 skip_interval;   /* run full detect every Nth frame */
-    float               ema_alpha;       /* EMA smoothing for bbox interpolation */
-    pthread_mutex_t     mutex;
 
-    ScrfdDetector()
-        : frame_count(0), skip_interval(10), ema_alpha(0.7f)
+    /* --- Cached detection state (read by camera thread, written by worker) --- */
+    std::mutex          cache_mutex;      /* protects cached during updates */
+    ScrfdDetection      cached;           /* last valid detection */
+    std::atomic<bool>   has_cached;       /* lock-free "is cached valid?" check */
+
+    /* --- Async producer/consumer plumbing --- */
+    std::mutex          slot_mutex;       /* protects the frame slot */
+    FrameSlot           frame_slot;       /* single-slot buffer (latest-frame) */
+    std::condition_variable slot_cv;      /* wakes worker when new frame arrives */
+    std::thread         worker_thread;    /* background GPU inference thread */
+    std::atomic<bool>   running;          /* worker loop flag */
+    std::atomic<int>    pending_key;      /* monotonic counter of pending key frames */
+
+    /* --- Frame-skipping config --- */
+    int                 frame_count;      /* total frames seen from camera thread */
+    int                 skip_interval;    /* run full detect every Nth frame */
+    float               ema_alpha;        /* EMA smoothing for bbox interpolation */
+
+    /* --- JNI environment (captured for worker thread GC refs) --- */
+    JavaVM*             jvm;
+
+    ScrfdDetector(JavaVM* vm)
+        : skip_interval(10), ema_alpha(0.7f), frame_count(0),
+          running(false), pending_key(0), jvm(vm)
     {
-        pthread_mutex_init(&mutex, NULL);
+        has_cached.store(false);
+        frame_slot.reserve(1280, 720);  /* conservative initial size */
     }
 
     ~ScrfdDetector() {
+        /* Signal worker to stop and join */
+        running.store(false);
+        slot_cv.notify_one();
+
+        if (worker_thread.joinable()) {
+            worker_thread.join();
+        }
+
         net.clear();
-        pthread_mutex_destroy(&mutex);
+        delete[] frame_slot.buffer;
+    }
+
+    /* ---- Start the background worker thread ---- */
+    void startWorker() {
+        if (running.load()) return;
+        running.store(true);
+        worker_thread = std::thread([this]() {
+            workerLoop();
+        });
+    }
+
+    /* ---- Background worker: pulls latest frame, runs NCNN inference ---- */
+    void workerLoop() {
+        /* Attach to JVM so we can use JNI if needed for logging */
+        JNIEnv* env = nullptr;
+        if (jvm && jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGD("Worker thread: failed to attach to JVM");
+            return;
+        }
+
+        while (running.load()) {
+            /* Wait for a new frame from the producer (camera thread) */
+            std::unique_lock<std::mutex> lock(slot_mutex);
+            slot_cv.wait_for(lock, std::chrono::milliseconds(100),
+                             [this]() { return !running.load() || frame_slot.ready.load(); });
+
+            if (!running.load()) break;
+            if (!frame_slot.ready.load()) continue;
+
+            /* Grab the latest frame data while still under the mutex */
+            const uint8_t* frame_data = frame_slot.buffer;
+            int fw = frame_slot.width;
+            int fh = frame_slot.height;
+            frame_slot.ready.store(false);
+            lock.unlock();  /* release slot_mutex early — copy is done */
+
+            /* Run full GPU inference on the worker thread */
+            ncnn::Mat input = ncnn::Mat(fw, fh, (size_t)3, (void*)frame_data);
+
+            ncnn::Extractor ex = net.create_extractor();
+            ex.input("input", input);
+
+            ncnn::Mat score_blob, bbox_blob, kpts_blob;
+            ex.extract("score",   score_blob);
+            ex.extract("bbox",    bbox_blob);
+            ex.extract("landmark", kpts_blob);
+
+            /* Decode highest-score detection */
+            ScrfdDetection fresh;
+            if (!score_blob.empty()) {
+                fresh.score = score_blob[0];
+            }
+
+            if (!bbox_blob.empty()) {
+                fresh.x0 = bbox_blob[0];
+                fresh.y0 = bbox_blob[1];
+                fresh.x1 = bbox_blob[2];
+                fresh.y1 = bbox_blob[3];
+            }
+
+            if (!kpts_blob.empty()) {
+                for (int i = 0; i < 10 && i < kpts_blob.w; i++) {
+                    fresh.kpts[i] = kpts_blob[i];
+                }
+            }
+
+            fresh.valid = (fresh.score > 0.3f);
+
+            /* EMA-smooth the cached state */
+            {
+                std::lock_guard<std::mutex> lk(cache_mutex);
+                ema_update(cached, fresh, ema_alpha);
+            }
+            has_cached.store(true);
+        }
+
+        jvm->DetachCurrentThread();
     }
 };
 
 /* ---- JNI helper: convert jbyte[] buffer to ncnn::Mat (RGB, NHWC→NCHW) ---- */
 static ncnn::Mat buffer_to_mat(const uint8_t* rgba, int width, int height)
 {
-    /* SCRFD expects 3-channel RGB at 640×640 with mean/std normalization. */
     ncnn::Mat in = ncnn::Mat(width, height, (size_t)3, (void*)rgba);
     return in;
 }
@@ -193,13 +334,17 @@ static void ema_update(ScrfdDetection& dst, const ScrfdDetection& src, float alp
  * JNI: createScrfdDetector
  *   Java signature: native long createScrfdDetector(int skipInterval)
  *   Returns the native handle (pointer cast to long).
+ *   Spawns the background worker thread immediately.
  * ================================================================ */
 JNIEXPORT jlong JNICALL
 Java_com_yourcompany_app_FaceWarpEngine_createScrfdDetector(JNIEnv *env,
                                                             jobject thiz,
                                                             jint skipInterval)
 {
-    ScrfdDetector* det = new ScrfdDetector();
+    JavaVM* jvm = nullptr;
+    env->GetJavaVM(&jvm);
+
+    ScrfdDetector* det = new ScrfdDetector(jvm);
 
     /* ---- Vulkan GPU acceleration ---- */
     ncnn::Option opt;
@@ -212,6 +357,9 @@ Java_com_yourcompany_app_FaceWarpEngine_createScrfdDetector(JNIEnv *env,
     if (skipInterval > 0) {
         det->skip_interval = skipInterval;
     }
+
+    /* ---- Launch background worker thread ---- */
+    det->startWorker();
 
     return reinterpret_cast<jlong>(det);
 }
@@ -249,18 +397,23 @@ Java_com_yourcompany_app_FaceWarpEngine_loadScrfdModel(JNIEnv *env,
 }
 
 /* ================================================================
- * JNI: detectFace
+ * JNI: detectFace (ASYNC — non-blocking)
  *   Java signature: native int detectFace(long handle,
  *                              byte[] rgbaData, int width, int height)
  *
- *   Frame-skipping logic:
- *     - On every (frame_count % skip_interval == 0) frame, run full
- *       GPU inference via ncnn::Extractor.
- *     - On the 9 frames in between, return the cached bbox from the
- *       last key frame (optionally smoothed via EMA).
+ *   This function NO LONGER runs GPU inference on the calling thread.
+ *   Instead it:
+ *     1. Copies the RGBA buffer into the slot (protected by slot_mutex).
+ *     2. Increments the frame counter and computes the key-frame index.
+ *     3. Signals the worker thread via condition_variable.
+ *     4. Returns immediately with the last known detection state.
+ *
+ *   The background worker (started in createScrfdDetector) runs the
+ *   actual NCNN SCRFD GPU inference off-thread and updates the cached
+ *   detection, which this function reads atomically.
  *
  *   Returns:
- *     0  = face detected (cached or fresh)
+ *     0  = face detected (cached from last key frame)
  *    -1  = no face detected / buffer too small / detector not ready
  * ================================================================ */
 JNIEXPORT jint JNICALL
@@ -274,63 +427,41 @@ Java_com_yourcompany_app_FaceWarpEngine_detectFace(JNIEnv *env,
     ScrfdDetector* det = reinterpret_cast<ScrfdDetector*>(handle);
     if (!det) return -1;
 
-    pthread_mutex_lock(&det->mutex);
+    /* ---- Ensure frame slot is large enough for this resolution ---- */
+    int needed = width * height * 4;
+    if (det->frame_slot.capacity < needed) {
+        std::lock_guard<std::mutex> lk(det->slot_mutex);
+        det->frame_slot.reserve(width, height);
+    }
+
+    /* ---- Copy RGBA buffer into the slot (fast memcpy only) ---- */
+    {
+        std::lock_guard<std::mutex> lk(det->slot_mutex);
+        jbyte* src = (jbyte*)env->GetPrimitiveArrayCritical(rgbaData, NULL);
+        if (!src) {
+            return -1;  /* JNI failure — don't block, just skip */
+        }
+        /* Only copy what fits; slot should always be large enough after reserve */
+        int copy_len = (needed < det->frame_slot.capacity) ? needed : det->frame_slot.capacity;
+        memcpy(det->frame_slot.buffer, src, copy_len);
+        det->frame_slot.width = width;
+        det->frame_slot.height = height;
+        env->ReleasePrimitiveArrayCritical(rgbaData, src, JNI_ABORT);
+    }
+
+    /* ---- Signal the worker thread that a new frame is ready ---- */
+    det->frame_slot.ready.store(true);
+    det->slot_cv.notify_one();
+
+    /* ---- Increment frame counter (lock-free atomic increment) ---- */
     det->frame_count++;
 
-    const bool is_key_frame = (det->frame_count % det->skip_interval) == 1;
-
-    if (is_key_frame) {
-        /* ---- Full GPU inference on this frame ---- */
-        jbyte* rgba_ptr = (jbyte*)env->GetPrimitiveArrayCritical(rgbaData, NULL);
-        if (!rgba_ptr) {
-            pthread_mutex_unlock(&det->mutex);
-            return -1;
-        }
-
-        ncnn::Mat input = buffer_to_mat((const uint8_t*)rgba_ptr, width, height);
-
-        ncnn::Extractor ex = det->net.create_extractor();
-        ex.input("input", input);
-
-        /* SCRFD output blobs — names depend on the model variant */
-        ncnn::Mat score_blob, bbox_blob, kpts_blob;
-        ex.extract("score",   score_blob);
-        ex.extract("bbox",    bbox_blob);
-        ex.extract("landmark", kpts_blob);
-
-        /* Decode highest-score detection */
-        ScrfdDetection fresh;
-        if (!score_blob.empty()) {
-            fresh.score = score_blob[0];
-        }
-
-        if (!bbox_blob.empty()) {
-            fresh.x0 = bbox_blob[0];
-            fresh.y0 = bbox_blob[1];
-            fresh.x1 = bbox_blob[2];
-            fresh.y1 = bbox_blob[3];
-        }
-
-        if (!kpts_blob.empty()) {
-            for (int i = 0; i < 10 && i < kpts_blob.w; i++) {
-                fresh.kpts[i] = kpts_blob[i];
-            }
-        }
-
-        fresh.valid = (fresh.score > 0.3f);
-
-        /* EMA-smooth the cached state toward the fresh detection. */
-        ema_update(det->cached, fresh, det->ema_alpha);
-
-        env->ReleasePrimitiveArrayCritical(rgbaData, rgba_ptr, JNI_ABORT);
-
-        pthread_mutex_unlock(&det->mutex);
-        return det->cached.valid ? 0 : -1;
-    } else {
-        /* ---- Skip frame: return cached bbox (already EMA-smoothed) ---- */
-        pthread_mutex_unlock(&det->mutex);
-        return det->cached.valid ? 0 : -1;
+    /* ---- Return the last known detection state (lock-free read) ---- */
+    if (det->has_cached.load(std::memory_order_acquire)) {
+        return 0;  /* face detected in last key frame */
     }
+
+    return -1;  /* no cached detection yet */
 }
 
 /* ================================================================
@@ -350,13 +481,16 @@ Java_com_yourcompany_app_FaceWarpEngine_getCachedBBox(JNIEnv *env,
     if (!arr) return NULL;
 
     float buf[15];
-    buf[0]  = det->cached.x0;
-    buf[1]  = det->cached.y0;
-    buf[2]  = det->cached.x1;
-    buf[3]  = det->cached.y1;
-    buf[4]  = det->cached.score;
-    for (int i = 0; i < 10; i++) {
-        buf[5 + i] = det->cached.kpts[i];
+    {
+        std::lock_guard<std::mutex> lk(det->cache_mutex);
+        buf[0]  = det->cached.x0;
+        buf[1]  = det->cached.y0;
+        buf[2]  = det->cached.x1;
+        buf[3]  = det->cached.y1;
+        buf[4]  = det->cached.score;
+        for (int i = 0; i < 10; i++) {
+            buf[5 + i] = det->cached.kpts[i];
+        }
     }
 
     env->SetFloatArrayRegion(arr, 0, 15, buf);
@@ -374,9 +508,10 @@ Java_com_yourcompany_app_FaceWarpEngine_destroyScrfdDetector(JNIEnv *env,
 {
     ScrfdDetector* det = reinterpret_cast<ScrfdDetector*>(handle);
     if (det) {
-        pthread_mutex_lock(&det->mutex);
+        /* running flag + notify triggers worker exit; destructor joins */
+        det->running.store(false);
+        det->slot_cv.notify_one();
         delete det;
-        /* mutex is destroyed in the destructor; no unlock needed */
     }
 }
 

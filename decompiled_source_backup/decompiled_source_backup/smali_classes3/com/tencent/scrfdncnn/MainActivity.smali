@@ -690,10 +690,45 @@
     move-result v0
 
     # ------------------------------------------------------------------
-    # If detectFace returned >= 0 (face detected), push frame to display
+    # If detectFace returned >= 0 (face detected), run warp then push
     # ------------------------------------------------------------------
     if-ltz v0, :end_method
 
+    # v0 = detectFace result (>= 0 means face found)
+    # After detectFace, register state is clobbered — reload what we need:
+    #   v5 = faceWarpEngine
+    #   v6 = rgbaBuffer
+    #   v8 = warpOutBuffer
+
+    iget-object v5, p0, Lcom/tencent/scrfdncnn/MainActivity;->faceWarpEngine:Lcom/yourcompany/app/FaceWarpEngine;
+
+    # ---- STEP 3: Call executeWarp(nativeHandle, rgbaData, rgbaBuffer, warpOutBuffer) ----
+    # executeWarp signature: int executeWarp(long nativeHandle, byte[] rgbaData,
+    #                                         byte[] srcBuffer, byte[] dstBuffer)
+    # We need contiguous regs for invoke-virtual/range:
+    #   v0 = scrfdncnn instance
+    #   v1/v2 = mNativeHandle (long pair)
+    #   v3 = rgbaBuffer (source face data)
+    #   v4 = warpOutBuffer (destination)
+    # Total = 5 contiguous registers: v0..v4
+
+    iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdncnn:Lcom/tencent/scrfdncnn/SCRFDNcnn;
+
+    # Load the native handle from FaceWarpEngine (used as warp native handle)
+    invoke-virtual {v5}, Lcom/yourcompany/app/FaceWarpEngine;->getNativeHandle()J
+    move-result-wide v1
+
+    # v3 = rgbaBuffer (source face region)
+    move-object v3, v6
+
+    # v4 = warpOutBuffer (destination)
+    move-object v4, v8
+
+    invoke-virtual/range {v0 .. v4}, Lcom/tencent/scrfdncnn/SCRFDNcnn;->executeWarp(J[B[B[B)I
+
+    # ------------------------------------------------------------------
+    # STEP 4: Push the warped frame buffer to display
+    # ------------------------------------------------------------------
     iget-object v1, p0, Lcom/tencent/scrfdncnn/MainActivity;->warpOutBuffer:[B
     if-eqz v1, :end_method
 

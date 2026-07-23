@@ -48,3 +48,19 @@
 
 .method private native pushFrameBuffer([B)V
 .end method
+
+# ---- Public wrapper: exposes executeWarp to callers outside this class ----
+# Signature: int runWarp(long nativeHandle, byte[] rgbaData, byte[] srcBuffer, byte[] dstBuffer)
+.method public runWarp(J[B[B[B)I
+    .locals 1
+    .param p1, "nativeHandle"    # J
+    .param p2, "rgbaData"       # [B
+    .param p3, "srcBuffer"      # [B
+    .param p4, "dstBuffer"      # [B
+
+    invoke-direct {p0, p1, p2, p3, p4}, Lcom/tencent/scrfdncnn/SCRFDNcnn;->executeWarp(J[B[B[B)I
+
+    move-result v0
+
+    return v0
+.end method
