@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item type="id" name="buttonSwitchCamera" />
+    <item type="id" name="cameraview" />
+    <item type="id" name="loadingView" />
+    <item type="id" name="spinnerCPUGPU" />
+    <item type="id" name="spinnerModel" />
+</resources>

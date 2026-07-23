@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <public type="array" name="cpugpu_array" id="0x7f010000" />
+    <public type="array" name="model_array" id="0x7f010001" />
+    <public type="id" name="buttonSwitchCamera" id="0x7f020000" />
+    <public type="id" name="cameraview" id="0x7f020001" />
+    <public type="id" name="loadingView" id="0x7f020002" />
+    <public type="id" name="spinnerCPUGPU" id="0x7f020003" />
+    <public type="id" name="spinnerModel" id="0x7f020004" />
+    <public type="layout" name="main" id="0x7f030000" />
+    <public type="string" name="app_name" id="0x7f040000" />
+</resources>
