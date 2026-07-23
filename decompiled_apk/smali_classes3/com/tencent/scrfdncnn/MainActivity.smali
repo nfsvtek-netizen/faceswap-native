@@ -254,15 +254,12 @@
     move-result-wide v1
     invoke-virtual {v0, v1, v2}, Lcom/yourcompany/app/FaceWarpEngine;->setScrfdHandle(J)V
 
+    # v0 = engine, v1/v2 = handle
     invoke-virtual {p0}, Lcom/tencent/scrfdncnn/MainActivity;->getAssets()Landroid/content/res/AssetManager;
     move-result-object v3
     const-string v4, "scrfd_500m-opt2.param"
     const-string v5, "scrfd_500m-opt2.bin"
-    move-object v0, p0
-    iget-object v0, v0, Lcom/tencent/scrfdncnn/MainActivity;->faceWarpEngine:Lcom/yourcompany/app/FaceWarpEngine;
-    move-object v6, v0
-    move-wide v1, v1
-    invoke-virtual/range {v6 .. v5}, Lcom/yourcompany/app/FaceWarpEngine;->loadScrfdModel(JLandroid/content/res/AssetManager;Ljava/lang/String;Ljava/lang/String;)I
+    invoke-virtual/range {v0 .. v5}, Lcom/yourcompany/app/FaceWarpEngine;->loadScrfdModel(JLandroid/content/res/AssetManager;Ljava/lang/String;Ljava/lang/String;)I
     const/4 v0, 0x1
     iput-boolean v0, p0, Lcom/tencent/scrfdncnn/MainActivity;->scrfdInitialized:Z
 
@@ -284,7 +281,6 @@
 .end method
 
 .method public onPreviewFrame([BLandroid/hardware/Camera;)V
-    .locals 10
     .locals 10
     .param p1, "data"    # [B
     .param p2, "camera"  # Landroid/hardware/Camera;
