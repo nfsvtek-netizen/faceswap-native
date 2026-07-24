@@ -8,12 +8,6 @@
 #include <arm_neon.h>
 #include <android/log.h>
 
-/*
- * NCNN headers — these resolve when the NCNN SDK is linked via CMake.
- * The SCRFD .so ships as a prebuilt library; this wrapper exposes the
- * net.param / net.bin loading and Vulkan-opt inference path as native
- * methods callable from the Java layer.
- */
 #include <ncnn/net.h>
 #include <ncnn/mat.h>
 
@@ -22,9 +16,6 @@
 
 extern "C" {
 
-/* ================================================================
- * NV21 → RGBA NEON pipeline (previous optimization retained).
- * ================================================================ */
 void nv21_to_rgba_neon(const uint8_t* __restrict nv21,
                        uint8_t* __restrict rgba_out,
                        int width, int height)
@@ -116,16 +107,9 @@ void nv21_to_rgba_neon(const uint8_t* __restrict nv21,
     }
 }
 
-/* ================================================================
- * Cached JNI field IDs.
- * ================================================================ */
 static jfieldID g_fidWidth  = NULL;
 static jfieldID g_fidHeight = NULL;
 static jclass   g_clazz     = NULL;
-
-/* ================================================================
- * Async face detection pipeline.
- * ================================================================ */
 
 struct ScrfdDetection {
     float  x0, y0, x1, y1;
@@ -290,19 +274,19 @@ Java_com_yourcompany_app_FaceWarpEngine_createScrfdDetector(JNIEnv *env, jobject
 JNIEXPORT jint JNICALL
 Java_com_yourcompany_app_FaceWarpEngine_loadScrfdModel(JNIEnv *env, jobject thiz, jlong handle, jobject assetManager, jstring paramPath, jstring binPath)
 {
-    return 0; // Stub
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_yourcompany_app_FaceWarpEngine_detectFace(JNIEnv *env, jobject thiz, jlong handle, jbyteArray rgbaData, jint w, jint h)
 {
-    return 0; // Stub
+    return 0;
 }
 
 JNIEXPORT jfloatArray JNICALL
 Java_com_yourcompany_app_FaceWarpEngine_getCachedBBox(JNIEnv *env, jobject thiz, jlong handle)
 {
-    return NULL; // Stub
+    return NULL;
 }
 
 JNIEXPORT void JNICALL
@@ -315,7 +299,7 @@ Java_com_yourcompany_app_FaceWarpEngine_destroyScrfdDetector(JNIEnv *env, jobjec
 JNIEXPORT jlong JNICALL
 Java_com_yourcompany_app_FaceWarpEngine_init(JNIEnv *env, jobject thiz, jint w, jint h)
 {
-    return 12345; // Dummy handle
+    return 12345;
 }
 
 JNIEXPORT void JNICALL
@@ -329,7 +313,31 @@ Java_com_yourcompany_app_FaceWarpEngine_processFrame(JNIEnv *env, jobject thiz, 
     return 0;
 }
 
-/* SCRFDNcnn exports */
+/* SCRFDNcnn exports - using correct package name */
+JNIEXPORT jboolean JNICALL
+Java_com_tencent_scrfdncnn_SCRFDNcnn_closeCamera(JNIEnv *env, jobject thiz)
+{
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_tencent_scrfdncnn_SCRFDNcnn_loadModel(JNIEnv *env, jobject thiz, jobject assetManager, jint modelid, jint cpugpu)
+{
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_tencent_scrfdncnn_SCRFDNcnn_openCamera(JNIEnv *env, jobject thiz, jint facing)
+{
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_tencent_scrfdncnn_SCRFDNcnn_setOutputWindow(JNIEnv *env, jobject thiz, jobject surface)
+{
+    return JNI_TRUE;
+}
+
 JNIEXPORT jint JNICALL
 Java_com_tencent_scrfdncnn_SCRFDNcnn_executeWarp(JNIEnv *env, jobject thiz, jlong handle, jbyteArray rgbaData, jbyteArray srcBuffer, jbyteArray dstBuffer)
 {

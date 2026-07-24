@@ -1,6 +1,9 @@
 .class public Lcom/yourcompany/app/FaceWarpEngine;
 .super Ljava/lang/Object;
 
+# static fields
+.field private static final TAG:Ljava/lang/String; = "FaceWarpEngine"
+
 # instance fields
 .field private mNativeHandle:J
 .field private mScrfdHandle:J
@@ -21,6 +24,9 @@
     const-wide/16 v0, 0x0
     iput-wide v0, p0, Lcom/yourcompany/app/FaceWarpEngine;->mNativeHandle:J
     iput-wide v0, p0, Lcom/yourcompany/app/FaceWarpEngine;->mScrfdHandle:J
+    const/4 v0, 0x0
+    iput v0, p0, Lcom/yourcompany/app/FaceWarpEngine;->previewWidth:I
+    iput v0, p0, Lcom/yourcompany/app/FaceWarpEngine;->previewHeight:I
     return-void
 .end method
 
