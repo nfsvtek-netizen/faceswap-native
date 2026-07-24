@@ -98,8 +98,8 @@ void nv21_to_rgba_neon(const uint8_t* __restrict nv21,
                 uint8x8_t a8 = vdup_n_u8(255);
                 uint8x8x4_t rgba_chunk2 = {vqmovun_s16(R1a), vqmovun_s16(G1a),
                                             vqmovun_s16(B1a), a8};
-                uint8x8x4_t rgba_chunk3 = {vqmovn_s16(R1b), vqmovn_s16(G1b),
-                                            vqmovn_s16(B1b), a8};
+                uint8x8x4_t rgba_chunk3 = {vqmovun_s16(R1b), vqmovun_s16(G1b),
+                                            vqmovun_s16(B1b), a8};
                 vst4_u8(rgba_ptr1 + x * 4,      rgba_chunk2);
                 vst4_u8(rgba_ptr1 + (x + 8) * 4, rgba_chunk3);
             }

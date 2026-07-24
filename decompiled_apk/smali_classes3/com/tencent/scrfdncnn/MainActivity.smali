@@ -9,6 +9,16 @@
 # static fields
 .field public static final REQUEST_CAMERA:I = 0x64
 
+# direct methods
+.method static constructor <clinit>()V
+    .locals 1
+    const-string v0, "scrfdncnn"
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+    const-string v0, "facewarp"
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+    return-void
+.end method
+
 # instance fields
 .field private cameraView:Landroid/view/SurfaceView;
 .field private current_cpugpu:I

@@ -5,14 +5,7 @@
 
 # direct methods
 .method static constructor <clinit>()V
-    .locals 1
-
-    const-string v0, "scrfdncnn"
-    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
-
-    const-string v0, "facewarp"
-    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
-
+    .locals 0
     return-void
 .end method
 
