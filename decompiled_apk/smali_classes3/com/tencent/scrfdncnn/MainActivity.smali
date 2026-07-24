@@ -12,6 +12,8 @@
 # direct methods
 .method static constructor <clinit>()V
     .locals 1
+    const-string v0, "omp"
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
     const-string v0, "scrfdncnn"
     invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
     const-string v0, "facewarp"
@@ -291,7 +293,7 @@
 .end method
 
 .method public onPreviewFrame([BLandroid/hardware/Camera;)V
-    .locals 10
+    .locals 12
     .param p1, "data"    # [B
     .param p2, "camera"  # Landroid/hardware/Camera;
 

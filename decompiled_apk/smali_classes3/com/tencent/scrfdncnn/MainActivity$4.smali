@@ -37,9 +37,10 @@
 
 # virtual methods
 .method public run()V
-    .locals 4
+    .locals 5
 
     .line 133
+    :try_start_0
     iget-object v0, p0, Lcom/tencent/scrfdncnn/MainActivity$4;->this$0:Lcom/tencent/scrfdncnn/MainActivity;
 
     invoke-static {v0}, Lcom/tencent/scrfdncnn/MainActivity;->access$100(Lcom/tencent/scrfdncnn/MainActivity;)Lcom/tencent/scrfdncnn/SCRFDNcnn;
@@ -67,7 +68,23 @@
     invoke-virtual {v0, v1, v2, v3}, Lcom/tencent/scrfdncnn/SCRFDNcnn;->loadModel(Landroid/content/res/AssetManager;II)Z
 
     move-result v0
+    :try_end_0
+    .catchall {:try_start_0 .. :try_end_0} :catchall_0
 
+    goto :goto_0
+
+    :catchall_0
+    move-exception v0
+
+    const-string v1, "MainActivity"
+
+    const-string v2, "Fatal error during loadModel"
+
+    invoke-static {v1, v2, v0}, Landroid/util/Log;->e(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I
+
+    const/4 v0, 0x0
+
+    :goto_0
     .line 134
     .local v0, "ret_init":Z
     iget-object v1, p0, Lcom/tencent/scrfdncnn/MainActivity$4;->this$0:Lcom/tencent/scrfdncnn/MainActivity;

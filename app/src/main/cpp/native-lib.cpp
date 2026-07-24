@@ -262,7 +262,7 @@ Java_com_yourcompany_app_FaceWarpEngine_createScrfdDetector(JNIEnv *env, jobject
     env->GetJavaVM(&jvm);
     ScrfdDetector* det = new ScrfdDetector(jvm);
     ncnn::Option opt;
-    opt.use_vulkan_compute = true;
+    opt.use_vulkan_compute = false;
     opt.num_threads        = 4;
     opt.lightmode          = true;
     det->net.opt = opt;
@@ -274,12 +274,14 @@ Java_com_yourcompany_app_FaceWarpEngine_createScrfdDetector(JNIEnv *env, jobject
 JNIEXPORT jint JNICALL
 Java_com_yourcompany_app_FaceWarpEngine_loadScrfdModel(JNIEnv *env, jobject thiz, jlong handle, jobject assetManager, jstring paramPath, jstring binPath)
 {
+    if (handle == 0 || handle == 12345) return -1;
     return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_yourcompany_app_FaceWarpEngine_detectFace(JNIEnv *env, jobject thiz, jlong handle, jbyteArray rgbaData, jint w, jint h)
 {
+    if (handle == 0 || handle == 12345) return -1;
     return 0;
 }
 
